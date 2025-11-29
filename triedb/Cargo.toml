@@ -39,8 +39,8 @@ tikv-jemallocator = { workspace = true, optional = true }
 
 [features]
 default = []
-jemalloc = ["tikv-jemallocator"]
-jemalloc-prof = ["tikv-jemallocator?/profiling"]
+jemalloc = ["tikv-jemallocator", "rust-eth-triedb-common/jemalloc", "rust-eth-triedb-state-trie/jemalloc", "rust-eth-triedb-pathdb/jemalloc"]
+jemalloc-prof = ["tikv-jemallocator?/profiling", "rust-eth-triedb-common/jemalloc-prof", "rust-eth-triedb-state-trie/jemalloc-prof", "rust-eth-triedb-pathdb/jemalloc-prof"]
 asm-keccak = ["alloy-primitives/asm-keccak", "rust-eth-triedb-common/asm-keccak", "rust-eth-triedb-state-trie/asm-keccak", "rust-eth-triedb-pathdb/asm-keccak"]
 io-uring = ["rust-eth-triedb-pathdb/io-uring"]
 
