@@ -50,8 +50,21 @@ metrics-derive = "0.1"
 ctor = "0.2"
 
 [workspace.features]
-jemalloc = ["tikv-jemallocator"]
-jemalloc-prof = ["tikv-jemallocator?/profiling"]
+jemalloc = [
+    "tikv-jemallocator",
+    "rust-eth-triedb-common/jemalloc",
+    "rust-eth-triedb-pathdb/jemalloc",
+    "rust-eth-triedb-state-trie/jemalloc",
+    "rust-eth-triedb/jemalloc",
+    "rust-eth-triedb-smoke-test/jemalloc",
+]
+jemalloc-prof = [
+    "tikv-jemallocator?/profiling",
+    "rust-eth-triedb-common/jemalloc-prof",
+    "rust-eth-triedb-pathdb/jemalloc-prof",
+    "rust-eth-triedb-state-trie/jemalloc-prof",
+    "rust-eth-triedb/jemalloc-prof",
+]
 asm-keccak = [
     "rust-eth-triedb-common/asm-keccak",
     "rust-eth-triedb-pathdb/asm-keccak",

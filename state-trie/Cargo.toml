@@ -37,8 +37,8 @@ tracing.workspace = true
 [features]
 # serde = ["alloy-primitives/serde"]
 arbitrary = ["dep:arbitrary"]
-jemalloc = ["tikv-jemallocator"]
-jemalloc-prof = ["tikv-jemallocator?/profiling"]
+jemalloc = ["tikv-jemallocator", "rust-eth-triedb-pathdb/jemalloc", "rust-eth-triedb-common/jemalloc"]
+jemalloc-prof = ["tikv-jemallocator?/profiling", "rust-eth-triedb-pathdb/jemalloc-prof", "rust-eth-triedb-common/jemalloc-prof"]
 asm-keccak = ["alloy-primitives/asm-keccak"]
 
 [dev-dependencies]
