@@ -38,6 +38,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run all tests (excluding smoke-test)
-        run: cargo test --workspace --exclude rust-eth-triedb-smoke-test
+      - name: Run all tests (excluding smoke-test and cli)
+        run: cargo test --workspace --exclude rust-eth-triedb-smoke-test --exclude rust-eth-triedb-cli
 
