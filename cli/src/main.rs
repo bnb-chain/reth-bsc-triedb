@@ -4,9 +4,6 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 mod generate_storage_root;
 
-#[cfg(test)]
-mod generate_storage_root_smoke_test;
-
 use generate_storage_root::GenerateStorageRootArgs;
 
 /// Rust Ethereum TrieDB CLI tools

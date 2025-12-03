@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use crate::generate_storage_root::GenerateStorageRootMainTask;
+use super::GenerateStorageRootMainTask;
 
 #[test]
 fn test_generate_storage_root_smoke() -> Result<()> {
@@ -93,13 +93,14 @@ fn test_generate_storage_root_smoke() -> Result<()> {
 
     // Step 5: Create GenerateStorageRootMainTask and start
     tracing::info!("Creating GenerateStorageRootMainTask...");
-    let mut main_task = GenerateStorageRootMainTask::new("main_task".to_string());
+    let path_db = triedb.get_mut_path_db_ref().clone();
+
+    let mut main_task = GenerateStorageRootMainTask::new(
+        "main_task".to_string(), 
+        path_db.clone());
     tracing::info!("Starting GenerateStorageRootMainTask...");
     main_task.start()?;
     tracing::info!("GenerateStorageRootMainTask execution completed");
-
-    // Step 6: Get pathdb from triedb and verify storage roots
-    let path_db = triedb.get_mut_path_db_ref().clone();
 
     tracing::info!("Verifying storage roots...");
     let mut verified_count = 0;

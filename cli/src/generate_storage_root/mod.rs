@@ -1,15 +1,16 @@
+#[cfg(test)]
+mod smoke_test;
+
 use clap::Args;
 use eyre::Result;
 use alloy_primitives::B256;
 use alloy_rlp::Decodable;
 use hex;
-use rust_eth_triedb::{init_global_triedb_manager, get_global_triedb};
-use rust_eth_triedb_pathdb::PathDB;
+use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
 use rust_eth_triedb_common::TrieDatabase;
-use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieBuilder, StateTrie, StateAccount};
-use rust_eth_triedb_state_trie::encoding::hex_to_keybytes;
-use rust_eth_triedb_state_trie::node::Node;
-use rust_eth_triedb_state_trie::trie::Trie;
+use rust_eth_triedb_state_trie::StateAccount;
+use rust_eth_triedb_state_trie::encoding::{hex_to_keybytes, account_trie_node_key};
+use rust_eth_triedb_state_trie::node::{Node, init_empty_root_node};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc};
@@ -44,9 +45,15 @@ impl GenerateStorageRootArgs {
 
         let path_str = self.triedb_path.to_str()
             .ok_or_else(|| eyre::eyre!("Invalid path: {:?}", self.triedb_path))?;
-        init_global_triedb_manager(path_str);
 
-        let mut main_task = GenerateStorageRootMainTask::new("main_task".to_string());
+        let mut config = PathProviderConfig::default();
+        config.trie_node_cache_size = 0;
+        config.storage_root_cache_size = 0;
+
+        let pathdb = PathDB::new(&path_str, config).unwrap();
+
+        init_empty_root_node();
+        let mut main_task = GenerateStorageRootMainTask::new("main_task".to_string(), pathdb);
         main_task.start()?;
 
         tracing::info!("Generated storage root finished!!!");
@@ -59,7 +66,7 @@ pub struct GenerateStorageRootMainTask {
     /// Name of the main task
     pub name: String,
     /// Trie of the main task
-    pub trie: Trie<PathDB>,
+    pub root: B256,
     /// Count of sub-tasks
     pub sub_task_count: u64,
     /// Sub-tasks of the main task
@@ -72,100 +79,105 @@ pub struct GenerateStorageRootMainTask {
 
 impl GenerateStorageRootMainTask {
     /// Create a new main task with a channel receiver
-    pub fn new(name: String) -> Self {
-        
-        let mut triedb = get_global_triedb();
-
-        let (latest_block_number, latest_state_root) = triedb.latest_persist_state().unwrap();
+    pub fn new(name: String, pathdb: PathDB) -> Self {
+        let (latest_block_number, latest_state_root) = pathdb.latest_persist_state().unwrap();
         tracing::info!("Latest persist state: block number: {}, state root: {}", latest_block_number, latest_state_root);
-        
-        // Get database from triedb
-        let path_db = triedb.get_mut_path_db_ref().clone();
-        
-        // Create SecureTrieId from latest_state_root
-        let id = SecureTrieId::new(latest_state_root);
-        
-        // Create StateTrie using SecureTrieBuilder
-        let state_trie: StateTrie<PathDB> = SecureTrieBuilder::new(path_db.clone())
-            .with_id(id)
-            .build_with_difflayer(None)
-            .map_err(|e| eyre::eyre!("Failed to create StateTrie: {}", e)).unwrap();
-
-        let trie = state_trie.trie().clone();
-        
+                
         let task = Self {
             name: name.clone(),
-            trie,
+            root: latest_state_root,
             sub_task_count: 0,
             sub_tasks: HashMap::new(),
-            path_db,
+            path_db: pathdb,
             generate_storage_root_count: 0,
         };
         task
     }
 
-    pub fn iterate_main_trie(&mut self, node: Arc<Node>, key: &[u8], depth: u64) -> Result<()> {
-        match &*node {
+    pub fn start(&mut self) -> Result<()> {
+        tracing::info!("Starting main task: 0x{}", hex::encode(&self.name));
+        let root_arc = self.resolve_hash_node(&self.root, &[])?;
+        let root = Arc::try_unwrap(root_arc).unwrap_or_else(|arc| (*arc).clone());
+        self.iterate_main_trie(root, &[], 0)?;
+
+        tracing::info!("Sub tasks count: {}", self.sub_tasks.len());
+        let mut sub_tasks_vec: Vec<_> = self.sub_tasks.drain().collect();
+        sub_tasks_vec.sort_by_key(|(id, _)| *id);
+        for (id, sub_task) in &sub_tasks_vec {
+            tracing::info!("Sub task: id: {}, name: 0x{}", id, hex::encode(&sub_task.name));
+        }
+
+        let handles: Vec<_> = sub_tasks_vec.into_iter().map(|(id, mut sub_task)| {
+            thread::spawn(move || {
+                tracing::info!("Starting sub task: id: {}, name: 0x{}", id, hex::encode(&sub_task.name));
+                let result = sub_task.start();
+                if let Err(e) = &result {
+                    panic!("Sub task {} failed, name: 0x{}: {}", id, hex::encode(&sub_task.name), e);
+                } else {
+                    tracing::info!("Sub task {} completed, name: 0x{}", id, hex::encode(&sub_task.name));
+                }
+                (id, result, sub_task)
+            })
+        }).collect();
+
+        let mut completed_sub_tasks = HashMap::new();
+        for handle in handles {
+            let (id, result, sub_task) = handle.join().map_err(|e| eyre::eyre!("Thread panicked: {:?}", e))?;
+            result?;
+            tracing::info!("Sub task {} finished successfully", id);
+            completed_sub_tasks.insert(id, sub_task);
+        }
+
+        // Update self.sub_tasks with completed tasks for statistics
+        self.sub_tasks = completed_sub_tasks;
+        self.print_progress()?;
+        return Ok(());
+    }
+
+    pub fn iterate_main_trie(&mut self, node: Node, key: &[u8], depth: u64) -> Result<()> {
+        // Helper to extract Node from Arc
+        let unwrap_node = |arc_node: Arc<Node>| -> Node {
+            Arc::try_unwrap(arc_node).unwrap_or_else(|arc| (*arc).clone())
+        };
+        
+        match node {
             Node::Full(full_node) => {
                 if depth < 2 {
                     for i in 0..17 {
-                        let child = full_node.get_child(i);
+                        let child_arc = full_node.children[i].clone();
+                        let child = unwrap_node(child_arc);
                         let mut child_key = key.to_vec();
                         child_key.push(i as u8);
                         self.iterate_main_trie(child, &child_key, depth + 1)?;
                     }
-                } else if depth == 2 {
-                    let sub_task = GenerateStorageRootSubTask::new(
-                        self.sub_task_count, 
-                        key.to_vec(), 
-                        self.trie.clone(), 
-                        node.clone(), 
-                        depth + 1, 
-                        self.path_db.clone());
-
-                    let sub_task_id = sub_task.id;
-                    self.sub_task_count += 1;
-                    self.sub_tasks.insert(sub_task.id, sub_task);
-
-                    tracing::info!("Create sub task under full node, id: {}, key: 0x{}", sub_task_id, hex::encode(key));
+                    drop(full_node);
+                    return Ok(());
                 } else {
-                    panic!("main task depth > 2 find full node, depth: {}", depth);
+                    panic!("main task depth >= 2 find full node, depth: {}", depth);
                 }
             }
             Node::Short(short_node) => {
                 if depth < 2 {
                     let mut hex_key = key.to_vec();
-                    hex_key.extend(short_node.key.clone()); 
-                    self.iterate_main_trie(short_node.val.clone(), &hex_key, depth + 1)?;
-                } else if depth == 2 {                    
-                    let sub_task = GenerateStorageRootSubTask::new(
-                        self.sub_task_count, 
-                        key.to_vec(), 
-                        self.trie.clone(), 
-                        node.clone(), 
-                        depth + 1, 
-                        self.path_db.clone());
-
-                    let sub_task_id = sub_task.id;
-                    self.sub_task_count += 1;
-                    self.sub_tasks.insert(sub_task.id, sub_task);
-
-                    tracing::info!("Create sub task under short node, id: {}, key: 0x{}", sub_task_id, hex::encode(key));
+                    hex_key.extend(short_node.key.clone());
+                    let val_arc = short_node.val.clone();
+                    let val = unwrap_node(val_arc);
+                    drop(short_node);
+                    return self.iterate_main_trie(val, &hex_key, depth + 1);
                 } else {
-                    panic!("main task depth > 2 find short node, depth: {}", depth);
+                    panic!("main task depth >= 2 find short node, depth: {}", depth);
                 }
             }
             Node::Hash(hash_node) => {
                 if depth < 2 {
-                    let resolved_node = self.trie.resolve_and_track(&hash_node, key)
+                    let resolved_node_arc = self.resolve_hash_node(&hash_node, key)
                         .map_err(|e| eyre::eyre!("Failed to resolve hash node: {:?}, error: {}", key, e))?;
-
+                    let resolved_node = unwrap_node(resolved_node_arc);
                     return self.iterate_main_trie(resolved_node, key, depth);
                 } else if depth == 2 {
                     let sub_task = GenerateStorageRootSubTask::new(
                         self.sub_task_count, 
-                        key.to_vec(), 
-                        self.trie.clone(), 
+                        key.to_vec(),  
                         node.clone(), 
                         depth, 
                         self.path_db.clone());
@@ -175,6 +187,7 @@ impl GenerateStorageRootMainTask {
                     self.sub_tasks.insert(sub_task.id, sub_task);
 
                     tracing::info!("Create sub task under hash node, id: {}, key: 0x{}", sub_task_id, hex::encode(key));
+                    return Ok(());
                 } else {
                     panic!("main task depth > 2 find hash node, depth: {}", depth);
                 }
@@ -197,45 +210,21 @@ impl GenerateStorageRootMainTask {
                 return Ok(());
             }
         }
-        Ok(())
     }
 
-    pub fn start(&mut self) -> Result<()> {
-        tracing::info!("Starting main task: 0x{}", hex::encode(&self.name));
-        self.iterate_main_trie(self.trie.root().clone(), &[], 0)?;
+    pub fn resolve_hash_node(&self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>> {
+        let key = account_trie_node_key(prefix);
+        let node_blob = self.path_db.get_trie_node(&key)
+            .map_err(|e| eyre::eyre!("Failed to get trie node: prefix: 0x{}, error: {}", hex::encode(prefix), e))?;
 
-        tracing::info!("Sub tasks count: {}", self.sub_tasks.len());
-        let mut sub_tasks_vec: Vec<_> = self.sub_tasks.drain().collect();
-        sub_tasks_vec.sort_by_key(|(id, _)| *id);
-        for (id, sub_task) in &sub_tasks_vec {
-            tracing::info!("Sub task: id: {}, name: 0x{}", id, hex::encode(&sub_task.name));
+        match node_blob {
+            Some(node_blob) => {
+                return Ok(Node::must_decode_node(Some(*hash), &node_blob));
+            }
+            None => {
+                panic!("Failed to get trie node: {:?}", key);
+            }
         }
-
-        let handles: Vec<_> = sub_tasks_vec.into_iter().map(|(id, mut sub_task)| {
-            thread::spawn(move || {
-                tracing::info!("Starting sub task: id: {}, name: 0x{}", id, hex::encode(&sub_task.name));
-                let result = sub_task.start();
-                if let Err(e) = &result {
-                    tracing::error!("Sub task {} failed, name: 0x{}: {}", id, hex::encode(&sub_task.name), e);
-                } else {
-                    tracing::info!("Sub task {} completed, name: 0x{}", id, hex::encode(&sub_task.name));
-                }
-                (id, result, sub_task)
-            })
-        }).collect();
-
-        let mut completed_sub_tasks = HashMap::new();
-        for handle in handles {
-            let (id, result, sub_task) = handle.join().map_err(|e| eyre::eyre!("Thread panicked: {:?}", e))?;
-            result?;
-            tracing::info!("Sub task {} finished successfully", id);
-            completed_sub_tasks.insert(id, sub_task);
-        }
-
-        // Update self.sub_tasks with completed tasks for statistics
-        self.sub_tasks = completed_sub_tasks;
-        self.print_progress()?;
-        return Ok(());
     }
 
     pub fn print_progress(&mut self) -> Result<()> {
@@ -266,10 +255,8 @@ pub struct GenerateStorageRootSubTask {
     pub depth: u64,
     /// Max depth of the sub-task
     pub max_depth: u64,
-    /// Trie of the sub-task
-    pub trie: Trie<PathDB>,
     /// Sub-root of the sub-task
-    pub sub_root: Arc<Node>,
+    pub sub_root: Node,
     /// PathDB for the sub-task
     pub path_db: PathDB,
     /// Count of generated storage roots
@@ -281,16 +268,15 @@ impl GenerateStorageRootSubTask {
     pub fn new(
         id: u64, 
         name: Vec<u8>, 
-        trie: Trie<PathDB>, 
-        sub_root: Arc<Node>,
+        sub_root: Node,
         depth: u64,  
         path_db: PathDB) -> Self {
+        // Extract Node from Arc to avoid Arc wrapping
         Self {
             id,
             name: name.clone(),
             depth,
             max_depth: 0,
-            trie,
             sub_root,
             path_db,
             generate_storage_root_count: 0,
@@ -303,30 +289,43 @@ impl GenerateStorageRootSubTask {
         return Ok(());
     }
 
-    pub fn iterate_sub_trie(&mut self, node: Arc<Node>, key: &[u8], depth: u64) -> Result<()> {
-        match &*node {
+    pub fn iterate_sub_trie(&mut self, node: Node, key: &[u8], depth: u64) -> Result<()> {
+        // Helper to extract Node from Arc
+        let unwrap_node = |arc_node: Arc<Node>| -> Node {
+            Arc::try_unwrap(arc_node).unwrap_or_else(|arc| (*arc).clone())
+        };
+        
+        match node {
             Node::Full(full_node) => {
                 for i in 0..17 {
-                    let child = full_node.get_child(i);
+                    let child_arc = full_node.children[i].clone();
+                    let child = unwrap_node(child_arc);
                     let mut child_key = key.to_vec();
                     child_key.push(i as u8);
                     self.iterate_sub_trie(child, &child_key, depth + 1)?;
                 }
+                drop(full_node);
+                return Ok(());
             }
             Node::Short(short_node) => {
                 let mut hex_key = key.to_vec();
-                hex_key.extend(short_node.key.clone()); 
-                self.iterate_sub_trie(short_node.val.clone(), &hex_key, depth + 1)?;
+                hex_key.extend(short_node.key.clone());
+                let val_arc = short_node.val.clone();
+                let val = unwrap_node(val_arc);
+                drop(short_node);
+                return self.iterate_sub_trie(val, &hex_key, depth + 1);
             }
             Node::Hash(hash_node) => {
-                let resolved_node = self.trie.resolve_and_track(&hash_node, key)
+                let resolved_node_arc = self.resolve_hash_node(&hash_node, key)
                     .map_err(|e| eyre::eyre!("Failed to resolve hash node: {:?}, error: {}", key, e))?;
-
+                let resolved_node = unwrap_node(resolved_node_arc);
                 return self.iterate_sub_trie(resolved_node, key, depth);
             }
             Node::Value(value_node) => {
                 let account = StateAccount::decode(&mut &value_node[..])
                     .map_err(|_| eyre::eyre!("Failed to decode account: {:?}", key))?;
+
+                drop(value_node);
 
                 let hashed_address = hex_to_keybytes(key);
                 self.path_db.put_storage_root(B256::from_slice(&hashed_address), account.storage_root)
@@ -346,7 +345,21 @@ impl GenerateStorageRootSubTask {
                 return Ok(());
             }
         }
-        return Ok(());
+    }
+
+    pub fn resolve_hash_node(&self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>> {
+        let key = account_trie_node_key(prefix);
+        let node_blob = self.path_db.get_trie_node(&key)
+            .map_err(|e| eyre::eyre!("Failed to get trie node: prefix: 0x{}, error: {}", hex::encode(prefix), e))?;
+
+        match node_blob {
+            Some(node_blob) => {
+                return Ok(Node::must_decode_node(Some(*hash), &node_blob));
+            }
+            None => {
+                panic!("Failed to get trie node: {:?}", key);
+            }
+        }
     }
 
     pub fn print_progress(&self) -> Result<()> {
