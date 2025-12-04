@@ -397,6 +397,34 @@ impl PathDB {
         }
     }
 
+    pub fn put_raw_storage_root(&self, key: &[u8], value: &[u8]) -> PathProviderResult<()> {
+        trace!(target: "pathdb::rocksdb", "Putting storage root key: {:?}, value_len: {}", key, value.len());
+
+        {
+            // Update cache first
+            let mut cache = self.storage_root_cache.lock().unwrap();
+            cache.insert(key.to_vec(), Some(value.to_vec()));
+        }
+        
+
+        let cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
+            PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
+        })?;
+
+        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+        match self.db.put_cf_opt(&cf, key, value, &self.write_options) {
+            Ok(()) => {
+                trace!(target: "pathdb::rocksdb", "Successfully put value in CF '{}' for key 0x{}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex);
+                Ok(())
+            }
+            Err(e) => {
+                error!(target: "pathdb::rocksdb", "Error putting in CF '{}' for key 0x{}: {}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex, e);
+                Err(PathProviderError::Database(format!("RocksDB put in CF '{}' for key 0x{} error: {}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex, e)))
+            }
+        }
+    }
+
     pub fn get_raw_meta_data(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         // Check cache first
         {
@@ -497,6 +525,11 @@ impl TrieDatabase for PathDB {
         } else {
             Ok(None)
         }
+    }
+
+    fn put_storage_root(&self, hased_address: B256, value: B256) -> Result<(), Self::Error> {
+        self.put_raw_storage_root(hased_address.as_slice(), value.as_slice())?;
+        Ok(())
     }
 
     fn clear_cache(&self) {

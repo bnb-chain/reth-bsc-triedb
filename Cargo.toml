@@ -5,6 +5,7 @@ members = [
     "state-trie",
     "smoke-test",
     "triedb",
+    "cli",
 ]
 resolver = "2"
 
@@ -35,6 +36,9 @@ tracing = "0.1"
 schnellru = "0.2"
 tempfile = "3.8"
 tikv-jemallocator = "0.6"
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 rust-eth-triedb-common = { version = "0.1.0", path = "common" }
 rust-eth-triedb-pathdb = { version = "0.1.0", path = "db/pathdb" }
 rust-eth-triedb-state-trie = { version = "0.1.0", path = "state-trie" }
