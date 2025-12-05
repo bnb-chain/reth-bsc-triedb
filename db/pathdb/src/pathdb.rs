@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use rocksdb::{ColumnFamilyDescriptor,DB, Options, ReadOptions, WriteBatch, WriteOptions};
-use schnellru::{ByLength, LruMap};
+// use schnellru::{ByLength, LruMap};
 use tracing::{error, trace, warn};
 
 use alloy_primitives::B256;
@@ -14,10 +14,10 @@ use alloy_trie::EMPTY_ROOT_HASH;
 use crate::traits::*;
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
 
-use reth_metrics::{
-    metrics::{Counter},
-    Metrics,
-};
+// use reth_metrics::{
+//     metrics::{Counter},
+//     Metrics,
+// };
 
 /// The default column family name used for storing trie nodes.
 ///
@@ -83,18 +83,18 @@ pub const STORAGE_ROOT_COLUMN_FAMILY_NAME: &str = "storage_root";
 const COLUMN_FAMILY_NAMES: [&str; 4] = [DEFAULT_COLUMN_FAMILY_NAME, META_COLUMN_FAMILY_NAME, STORAGE_ROOT_COLUMN_FAMILY_NAME, TRIE_NODE_COLUMN_FAMILY_NAME];
 
 /// Metrics for the `PathDB`.
-#[derive(Metrics, Clone)]
-#[metrics(scope = "rust.eth.triedb.pathdb")]
-pub(crate) struct PathDBMetrics {
-    /// Counter of cache hits
-    pub(crate) trie_node_cache_hits: Counter,
-    /// Counter of cache misses
-    pub(crate) trie_node_cache_misses: Counter,
-    /// Counter of storage root cache hits
-    pub(crate) storage_root_cache_hits: Counter,
-    /// Counter of storage root cache misses
-    pub(crate) storage_root_cache_misses: Counter,
-}
+// #[derive(Metrics, Clone)]
+// #[metrics(scope = "rust.eth.triedb.pathdb")]
+// pub(crate) struct PathDBMetrics {
+//     /// Counter of cache hits
+//     pub(crate) trie_node_cache_hits: Counter,
+//     /// Counter of cache misses
+//     pub(crate) trie_node_cache_misses: Counter,
+//     /// Counter of storage root cache hits
+//     pub(crate) storage_root_cache_hits: Counter,
+//     /// Counter of storage root cache misses
+//     pub(crate) storage_root_cache_misses: Counter,
+// }
 
 /// PathDB implementation using RocksDB.
 pub struct PathDB {
@@ -108,12 +108,12 @@ pub struct PathDB {
     pub write_options: WriteOptions,
     /// Read options for read operations.
     pub read_options: ReadOptions,
-    /// LRU cache for key-value pairs.
-    pub trie_node_cache: Arc<Mutex<LruMap<Vec<u8>, Option<Vec<u8>>, ByLength>>>,
-    /// LRU cache for storage root key-value pairs.
-    pub storage_root_cache: Arc<Mutex<LruMap<Vec<u8>, Option<Vec<u8>>, ByLength>>>,
-    /// Metrics for the PathDB.
-    metrics: PathDBMetrics,
+    // /// LRU cache for key-value pairs.
+    // pub trie_node_cache: Arc<Mutex<LruMap<Vec<u8>, Option<Vec<u8>>, ByLength>>>,
+    // /// LRU cache for storage root key-value pairs.
+    // pub storage_root_cache: Arc<Mutex<LruMap<Vec<u8>, Option<Vec<u8>>, ByLength>>>,
+    // /// Metrics for the PathDB.
+    // metrics: PathDBMetrics,
 }
 
 impl Debug for PathDB {
@@ -140,9 +140,9 @@ impl Clone for PathDB {
             config: self.config.clone(),
             write_options,
             read_options,
-            trie_node_cache: self.trie_node_cache.clone(),
-            storage_root_cache: self.storage_root_cache.clone(),
-            metrics: self.metrics.clone(),
+            // trie_node_cache: self.trie_node_cache.clone(),
+            // storage_root_cache: self.storage_root_cache.clone(),
+            // metrics: self.metrics.clone(),
         }
     }
 }
@@ -183,8 +183,8 @@ impl PathDB {
         read_options.set_async_io(config.async_io);
         read_options.set_verify_checksums(config.verify_checksums);
 
-        let trie_node_cache_size = config.trie_node_cache_size;
-        let storage_root_cache_size = config.storage_root_cache_size;
+        // let trie_node_cache_size = config.trie_node_cache_size;
+        // let storage_root_cache_size = config.storage_root_cache_size;
 
         Ok(Self {
             db: Arc::new(db),
@@ -192,9 +192,9 @@ impl PathDB {
             config,
             write_options,
             read_options,
-            trie_node_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(trie_node_cache_size)))),
-            storage_root_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(storage_root_cache_size)))),
-            metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
+            // trie_node_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(trie_node_cache_size)))),
+            // storage_root_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(storage_root_cache_size)))),
+            // metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
         })
     }
 
@@ -211,22 +211,22 @@ impl PathDB {
     /// Clear the LRU cache.
     pub fn clear_cache(&self) {
         warn!(target: "pathdb::rocksdb", "Clearing LRU cache");
-        self.trie_node_cache.lock().unwrap().clear();
-        self.storage_root_cache.lock().unwrap().clear();
+        // self.trie_node_cache.lock().unwrap().clear();
+        // self.storage_root_cache.lock().unwrap().clear();
     }
 
-    /// Get cache statistics.
-    pub fn cache_stats(&self) -> (usize, usize) {
-        let trie_node_cache = self.trie_node_cache.lock().unwrap();
-        let storage_root_cache = self.storage_root_cache.lock().unwrap();
+    // /// Get cache statistics.
+    // pub fn cache_stats(&self) -> (usize, usize) {
+    //     let trie_node_cache = self.trie_node_cache.lock().unwrap();
+    //     let storage_root_cache = self.storage_root_cache.lock().unwrap();
 
-        (trie_node_cache.len(), storage_root_cache.len())
-    }
+    //     (trie_node_cache.len(), storage_root_cache.len())
+    // }
 
-    /// Create a new metrics instance for the PathDB.
-    pub fn with_new_metrics(&mut self, instance_name: &str) {
-        self.metrics = PathDBMetrics::new_with_labels(&[("instance", instance_name.to_string())]);
-    }
+    // /// Create a new metrics instance for the PathDB.
+    // pub fn with_new_metrics(&mut self, instance_name: &str) {
+    //     self.metrics = PathDBMetrics::new_with_labels(&[("instance", instance_name.to_string())]);
+    // }
 }
 
 impl PathDB {
@@ -234,16 +234,16 @@ impl PathDB {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
         // Check cache first
-        {
-            let cache = self.trie_node_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                self.metrics.trie_node_cache_hits.increment(1);
-                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-                return Ok(cached_value.clone());
-            } else {
-                self.metrics.trie_node_cache_misses.increment(1);
-            }
-        }
+        // {
+        //     let cache = self.trie_node_cache.lock().unwrap();
+        //     if let Some(cached_value) = cache.peek(key) {
+        //         self.metrics.trie_node_cache_hits.increment(1);
+        //         trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+        //         return Ok(cached_value.clone());
+        //     } else {
+        //         self.metrics.trie_node_cache_misses.increment(1);
+        //     }
+        // }
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -254,7 +254,7 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
+                // self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
                 Ok(Some(value))
             }
             Ok(None) => {
@@ -272,7 +272,7 @@ impl PathDB {
         trace!(target: "pathdb::rocksdb", "Putting key: {:?}, value_len: {}", key, value.len());
 
         // Update cache first
-        self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
+        // self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -288,7 +288,7 @@ impl PathDB {
             }
             Err(e) => {
                 error!(target: "pathdb::rocksdb", "Error putting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                self.trie_node_cache.lock().unwrap().remove(key);
+                // self.trie_node_cache.lock().unwrap().remove(key);
                 Err(PathProviderError::Database(format!("RocksDB put in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
             }
         }
@@ -298,7 +298,7 @@ impl PathDB {
         trace!(target: "pathdb::rocksdb", "Deleting key: {:?}", key);
 
         // Remove from cache first
-        self.trie_node_cache.lock().unwrap().remove(key);
+        // self.trie_node_cache.lock().unwrap().remove(key);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -323,16 +323,16 @@ impl PathDB {
         trace!(target: "pathdb::rocksdb", "Checking existence of key: {:?}", key);
 
         // Check cache first
-        {
-            let cache = self.trie_node_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                trace!(target: "pathdb::rocksdb", "Key exists in cache: {:?}", key);
-                self.metrics.trie_node_cache_hits.increment(1);
-                return Ok(cached_value.is_some());
-            } else {
-                self.metrics.trie_node_cache_misses.increment(1);
-            }
-        }
+        // {
+        //     let cache = self.trie_node_cache.lock().unwrap();
+        //     if let Some(cached_value) = cache.peek(key) {
+        //         trace!(target: "pathdb::rocksdb", "Key exists in cache: {:?}", key);
+        //         self.metrics.trie_node_cache_hits.increment(1);
+        //         return Ok(cached_value.is_some());
+        //     } else {
+        //         self.metrics.trie_node_cache_misses.increment(1);
+        //     }
+        // }
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -344,7 +344,7 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(_)) => {
                 trace!(target: "pathdb::rocksdb", "Key exists in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(vec![]));
+                // self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(vec![]));
                 Ok(true)
             }
             Ok(None) => {
@@ -362,16 +362,16 @@ impl PathDB {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
         // Check cache first
-        {
-            let cache = self.storage_root_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                self.metrics.storage_root_cache_hits.increment(1);
-                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-                return Ok(cached_value.clone());
-            } else {
-                self.metrics.storage_root_cache_misses.increment(1);
-            }
-        }
+        // {
+        //     let cache = self.storage_root_cache.lock().unwrap();
+        //     if let Some(cached_value) = cache.peek(key) {
+        //         self.metrics.storage_root_cache_hits.increment(1);
+        //         trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+        //         return Ok(cached_value.clone());
+        //     } else {
+        //         self.metrics.storage_root_cache_misses.increment(1);
+        //     }
+        // }
 
         let cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
@@ -383,7 +383,7 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key 0x{}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex);
-                self.storage_root_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
+                // self.storage_root_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
                 Ok(Some(value))
             }
             Ok(None) => {
@@ -400,11 +400,11 @@ impl PathDB {
     pub fn put_raw_storage_root(&self, key: &[u8], value: &[u8]) -> PathProviderResult<()> {
         trace!(target: "pathdb::rocksdb", "Putting storage root key: {:?}, value_len: {}", key, value.len());
 
-        {
-            // Update cache first
-            let mut cache = self.storage_root_cache.lock().unwrap();
-            cache.insert(key.to_vec(), Some(value.to_vec()));
-        }
+        // {
+        //     // Update cache first
+        //     let mut cache = self.storage_root_cache.lock().unwrap();
+        //     cache.insert(key.to_vec(), Some(value.to_vec()));
+        // }
         
 
         let cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
@@ -427,13 +427,13 @@ impl PathDB {
 
     pub fn get_raw_meta_data(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         // Check cache first
-        {
-            let cache = self.trie_node_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-                return Ok(cached_value.clone());
-            }
-        }
+        // {
+        //     let cache = self.trie_node_cache.lock().unwrap();
+        //     if let Some(cached_value) = cache.peek(key) {
+        //         trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+        //         return Ok(cached_value.clone());
+        //     }
+        // }
 
         // TODO:: change to META_COLUMN_FAMILY_NAME from default CF in the future.
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
@@ -446,7 +446,7 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
-                self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.clone()));
+                // self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
@@ -568,8 +568,8 @@ impl TrieDatabase for PathDB {
 
         let mut batch = WriteBatch::default();
         {
-            let mut trie_node_cache = self.trie_node_cache.lock().unwrap();
-            let mut storage_root_cache = self.storage_root_cache.lock().unwrap();
+            // let mut trie_node_cache = self.trie_node_cache.lock().unwrap();
+            // let mut storage_root_cache = self.storage_root_cache.lock().unwrap();
 
             batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
             batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
@@ -578,8 +578,8 @@ impl TrieDatabase for PathDB {
             batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
             batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
 
-            trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
-            trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+            // trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
+            // trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
         
             if let Some(difflayer) = difflayer {
                 diff_nodes_len = difflayer.diff_nodes.len();
@@ -587,19 +587,19 @@ impl TrieDatabase for PathDB {
 
                 for (key, node) in difflayer.diff_nodes.iter() {
                     if node.is_deleted() {
-                        trie_node_cache.remove(key);
+                        // trie_node_cache.remove(key);
                         batch.delete_cf(&default_cf, key);
                         
                     } else {
                         if let Some(blob) = &node.blob {
-                            trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                            // trie_node_cache.insert(key.clone(), Some(blob.clone()));
                             batch.put_cf(&default_cf, key, blob);
                         }
                     }
                 }
 
                 for (key, value) in difflayer.diff_storage_roots.iter() {
-                    storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
+                    // storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
                     batch.put_cf(&storage_root_cf, key.as_slice(), value.as_slice());
                 }
             }
