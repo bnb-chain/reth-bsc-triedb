@@ -155,14 +155,14 @@ where
         parent_root: B256, 
         difflayer: Option<&DiffLayers>, 
         states: HashMap<B256, Option<StateAccount>>,
-        _states_rebuild: HashSet<B256>,
+        states_rebuild: HashSet<B256>,
         storage_states: HashMap<B256, HashMap<B256, Option<U256>>>) -> 
         Result<(B256, Arc<MergedNodeSet>, HashMap<B256, B256>), TrieDBError> {
         
         self.state_at(parent_root, difflayer)?;
 
         let intermediate_root_start = Instant::now();
-        let root_hash = self.intermediate_root(states, storage_states)?;
+        let root_hash = self.intermediate_root(states, storage_states, states_rebuild)?;
         self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
 
         let commit_start = Instant::now();
@@ -171,18 +171,19 @@ where
 
         let diff_storage_roots = self.updated_storage_roots.clone();
         self.clean();
-        
+
         Ok((root_hash, node_set, diff_storage_roots))
     }
 
     pub fn intermediate_root(
         &mut self, 
         accounts: HashMap<B256, Option<StateAccount>>,
-        storages: HashMap<B256, HashMap<B256, Option<U256>>>) -> 
+        storages: HashMap<B256, HashMap<B256, Option<U256>>>,
+        states_rebuild: HashSet<B256>) -> 
         Result<B256, TrieDBError> {
         
         let intermediate_state_objects = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages)?;        
+        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild)?;        
         self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
         
         for (hashed_address, account) in updated_accounts {
@@ -201,7 +202,8 @@ where
     fn update_state_objects (
         &mut self, 
         accounts: HashMap<B256, Option<StateAccount>>,
-        storages: HashMap<B256, HashMap<B256, Option<U256>>>) -> 
+        storages: HashMap<B256, HashMap<B256, Option<U256>>>, 
+        states_rebuild: HashSet<B256>) -> 
         Result<HashMap<B256, Option<StateAccount>>, TrieDBError> {
        
         // Prepare data for parallel execution
@@ -214,6 +216,10 @@ where
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
+            if states_rebuild.contains(&hashed_address) {
+                return Ok(alloy_trie::EMPTY_ROOT_HASH);
+            }
+
             if let Some(dl) = difflayer_clone.as_ref() {
                 if let Some(root) = dl.get_storage_root(hashed_address) {
                     return Ok(root);
@@ -236,13 +242,10 @@ where
                     .par_iter()
                     .filter(|(hashed_address, _)| !storages_keys.contains(*hashed_address))
                     .map(|(hashed_address, account)| {
-                        // Get storage root from path_db or difflayer
-                        let storage_root = get_storage_root(*hashed_address)?;
-
                         match account {
                             Some(account) => {
                                 let mut new_account = account.clone();
-                                new_account.storage_root = storage_root;
+                                new_account.storage_root = get_storage_root(*hashed_address)?;
                                 Ok((*hashed_address, (Some(new_account), storage_root)))
                             }
                             None => {
@@ -271,7 +274,6 @@ where
                     .map(|(hashed_address, kvs)| {
                         // Get storage root from path_db or difflayer (same logic as task 1)
                         let storage_root = get_storage_root(hashed_address)?;
-
                         let id = SecureTrieId::new(storage_root)
                             .with_owner(hashed_address);
                         let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
