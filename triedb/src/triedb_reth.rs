@@ -245,7 +245,8 @@ where
                         match account {
                             Some(account) => {
                                 let mut new_account = account.clone();
-                                new_account.storage_root = get_storage_root(*hashed_address)?;
+                                let storage_root = get_storage_root(*hashed_address)?;
+                                new_account.storage_root = storage_root;
                                 Ok((*hashed_address, (Some(new_account), storage_root)))
                             }
                             None => {
