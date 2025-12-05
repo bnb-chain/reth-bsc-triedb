@@ -8,7 +8,6 @@ use std::time::Instant;
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
 use rust_eth_triedb_state_trie::node::{MergedNodeSet, NodeSet, DiffLayer, DiffLayers};
-use rust_eth_triedb_state_trie::state_trie::StateTrie;
 use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
@@ -179,11 +178,11 @@ where
         &mut self, 
         accounts: HashMap<B256, Option<StateAccount>>,
         storages: HashMap<B256, HashMap<B256, Option<U256>>>,
-        states_rebuild: HashSet<B256>) -> 
+        accounts_rebuild: HashSet<B256>) -> 
         Result<B256, TrieDBError> {
         
         let intermediate_state_objects = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild)?;        
+        let updated_accounts = self.update_state_objects(accounts, storages, accounts_rebuild)?;        
         self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
         
         for (hashed_address, account) in updated_accounts {
@@ -203,130 +202,97 @@ where
         &mut self, 
         accounts: HashMap<B256, Option<StateAccount>>,
         storages: HashMap<B256, HashMap<B256, Option<U256>>>, 
-        states_rebuild: HashSet<B256>) -> 
+        accounts_rebuild: HashSet<B256>) -> 
         Result<HashMap<B256, Option<StateAccount>>, TrieDBError> {
        
+        let task1_start = Instant::now();
+        let mut new_accounts_with_no_storage = HashMap::new();
+        let mut new_accounts_with_storages = HashMap::new();
+        let mut storage_roots = HashMap::new();
+        for (hashed_address, new_account) in accounts {
+            if new_account.is_none() {
+                new_accounts_with_no_storage.insert(hashed_address, None);
+                storage_roots.insert(hashed_address, alloy_trie::EMPTY_ROOT_HASH);
+                continue;
+            }
+
+            let final_account = if accounts_rebuild.contains(&hashed_address) {
+                new_account.unwrap()
+            }else {
+                let mut new_account = new_account.unwrap();
+                new_account.storage_root = self.get_storage_root(hashed_address)?;
+                new_account
+            };
+            storage_roots.insert(hashed_address, final_account.storage_root);
+
+            if storages.contains_key(&hashed_address) {
+                new_accounts_with_storages.insert(hashed_address, final_account);
+            } else {
+                new_accounts_with_no_storage.insert(hashed_address, Some(final_account));
+            }
+        }
+        self.metrics.record_intermediate_state_objects_account_duration(task1_start.elapsed().as_secs_f64());
+
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
         let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
-        let accounts_clone = accounts.clone();
-        let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
-        let storages_for_task2 = storages;
-        let metrics_clone = self.metrics.clone();
 
-        // Closure to get storage root from difflayer or path_db
-        let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
-            if states_rebuild.contains(&hashed_address) {
-                return Ok(alloy_trie::EMPTY_ROOT_HASH);
-            }
+        let task2_start = Instant::now();
+        let storage_result = storages
+            .into_par_iter()
+            .map(|(hashed_address, kvs)| {
+                // Get storage root from path_db or difflayer (same logic as task 1)
+                let mut account = new_accounts_with_storages.get(&hashed_address).unwrap().clone();
+                let storage_root = account.storage_root;
 
-            if let Some(dl) = difflayer_clone.as_ref() {
-                if let Some(root) = dl.get_storage_root(hashed_address) {
-                    return Ok(root);
+                let id = SecureTrieId::new(storage_root)
+                    .with_owner(hashed_address);
+                let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
+                    .with_id(id)
+                    .build_with_difflayer(difflayer_clone.as_ref())
+                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+
+                // Parallel execution for kvs within each address
+                let kvs_vec: Vec<_> = kvs.into_iter().collect();
+                for (hashed_key, new_value) in kvs_vec {
+                    if let Some(new_value) = new_value {
+                        storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
+                            .map_err(|e| TrieDBError::Database(format!("Failed to update storage for hashed_address: 0x{}, hashed_key: 0x{}, new_value: {:#x}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), new_value, e)))?;
+                    } else {
+                        storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
+                            .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
+                    }
                 }
-            }
-            path_db_clone.get_storage_root(hashed_address)
-                .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))
-                .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
-        };
 
-        // Parallel execution: process accounts and storages simultaneously
-        let (account_result, storage_result): (
-            Result<(HashMap<B256, Option<StateAccount>>, HashMap<B256, B256>), TrieDBError>,
-            Result<(HashMap<B256, Option<StateAccount>>, HashMap<B256, B256>, HashMap<B256, StateTrie<DB>>), TrieDBError>
-        ) = rayon::join(
-            || {
-                // Task 1: Process accounts that don't have storage updates (parallel)
-                let task1_start = Instant::now();
-                let result = accounts_clone
-                    .par_iter()
-                    .filter(|(hashed_address, _)| !storages_keys.contains(*hashed_address))
-                    .map(|(hashed_address, account)| {
-                        match account {
-                            Some(account) => {
-                                let mut new_account = account.clone();
-                                new_account.storage_root = get_storage_root(*hashed_address)?;
-                                Ok((*hashed_address, (Some(new_account), storage_root)))
-                            }
-                            None => {
-                                Ok((*hashed_address, (None, alloy_trie::EMPTY_ROOT_HASH)))
-                            }
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|vec| {
-                        let mut new_accounts = HashMap::new();
-                        let mut diff_account_storage_roots = HashMap::new();
-                        for (hashed_address, (account, storage_root)) in vec {
-                            new_accounts.insert(hashed_address, account);
-                            diff_account_storage_roots.insert(hashed_address, storage_root);
-                        }
-                        (new_accounts, diff_account_storage_roots)
-                    });
-                metrics_clone.record_intermediate_state_objects_account_duration(task1_start.elapsed().as_secs_f64());
-                result
-            },
-            || {
-                // Task 2: Process accounts with storage updates (parallel)
-                let task2_start = Instant::now();
-                let result = storages_for_task2
-                    .into_par_iter()
-                    .map(|(hashed_address, kvs)| {
-                        // Get storage root from path_db or difflayer (same logic as task 1)
-                        let storage_root = get_storage_root(hashed_address)?;
-                        let id = SecureTrieId::new(storage_root)
-                            .with_owner(hashed_address);
-                        let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
-                            .with_id(id)
-                            .build_with_difflayer(difflayer_clone.as_ref())
-                            .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+                let new_storage_root = storage_trie.hash();
+                account.storage_root = new_storage_root;
 
-                        // Parallel execution for kvs within each address
-                        let kvs_vec: Vec<_> = kvs.into_iter().collect();
-                        for (hashed_key, new_value) in kvs_vec {
-                            if let Some(new_value) = new_value {
-                                storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
-                                    .map_err(|e| TrieDBError::Database(format!("Failed to update storage for hashed_address: 0x{}, hashed_key: 0x{}, new_value: {:#x}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), new_value, e)))?;
-                            } else {
-                                storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
-                                    .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
-                            }
-                        }
-
-                        let new_storage_root = storage_trie.hash();
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
-                        new_account.storage_root = new_storage_root;
-
-                        Ok((hashed_address, (Some(new_account), new_storage_root, storage_trie)))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|vec| {
-                        let mut new_accounts = HashMap::new();
-                        let mut diff_account_storage_roots = HashMap::new();
-                        let mut storage_tries = HashMap::new();
-                        for (hashed_address, (account, storage_root, storage_trie)) in vec {
-                            new_accounts.insert(hashed_address, account);
-                            diff_account_storage_roots.insert(hashed_address, storage_root);
-                            storage_tries.insert(hashed_address, storage_trie);
-                        }
-                        (new_accounts, diff_account_storage_roots, storage_tries)
-                    });
-                metrics_clone.record_intermediate_state_objects_storage_duration(task2_start.elapsed().as_secs_f64());
-                result
-            }
-        );
+                Ok((hashed_address, (Some(account), new_storage_root, storage_trie)))
+            })
+            .collect::<Result<Vec<_>, TrieDBError>>()
+            .map(|vec| {
+                let mut new_accounts = HashMap::new();
+                let mut diff_account_storage_roots = HashMap::new();
+                let mut storage_tries = HashMap::new();
+                for (hashed_address, (account, storage_root, storage_trie)) in vec {
+                    new_accounts.insert(hashed_address, account);
+                    diff_account_storage_roots.insert(hashed_address, storage_root);
+                    storage_tries.insert(hashed_address, storage_trie);
+                }
+                (new_accounts, diff_account_storage_roots, storage_tries)
+            });
+        self.metrics.record_intermediate_state_objects_storage_duration(task2_start.elapsed().as_secs_f64());
 
         // Merge results
-        let (mut accounts_no_storage, mut roots_no_storage) = account_result?;
         let (accounts_with_storage, roots_with_storage, storage_tries) = storage_result?;
 
-        accounts_no_storage.extend(accounts_with_storage);
-        roots_no_storage.extend(roots_with_storage);
+        new_accounts_with_no_storage.extend(accounts_with_storage);
+        storage_roots.extend(roots_with_storage);
 
         self.storage_tries = storage_tries;
-        self.updated_storage_roots = roots_no_storage;
+        self.updated_storage_roots = storage_roots;
         
-        Ok(accounts_no_storage)
+        Ok(new_accounts_with_no_storage)
     }
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
