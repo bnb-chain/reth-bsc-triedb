@@ -27,6 +27,7 @@ tracing.workspace = true
 
 # LRU Cache
 schnellru.workspace = true
+mini-moka = { workspace = true, features = ["sync"] }
 
 # Testing
 tempfile.workspace = true

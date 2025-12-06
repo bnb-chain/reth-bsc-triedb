@@ -34,6 +34,7 @@ hex = "0.4"
 rocksdb = "0.24"
 tracing = "0.1"
 schnellru = "0.2"
+mini-moka = "0.10"
 tempfile = "3.8"
 tikv-jemallocator = "0.6"
 clap = { version = "4", features = ["derive"] }
