@@ -21,6 +21,8 @@ pub(crate) struct TrieDBMetrics {
     pub(crate) intermediate_state_objects_storage_histogram: Histogram,
     /// Histogram of commit durations (in seconds)
     pub(crate) commit_histogram: Histogram,
+    /// Histogram of commit to diff nodes durations (in seconds)
+    pub(crate) commit_to_diff_nodes_histogram: Histogram,
     /// Histogram of flush durations (in seconds)
     pub(crate) flush_histogram: Histogram,
 }
@@ -48,6 +50,10 @@ impl TrieDBMetrics {
 
     pub(crate) fn record_commit_duration(&self, duration: f64) {
         self.commit_histogram.record(duration);
+    }
+
+    pub(crate) fn record_commit_to_diff_nodes_duration(&self, duration: f64) {
+        self.commit_to_diff_nodes_histogram.record(duration);
     }
 
     pub(crate) fn record_flush_duration(&self, duration: f64) {

@@ -168,8 +168,9 @@ where
         let (_, node_set) = self.commit(true)?;
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
+        let commit_to_diff_nodes_start = Instant::now();
         let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
-        self.clean();
+        self.metrics.record_commit_to_diff_nodes_duration(commit_to_diff_nodes_start.elapsed().as_secs_f64());
 
         Ok((root_hash, node_set, diff_storage_roots))
     }
