@@ -9,6 +9,8 @@ use reth_metrics::{
 #[derive(Metrics, Clone)]
 #[metrics(scope = "rust.eth.triedb")]
 pub(crate) struct TrieDBMetrics {
+    /// Histogram of prefetcher hashed posted state durations (in seconds)
+    pub(crate) prefetcher_hashed_posted_state_histogram: Histogram,
     /// Histogram of validate durations (in seconds)
     pub(crate) validate_histogram: Histogram,
     /// Histogram of intermediate root durations (in seconds)
@@ -26,6 +28,10 @@ pub(crate) struct TrieDBMetrics {
 }
 
 impl TrieDBMetrics {
+    pub(crate) fn record_prefetcher_hashed_posted_state_duration(&self, duration: f64) {
+        self.prefetcher_hashed_posted_state_histogram.record(duration);
+    }
+
     pub(crate) fn record_validate_duration(&self, duration: f64) {
         self.validate_histogram.record(duration);
     }

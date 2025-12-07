@@ -9,6 +9,7 @@ pub mod triedb_manager;
 pub mod triedb_metrics;
 pub mod triedb_disk;
 pub mod triedb_reth;
+pub mod triedb_prefetcher;
 
 #[cfg(test)]
 mod triedb_test;

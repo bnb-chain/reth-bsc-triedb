@@ -12,6 +12,7 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieBuilder};
 
 use crate::triedb_metrics::TrieDBMetrics;
+use crate::triedb_prefetcher::Prefetcher;
 
 /// Error type for trie database operations
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +165,9 @@ where
     /// This database provides the persistent storage backend for all trie operations.
     pub(crate) path_db: DB,
     
+    /// The prefetcher for the trie db
+    pub(crate) prefetcher: Prefetcher<DB>,
+
     /// Metrics for monitoring trie database operations and performance.
     pub(crate) metrics: TrieDBMetrics,
 }
@@ -184,6 +188,7 @@ where
             updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: path_db.clone(),
+            prefetcher: Prefetcher::default(),
             metrics: TrieDBMetrics::new_with_labels(&[("instance", "default")]),
         }
     }
@@ -196,6 +201,7 @@ where
             .with_id(id)
             .build_with_difflayer(difflayer)?
         );
+        self.prefetcher = Prefetcher::new(self.path_db.clone(), root_hash, difflayer)?;
         self.root_hash = root_hash;
         self.updated_storage_roots.clear();
         self.difflayer = difflayer.map(|d| d.clone());
@@ -223,7 +229,8 @@ where
         let accounts_with_storage_trie = std::mem::take(&mut self.accounts_with_storage_trie);
         let updated_storage_roots = std::mem::take(&mut self.updated_storage_roots);
         let difflayer = std::mem::take(&mut self.difflayer);
-        
+        let prefetcher = std::mem::take(&mut self.prefetcher);
+
         // Reset simple fields immediately
         self.root_hash = EMPTY_ROOT_HASH;
         
@@ -233,6 +240,7 @@ where
             // This allows Arc references to be released asynchronously
             drop(account_trie);
             drop(storage_tries);
+            drop(prefetcher);
             drop(accounts_with_storage_trie);
             drop(updated_storage_roots);
             drop(difflayer);
@@ -254,6 +262,7 @@ where
             updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: self.path_db.clone(),
+            prefetcher: self.prefetcher.clone(),
             metrics: self.metrics.clone()
         }
     }
