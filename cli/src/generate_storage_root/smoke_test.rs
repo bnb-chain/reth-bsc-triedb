@@ -77,7 +77,7 @@ fn test_generate_storage_root_smoke() -> Result<()> {
     let difflayer = if let Some(difflayer) = difflayers {
         let new_difflayer = DiffLayer::new(
             difflayer.diff_nodes.clone(),
-            HashMap::new()  // Empty diff_storage_roots
+            Arc::from(HashMap::new())  // Empty diff_storage_roots
         );
         Some(Arc::new(new_difflayer))
     } else {
