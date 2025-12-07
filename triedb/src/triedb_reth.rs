@@ -119,7 +119,10 @@ where
         root_hash: B256, 
         difflayer: Option<&DiffLayers>, 
         hashed_post_state: &TrieDBHashedPostState) -> 
-        Result<(B256, Option<Arc<DiffLayer>>), TrieDBError> {
+        Result<(B256, Option<Arc<DiffLayer>>), TrieDBError>
+    where
+        DB: 'static,
+    {
 
         let validate_start = Instant::now();
 
@@ -156,7 +159,10 @@ where
         states: HashMap<B256, Option<StateAccount>>,
         states_rebuild: HashSet<B256>,
         storage_states: HashMap<B256, HashMap<B256, Option<U256>>>) -> 
-        Result<(B256, Arc<MergedNodeSet>, Arc<HashMap<B256, B256>>), TrieDBError> {
+        Result<(B256, Arc<MergedNodeSet>, Arc<HashMap<B256, B256>>), TrieDBError>
+    where
+        DB: 'static,
+    {
         
         self.state_at(parent_root, difflayer)?;
 
@@ -168,10 +174,10 @@ where
         let (_, node_set) = self.commit(true)?;
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
-        let commit_to_diff_nodes_start = Instant::now();
         let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
-        self.metrics.record_commit_to_diff_nodes_duration(commit_to_diff_nodes_start.elapsed().as_secs_f64());
 
+        self.clean();
+        
         Ok((root_hash, node_set, diff_storage_roots))
     }
 

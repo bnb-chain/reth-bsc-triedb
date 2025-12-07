@@ -210,13 +210,33 @@ where
     }
 
     /// Clean the trie db
-    pub fn clean(&mut self) {
+    /// 
+    /// This method resets all fields immediately and asynchronously releases
+    /// Arc references in a background thread to avoid blocking.
+    pub fn clean(&mut self)
+    where
+        DB: 'static,
+    {
+        // Move out values that contain Arc references for async cleanup
+        let account_trie = std::mem::take(&mut self.account_trie);
+        let storage_tries = std::mem::take(&mut self.storage_tries);
+        let accounts_with_storage_trie = std::mem::take(&mut self.accounts_with_storage_trie);
+        let updated_storage_roots = std::mem::take(&mut self.updated_storage_roots);
+        let difflayer = std::mem::take(&mut self.difflayer);
+        
+        // Reset simple fields immediately
         self.root_hash = EMPTY_ROOT_HASH;
-        self.account_trie = None;
-        self.storage_tries.clear();
-        self.accounts_with_storage_trie.clear();
-        self.updated_storage_roots.clear();
-        self.difflayer = None;
+        
+        // Spawn background thread to asynchronously drop Arc references
+        std::thread::spawn(move || {
+            // Drop all values in background thread
+            // This allows Arc references to be released asynchronously
+            drop(account_trie);
+            drop(storage_tries);
+            drop(accounts_with_storage_trie);
+            drop(updated_storage_roots);
+            drop(difflayer);
+        });
     }
 }
 
