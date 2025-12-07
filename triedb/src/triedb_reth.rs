@@ -332,6 +332,9 @@ where
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
         let mut merged_node_set = MergedNodeSet::new();
+
+
+        let commit_tries_start = Instant::now();
         // Start both tasks in parallel using rayon
         let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
         let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) = rayon::join(
@@ -344,7 +347,7 @@ where
                 })
                 .collect()
         );
-        drop(account_trie_clone);
+        self.metrics.record_commit_tries_duration(commit_tries_start.elapsed().as_secs_f64());
 
         let (root_hash, account_node_set) = account_commit_result?;
 
