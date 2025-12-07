@@ -171,12 +171,8 @@ where
         self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
 
         let commit_start = Instant::now();
-        let (_, node_set) = self.commit(true)?;
+        let (_, node_set, diff_storage_roots) = self.commit(true)?;
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
-
-        let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
-
-        self.clean();
         
         Ok((root_hash, node_set, diff_storage_roots))
     }
@@ -336,20 +332,47 @@ where
         Ok(accounts_no_storage)
     }
 
-    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
+    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>, Arc<HashMap<B256, B256>>), TrieDBError> 
+    where
+        DB: 'static,
+    {        
         let mut merged_node_set = Box::new(MergedNodeSet::new());
 
-        // Start both tasks in parallel using rayon
+        // Clone resources needed for commit before taking ownership for cleanup
         let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
-        let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) = rayon::join(
-            || account_trie_clone.commit(true),
-            || self.storage_tries
-                .par_iter()
-                .map(|(hashed_address, trie)| {
-                    let (_, node_set) = trie.clone().commit(false).unwrap();
-                    (*hashed_address, node_set)
+        let storage_tries_clone = self.storage_tries.clone();
+        let diff_storage_roots_clone = Arc::from(*self.updated_storage_roots.clone());
+
+        // Start three tasks in parallel using nested rayon::join
+        let ((account_commit_result, storage_commit_results), _cleanup_handle): ((Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>), std::thread::JoinHandle<()>) = rayon::join(
+            || rayon::join(
+                || account_trie_clone.commit(true),
+                || storage_tries_clone
+                    .par_iter()
+                    .map(|(hashed_address, trie)| {
+                        let (_, node_set) = trie.clone().commit(false).unwrap();
+                        (*hashed_address, node_set)
+                    })
+                    .collect()
+            ),
+            || {
+                // Third parallel task: clean up all resources asynchronously
+                // Move out all resources that contain Arc references
+                let account_trie = std::mem::take(&mut self.account_trie);
+                let storage_tries = std::mem::take(&mut self.storage_tries);
+                let accounts_with_storage_trie = std::mem::take(&mut self.accounts_with_storage_trie);
+                let updated_storage_roots = std::mem::take(&mut self.updated_storage_roots);
+                let difflayer = std::mem::take(&mut self.difflayer);
+                
+                // Spawn background thread to asynchronously drop Arc references
+                std::thread::spawn(move || {
+                    drop(account_trie);
+                    drop(storage_tries);
+                    drop(accounts_with_storage_trie);
+                    drop(updated_storage_roots);
+                    drop(difflayer);
                 })
-                .collect()
+            }
         );
 
         let (root_hash, account_node_set) = account_commit_result?;
@@ -365,7 +388,8 @@ where
                     .map_err(|e| TrieDBError::Database(e))?;
             }
         }
-        Ok((root_hash, Arc::from(*merged_node_set)))
+        
+        Ok((root_hash, Arc::from(*merged_node_set), diff_storage_roots_clone))
     }
 }
 
