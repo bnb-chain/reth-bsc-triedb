@@ -8,7 +8,6 @@ use std::collections::HashMap;
 
 use alloy_primitives::B256;
 use rust_eth_triedb_common::{Leaf, TrieNode};
-use crate::encoding;
 
 /// NodeSet contains a set of nodes collected during the commit operation.
 /// Each node is keyed by path. It's not thread-safe to use.
@@ -232,19 +231,35 @@ impl MergedNodeSet {
 
     /// Convert the merged node set to a difflayer
     pub fn to_diff_nodes(&self) -> Arc<HashMap<Vec<u8>, Arc<TrieNode>>> {
-        let mut difflayer = HashMap::new();
+        // Pre-calculate total capacity to avoid HashMap reallocations
+        let total_capacity: usize = self.sets.values().map(|set| set.nodes.len()).sum();
+        // Use Box to allocate HashMap struct on heap from the start, avoiding stack allocation
+        // Arc::from(*boxed) will convert Box to Arc without copying the HashMap contents
+        let mut difflayer = Box::new(HashMap::with_capacity(total_capacity));
+        
         for (owner, set) in &self.sets {
             for (path, node) in &set.nodes {
-                if owner == &B256::ZERO {
-                    let key = encoding::account_trie_node_key(path.as_bytes());
-                    difflayer.insert(key, node.clone());
+                let key = if owner == &B256::ZERO {
+                    // Account trie: "A" + path
+                    let mut key = Vec::with_capacity(1 + path.len());
+                    key.push(b'A');
+                    key.extend_from_slice(path.as_bytes());
+                    key
                 } else {
-                    let key = encoding::storage_trie_node_key(owner.as_slice(), path.as_bytes());
-                    difflayer.insert(key, node.clone());
-                }
+                    // Storage trie: "O" + owner + path
+                    let mut key = Vec::with_capacity(1 + 32 + path.len());
+                    key.push(b'O');
+                    key.extend_from_slice(owner.as_slice());
+                    key.extend_from_slice(path.as_bytes());
+                    key
+                };
+                
+                difflayer.insert(key, node.clone());
             }
         }
-        Arc::new(difflayer)
+        
+        // Convert Box to Arc without copying HashMap contents (only moves the struct)
+        Arc::from(*difflayer)
     }
 }
 

@@ -74,7 +74,7 @@ pub struct DiffLayer {
     /// ```
     /// // A path prefix might represent: [0x01, 0x23, 0x45] for a node at depth 3
     /// ```
-    pub diff_nodes: HashMap<Vec<u8>, Arc<TrieNode>>,
+    pub diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>,
     
     /// A map of account address hashes to their corresponding storage trie roots.
     ///
@@ -88,13 +88,13 @@ pub struct DiffLayer {
     /// # Note
     /// Only accounts whose storage has been modified in this block will have entries
     /// in this map. Unmodified accounts are not included.
-    pub diff_storage_roots: HashMap<B256, B256>,
+    pub diff_storage_roots: Arc<HashMap<B256, B256>>,
 }
 
 impl DiffLayer {
     /// Create a new diff layer
-    pub fn new(diff_nodes: HashMap<Vec<u8>, Arc<TrieNode>>, diff_storage_roots: HashMap<B256, B256>) -> Self {
-        Self { diff_nodes, diff_storage_roots }
+    pub fn new(diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>, diff_storage_roots: Arc<HashMap<B256, B256>>) -> Self {
+        Self { diff_nodes: diff_nodes.clone(), diff_storage_roots: diff_storage_roots.clone() }
     }
 
     /// Get a trie node by prefix

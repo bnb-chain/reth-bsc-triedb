@@ -150,7 +150,7 @@ where
     /// **Purpose**: When storage is modified, the storage trie's root hash changes.
     /// This map tracks these changes so that the account's `storage_root` field
     /// can be updated in the account trie during commit operations.
-    pub(crate) updated_storage_roots: HashMap<B256, B256>,
+    pub(crate) updated_storage_roots: Box<HashMap<B256, B256>>,
     
     /// Uncommitted diff layers for tracking state changes.
     ///
@@ -181,7 +181,7 @@ where
             account_trie: None,
             storage_tries: HashMap::new(),
             accounts_with_storage_trie: HashMap::new(),
-            updated_storage_roots: HashMap::new(),
+            updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: path_db.clone(),
             metrics: TrieDBMetrics::new_with_labels(&[("instance", "default")]),
@@ -231,7 +231,7 @@ where
             account_trie: None,
             storage_tries: HashMap::new(),
             accounts_with_storage_trie: HashMap::new(),
-            updated_storage_roots: HashMap::new(),
+            updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: self.path_db.clone(),
             metrics: self.metrics.clone()

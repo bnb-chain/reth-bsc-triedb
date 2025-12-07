@@ -130,8 +130,7 @@ where
             hashed_post_state.states_rebuild.clone(), 
             hashed_post_state.storage_states.clone())?;
 
-        let diff_nodes = (*node_set.to_diff_nodes()).clone();
-        let difflayer = Arc::new(DiffLayer::new(diff_nodes, diff_storage_roots));
+        let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
         
         if difflayer.is_empty() {
             return Ok((root_hash, None));
@@ -157,7 +156,7 @@ where
         states: HashMap<B256, Option<StateAccount>>,
         states_rebuild: HashSet<B256>,
         storage_states: HashMap<B256, HashMap<B256, Option<U256>>>) -> 
-        Result<(B256, Arc<MergedNodeSet>, HashMap<B256, B256>), TrieDBError> {
+        Result<(B256, Arc<MergedNodeSet>, Arc<HashMap<B256, B256>>), TrieDBError> {
         
         self.state_at(parent_root, difflayer)?;
 
@@ -169,7 +168,7 @@ where
         let (_, node_set) = self.commit(true)?;
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
-        let diff_storage_roots = self.updated_storage_roots.clone();
+        let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
         self.clean();
 
         Ok((root_hash, node_set, diff_storage_roots))
@@ -232,8 +231,8 @@ where
 
         // Parallel execution: process accounts and storages simultaneously
         let (account_result, storage_result): (
-            Result<(HashMap<B256, Option<StateAccount>>, HashMap<B256, B256>), TrieDBError>,
-            Result<(HashMap<B256, Option<StateAccount>>, HashMap<B256, B256>, HashMap<B256, StateTrie<DB>>), TrieDBError>
+            Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>), TrieDBError>,
+            Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>, HashMap<B256, StateTrie<DB>>), TrieDBError>
         ) = rayon::join(
             || {
                 // Task 1: Process accounts that don't have storage updates (parallel)
@@ -257,7 +256,7 @@ where
                     .collect::<Result<Vec<_>, _>>()
                     .map(|vec| {
                         let mut new_accounts = HashMap::new();
-                        let mut diff_account_storage_roots = HashMap::new();
+                        let mut diff_account_storage_roots = Box::new(HashMap::new());
                         for (hashed_address, (account, storage_root)) in vec {
                             new_accounts.insert(hashed_address, account);
                             diff_account_storage_roots.insert(hashed_address, storage_root);
@@ -303,7 +302,7 @@ where
                     .collect::<Result<Vec<_>, _>>()
                     .map(|vec| {
                         let mut new_accounts = HashMap::new();
-                        let mut diff_account_storage_roots = HashMap::new();
+                        let mut diff_account_storage_roots = Box::new(HashMap::new());
                         let mut storage_tries = HashMap::new();
                         for (hashed_address, (account, storage_root, storage_trie)) in vec {
                             new_accounts.insert(hashed_address, account);
@@ -322,7 +321,7 @@ where
         let (accounts_with_storage, roots_with_storage, storage_tries) = storage_result?;
 
         accounts_no_storage.extend(accounts_with_storage);
-        roots_no_storage.extend(roots_with_storage);
+        roots_no_storage.extend(roots_with_storage.into_iter());
 
         self.storage_tries = storage_tries;
         self.updated_storage_roots = roots_no_storage;
@@ -331,10 +330,8 @@ where
     }
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
-        let mut merged_node_set = MergedNodeSet::new();
+        let mut merged_node_set = Box::new(MergedNodeSet::new());
 
-
-        let commit_tries_start = Instant::now();
         // Start both tasks in parallel using rayon
         let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
         let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) = rayon::join(
@@ -347,7 +344,6 @@ where
                 })
                 .collect()
         );
-        self.metrics.record_commit_tries_duration(commit_tries_start.elapsed().as_secs_f64());
 
         let (root_hash, account_node_set) = account_commit_result?;
 
@@ -362,7 +358,7 @@ where
                     .map_err(|e| TrieDBError::Database(e))?;
             }
         }
-        Ok((root_hash, Arc::new(merged_node_set)))
+        Ok((root_hash, Arc::from(*merged_node_set)))
     }
 }
 
