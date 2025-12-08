@@ -99,12 +99,13 @@ where
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct TrieDBHashedPostState {
     pub states: HashMap<B256, Option<StateAccount>>,
     pub states_rebuild: HashSet<B256>,
     pub storage_states: HashMap<B256, HashMap<B256, Option<U256>>>
 }
+
 
 /// Compatible with Reth client usage scenarios
 impl<DB> TrieDB<DB>
@@ -116,7 +117,7 @@ where
     /// Compatible with Reth usage scenarios
     pub fn commit_hashed_post_state(
         &mut self, 
-        root_hash: B256, 
+        parent_root: B256, 
         difflayer: Option<&DiffLayers>, 
         hashed_post_state: &TrieDBHashedPostState) -> 
         Result<(B256, Option<Arc<DiffLayer>>), TrieDBError>
@@ -127,7 +128,7 @@ where
         let validate_start = Instant::now();
 
         let (root_hash, node_set, diff_storage_roots) = self.finalise(
-            root_hash, 
+            parent_root, 
             difflayer, 
             hashed_post_state.states.clone(), 
             hashed_post_state.states_rebuild.clone(), 

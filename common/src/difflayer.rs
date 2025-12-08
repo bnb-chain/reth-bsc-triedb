@@ -111,6 +111,14 @@ impl DiffLayer {
     pub fn is_empty(&self) -> bool {
         self.diff_nodes.is_empty() && self.diff_storage_roots.is_empty()
     }
+
+    pub fn debug_diff_storage_roots(&self) -> String {
+        let mut diff_storage_roots_str = String::new();
+        for (hased_address, root) in self.diff_storage_roots.iter() {
+            diff_storage_roots_str.push_str(&format!("hased_address: {}, root: {}\n", hased_address, root));
+        }
+        diff_storage_roots_str
+    }
 }
 
 /// A collection of diff layers for uncommitted blocks in the trie state.
