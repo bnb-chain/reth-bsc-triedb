@@ -1,6 +1,6 @@
 //! Reth-compatible implementations for TrieDB.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::time::Instant;
@@ -190,9 +190,14 @@ where
         Result<B256, TrieDBError> {
         
         let intermediate_state_objects = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild)?;        
+        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;        
         self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
         
+        for hashed_address in states_rebuild {
+            self.delete_account_with_hash_state(hashed_address)
+            .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+        }
+
         for (hashed_address, account) in updated_accounts {
             if let Some(account) = account {
                 self.update_account_with_hash_state(hashed_address, &account)
@@ -220,22 +225,8 @@ where
         let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
         let storages_for_task2 = storages;
         let metrics_clone = self.metrics.clone();
-
-        // Closure to get storage root from difflayer or path_db
-        let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
-            if states_rebuild.contains(&hashed_address) {
-                return Ok(alloy_trie::EMPTY_ROOT_HASH);
-            }
-
-            if let Some(dl) = difflayer_clone.as_ref() {
-                if let Some(root) = dl.get_storage_root(hashed_address) {
-                    return Ok(root);
-                }
-            }
-            path_db_clone.get_storage_root(hashed_address)
-                .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))
-                .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
-        };
+        let account_trie_clone_task1 = Arc::new(Mutex::new(self.account_trie.as_mut().unwrap().clone()));
+        let account_trie_clone_task2 = Arc::new(Mutex::new(self.account_trie.as_mut().unwrap().clone()));
 
         // Parallel execution: process accounts and storages simultaneously
         let (account_result, storage_result): (
@@ -243,6 +234,35 @@ where
             Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>, HashMap<B256, StateTrie<DB>>), TrieDBError>
         ) = rayon::join(
             || {
+                // Closure to get storage root from difflayer or path_db (Task 1)
+                let account_trie_clone = account_trie_clone_task1.clone();
+                let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
+                    if states_rebuild.contains(&hashed_address) {
+                        return Ok(alloy_trie::EMPTY_ROOT_HASH);
+                    }
+
+                    if let Some(dl) = difflayer_clone.as_ref() {
+                        if let Some(root) = dl.get_storage_root(hashed_address) {
+                            return Ok(root);
+                        }
+                    }
+
+                    let path_db_root = path_db_clone.get_storage_root(hashed_address)
+                        .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))?
+                        .unwrap_or(alloy_trie::EMPTY_ROOT_HASH);
+
+                    let account_trie_root = account_trie_clone.lock().unwrap().get_account_with_hash_state(hashed_address)
+                        .ok()
+                        .flatten()
+                        .map(|account| account.storage_root)
+                        .unwrap_or(alloy_trie::EMPTY_ROOT_HASH);
+
+                    if path_db_root != account_trie_root {
+                        panic!("Storage root mismatch for hashed_address: 0x{}, path_db_root: 0x{}, account_trie_root: 0x{}", hex::encode(hashed_address), hex::encode(path_db_root), hex::encode(account_trie_root));
+                    }
+                    return Ok(path_db_root)
+                };
+
                 // Task 1: Process accounts that don't have storage updates (parallel)
                 let task1_start = Instant::now();
                 let result = accounts_clone
@@ -275,6 +295,34 @@ where
                 result
             },
             || {
+                // Closure to get storage root from difflayer or path_db (Task 2)
+                let account_trie_clone = account_trie_clone_task2.clone();
+                let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
+                    if states_rebuild.contains(&hashed_address) {
+                        return Ok(alloy_trie::EMPTY_ROOT_HASH);
+                    }
+
+                    if let Some(dl) = difflayer_clone.as_ref() {
+                        if let Some(root) = dl.get_storage_root(hashed_address) {
+                            return Ok(root);
+                        }
+                    }
+                    let path_db_root = path_db_clone.get_storage_root(hashed_address)
+                        .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))?
+                        .unwrap_or(alloy_trie::EMPTY_ROOT_HASH);
+
+                    let account_trie_root = account_trie_clone.lock().unwrap().get_account_with_hash_state(hashed_address)
+                        .ok()
+                        .flatten()
+                        .map(|account| account.storage_root)
+                        .unwrap_or(alloy_trie::EMPTY_ROOT_HASH);
+
+                    if path_db_root != account_trie_root {
+                        panic!("Storage root mismatch for hashed_address: 0x{}, path_db_root: 0x{}, account_trie_root: 0x{}", hex::encode(hashed_address), hex::encode(path_db_root), hex::encode(account_trie_root));
+                    }
+                    return Ok(path_db_root)
+                };
+
                 // Task 2: Process accounts with storage updates (parallel)
                 let task2_start = Instant::now();
                 let result = storages_for_task2
