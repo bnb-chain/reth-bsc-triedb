@@ -190,9 +190,14 @@ where
         Result<B256, TrieDBError> {
         
         let intermediate_state_objects = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild)?;        
+        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;        
         self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
         
+        for hashed_address in states_rebuild {
+            self.delete_account_with_hash_state(hashed_address)
+                    .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+        }
+
         for (hashed_address, account) in updated_accounts {
             if let Some(account) = account {
                 self.update_account_with_hash_state(hashed_address, &account)
