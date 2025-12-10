@@ -79,6 +79,9 @@ pub trait SecureTrieTrait {
     /// Gets an account from the trie by hash state
     fn get_account_with_hash_state(&mut self, hashed_address: B256) -> Result<Option<StateAccount>, Self::Error>;
 
+    /// Touches an account by hash states
+    fn touch_account_with_hash_state(&mut self, hashed_address: B256) -> Result<(), Self::Error>;
+
     /// Updates an account in the trie by hash state
     fn update_account_with_hash_state(&mut self, hashed_address: B256, account: &StateAccount) -> Result<(), Self::Error>;
 
@@ -87,6 +90,9 @@ pub trait SecureTrieTrait {
 
     /// Gets storage value for an account by key and hash state
     fn get_storage_with_hash_state(&mut self, hashed_address: B256, hashed_key: B256) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Touches an account by hash state
+    fn touch_storage_with_hash_state(&mut self, hashed_key: B256) -> Result<(), Self::Error>;
 
     /// Updates storage value for an account by key and hash state
     fn update_storage_with_hash_state(&mut self, hashed_address: B256, hashed_key: B256, value: &[u8]) -> Result<(), Self::Error>;
