@@ -106,6 +106,16 @@ pub struct TrieDBHashedPostState {
     pub storage_states: HashMap<B256, HashMap<B256, Option<U256>>>
 }
 
+#[derive(Clone, Debug)]
+pub struct TrieDBPrefetchState<DB>
+where
+    DB: TrieDatabase + Clone + Send + Sync,
+    DB::Error: std::fmt::Debug,
+{
+    pub account_trie: StateTrie<DB>,
+    pub storage_roots: HashMap<B256, B256>,
+    pub storage_tries: HashMap<B256, StateTrie<DB>>,
+}
 
 /// Compatible with Reth client usage scenarios
 impl<DB> TrieDB<DB>
@@ -197,7 +207,7 @@ where
             self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
         }
-
+        
         for (hashed_address, account) in updated_accounts {
             if let Some(account) = account {
                 self.update_account_with_hash_state(hashed_address, &account)
