@@ -160,6 +160,10 @@ impl PathDB {
         db_opts.set_target_file_size_base(config.target_file_size_base);
         db_opts.set_max_background_jobs(config.max_background_jobs);
         db_opts.create_if_missing(config.create_if_missing);
+        
+        // Disable auto compaction during startup to avoid slow initialization
+        // Compaction will happen automatically in the background during runtime
+        db_opts.set_disable_auto_compactions(true);
 
         // Ensure all required Column Families exist
         ensure_column_families(path, &db_opts, &config)?;
@@ -170,11 +174,32 @@ impl PathDB {
             let mut cf_opts = Options::default();
             cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
             cf_opts.set_write_buffer_size(config.write_buffer_size);
+            // Disable auto compaction for each column family as well
+            cf_opts.set_disable_auto_compactions(true);
             cf_descriptors.push(ColumnFamilyDescriptor::new(cf_name, cf_opts));
         }
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
             .map_err(|e| PathProviderError::Database(format!("Failed to open RocksDB: {}", e)))?;
+        
+        // Re-enable auto compaction after database is opened
+        // This allows compaction to happen gradually in the background during runtime
+        // without blocking startup
+        for cf_name in COLUMN_FAMILY_NAMES {
+            if let Some(cf) = db.cf_handle(cf_name) {
+                if let Err(e) = db.set_options_cf(&cf, &[("disable_auto_compactions", "false")]) {
+                    warn!(
+                        target: "pathdb::rocksdb",
+                        "Failed to re-enable auto compaction for column family '{}': {}", cf_name, e
+                    );
+                } else {
+                    trace!(
+                        target: "pathdb::rocksdb",
+                        "Re-enabled auto compaction for column family '{}'", cf_name
+                    );
+                }
+            }
+        }
 
         let cf_names_set: HashSet<String> = COLUMN_FAMILY_NAMES.iter().map(|s| s.to_string()).collect();
 
@@ -670,6 +695,8 @@ fn ensure_column_families(
         let mut cf_opts = Options::default();
         cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
         cf_opts.set_write_buffer_size(config.write_buffer_size);
+        // Disable auto compaction during startup
+        cf_opts.set_disable_auto_compactions(true);
         existing_cf_descriptors.push(ColumnFamilyDescriptor::new(cf_name, cf_opts));
     }
 
