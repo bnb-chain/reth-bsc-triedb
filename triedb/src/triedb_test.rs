@@ -98,7 +98,7 @@ fn test_update_all_initial(triedb: &mut TrieDB<PathDB>) -> Result<(B256, Option<
     println!("Constructed {} storage states", storage_states.len());
     
     // Call update_all interface
-    let result = triedb.finalise(EMPTY_ROOT_HASH, None, states, HashSet::new(), storage_states);
+    let result = triedb.finalise(EMPTY_ROOT_HASH, None, states, HashSet::new(), storage_states, None);
     match &result {
         Ok((root_hash, node_set, diff_storage_roots)) => {    
             // Assert that root_hash matches BSC implementation result
@@ -191,7 +191,7 @@ fn test_update_all_modifications(root_hash: B256, difflayer: Option<Arc<MergedNo
         None
     };
     // Call update_all interface
-    let result = triedb.finalise(root_hash, difflayers.as_ref(), states, HashSet::new(), storage_states);
+    let result = triedb.finalise(root_hash, difflayers.as_ref(), states, HashSet::new(), storage_states, None);
     
     match result {
         Ok((root_hash, node_set, diff_storage_roots)) => {
@@ -358,13 +358,13 @@ fn test_multiple_accounts_update() {
         states,
         states_rebuild,
         storage_states,
+        None,
     ).unwrap();
 
     let difflayer = Arc::new(DiffLayer::new(merged_node_set.to_diff_nodes(), diff_storage_roots));
     triedb.flush(0, root_hash, &Some(difflayer)).unwrap();
     
-
-    triedb.state_at(root_hash, None).unwrap();
+    triedb.state_at(root_hash, None, None).unwrap();
 
     for i in 0..total_operations {
         let hashed_address = keccak256((i as u64).to_le_bytes());

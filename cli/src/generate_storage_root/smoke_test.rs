@@ -71,7 +71,8 @@ fn test_generate_storage_root_smoke() -> Result<()> {
     let (new_root, difflayers) = triedb.commit_hashed_post_state(
         initial_root,
         None,
-        &hashed_post_state
+        &hashed_post_state,
+        None
     )?;
 
     let difflayer = if let Some(difflayer) = difflayers {

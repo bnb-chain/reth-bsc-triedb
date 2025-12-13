@@ -129,7 +129,8 @@ where
         &mut self, 
         parent_root: B256, 
         difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState) -> 
+        hashed_post_state: &TrieDBHashedPostState, 
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
         Result<(B256, Option<Arc<DiffLayer>>), TrieDBError>
     where
         DB: 'static,
@@ -142,7 +143,8 @@ where
             difflayer, 
             hashed_post_state.states.clone(), 
             hashed_post_state.states_rebuild.clone(), 
-            hashed_post_state.storage_states.clone())?;
+            hashed_post_state.storage_states.clone(),
+            prefetcher)?;
 
         let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
         
@@ -169,13 +171,14 @@ where
         difflayer: Option<&DiffLayers>, 
         states: HashMap<B256, Option<StateAccount>>,
         states_rebuild: HashSet<B256>,
-        storage_states: HashMap<B256, HashMap<B256, Option<U256>>>) -> 
+        storage_states: HashMap<B256, HashMap<B256, Option<U256>>>,
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
         Result<(B256, Arc<MergedNodeSet>, Arc<HashMap<B256, B256>>), TrieDBError>
     where
         DB: 'static,
     {
         
-        self.state_at(parent_root, difflayer)?;
+        self.state_at(parent_root, difflayer, prefetcher)?;
 
         let intermediate_root_start = Instant::now();
         let root_hash = self.intermediate_root(states, storage_states, states_rebuild)?;
@@ -235,11 +238,18 @@ where
         let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
         let storages_for_task2 = storages;
         let metrics_clone = self.metrics.clone();
+        let prefetcher_clone = self.prefetcher.clone();
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
             if states_rebuild.contains(&hashed_address) {
                 return Ok(alloy_trie::EMPTY_ROOT_HASH);
+            }
+
+            if let Some(prefetcher) = &self.prefetcher {
+                if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
+                    return Ok(*root);
+                }
             }
 
             if let Some(dl) = difflayer_clone.as_ref() {
@@ -295,14 +305,33 @@ where
                 let result = storages_for_task2
                     .into_par_iter()
                     .map(|(hashed_address, kvs)| {
+
+                        // Try to get storage_trie from prefetcher, otherwise create a new one
+                        let mut storage_trie = match prefetcher_clone.as_ref()
+                            .and_then(|p| p.storage_tries.get(&hashed_address))
+                            .cloned()
+                        {
+                            Some(trie) => trie,
+                            None => {
+                                // Get storage root from path_db or difflayer
+                                let storage_root = get_storage_root(hashed_address)?;
+                                let id = SecureTrieId::new(storage_root)
+                                    .with_owner(hashed_address);
+                                SecureTrieBuilder::new(path_db_clone.clone())
+                                    .with_id(id)
+                                    .build_with_difflayer(difflayer_clone.as_ref())
+                                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?
+                            }
+                        };
+                        
                         // Get storage root from path_db or difflayer (same logic as task 1)
-                        let storage_root = get_storage_root(hashed_address)?;
-                        let id = SecureTrieId::new(storage_root)
-                            .with_owner(hashed_address);
-                        let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
-                            .with_id(id)
-                            .build_with_difflayer(difflayer_clone.as_ref())
-                            .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+                        // let storage_root = get_storage_root(hashed_address)?;
+                        // let id = SecureTrieId::new(storage_root)
+                        //     .with_owner(hashed_address);
+                        // let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
+                        //     .with_id(id)
+                        //     .build_with_difflayer(difflayer_clone.as_ref())
+                        //     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
 
                         // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();

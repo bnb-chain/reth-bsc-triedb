@@ -1,6 +1,7 @@
 //! Trie database implementation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
@@ -12,6 +13,7 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieBuilder};
 
 use crate::triedb_metrics::TrieDBMetrics;
+use crate::triedb_reth::TrieDBPrefetchState;
 
 /// Error type for trie database operations
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +165,11 @@ where
     ///
     /// This database provides the persistent storage backend for all trie operations.
     pub(crate) path_db: DB,
+
+    /// The prefetch state of the trie db
+    ///
+    /// This is used to store the prefetched state of the trie db.
+    pub(crate) prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>,
     
     /// Metrics for monitoring trie database operations and performance.
     pub(crate) metrics: TrieDBMetrics,
@@ -184,18 +191,24 @@ where
             updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: path_db.clone(),
+            prefetcher: None,
             metrics: TrieDBMetrics::new_with_labels(&[("instance", "default")]),
         }
     }
 
     /// Reset the state of the trie db to the given root hash and difflayer
-    pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>) -> Result<(), TrieDBError> {
-        let id = SecureTrieId::new(root_hash);
-        self.account_trie = Some(
-            SecureTrieBuilder::new(self.path_db.clone())
-            .with_id(id)
-            .build_with_difflayer(difflayer)?
-        );
+    pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
+        self.prefetcher = prefetcher;
+        if let Some(prefetcher) = &self.prefetcher {
+            self.account_trie = Some(prefetcher.account_trie.clone());
+        } else {
+            let id = SecureTrieId::new(root_hash);
+            self.account_trie = Some(
+                SecureTrieBuilder::new(self.path_db.clone())
+                .with_id(id)
+                .build_with_difflayer(difflayer)?
+            );
+        }
         self.root_hash = root_hash;
         self.updated_storage_roots.clear();
         self.difflayer = difflayer.map(|d| d.clone());
@@ -223,6 +236,7 @@ where
         let accounts_with_storage_trie = std::mem::take(&mut self.accounts_with_storage_trie);
         let updated_storage_roots = std::mem::take(&mut self.updated_storage_roots);
         let difflayer = std::mem::take(&mut self.difflayer);
+        let prefetcher = std::mem::take(&mut self.prefetcher);
         
         // Reset simple fields immediately
         self.root_hash = EMPTY_ROOT_HASH;
@@ -231,6 +245,7 @@ where
         std::thread::spawn(move || {
             // Drop all values in background thread
             // This allows Arc references to be released asynchronously
+            drop(prefetcher);
             drop(account_trie);
             drop(storage_tries);
             drop(accounts_with_storage_trie);
@@ -254,6 +269,7 @@ where
             updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: self.path_db.clone(),
+            prefetcher: None,
             metrics: self.metrics.clone()
         }
     }
