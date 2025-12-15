@@ -123,48 +123,6 @@ where
     DB: TrieDatabase + Clone + Send + Sync,
     DB::Error: std::fmt::Debug,
 {  
-    /// Transfers HashedPostState to triedb structure and commits the changes
-    /// Compatible with Reth usage scenarios
-    pub fn commit_hashed_post_state(
-        &mut self, 
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
-        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
-        Result<(B256, Option<Arc<DiffLayer>>), TrieDBError>
-    where
-        DB: 'static,
-    {
-
-        let validate_start = Instant::now();
-
-        let (root_hash, node_set, diff_storage_roots) = self.finalise(
-            parent_root, 
-            difflayer, 
-            hashed_post_state.states.clone(), 
-            hashed_post_state.states_rebuild.clone(), 
-            hashed_post_state.storage_states.clone(),
-            prefetcher)?;
-
-        let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
-        
-        if difflayer.is_empty() {
-            return Ok((root_hash, None));
-        }
-
-        self.metrics.record_validate_duration(validate_start.elapsed().as_secs_f64());
-        
-        Ok((root_hash, Some(difflayer)))      
-    }
-
-    /// Batch update the changes and commit
-    /// Compatible with Reth usage scenarios
-    /// 
-    /// 1. Reset the trie db state
-    /// 2. Prepare accounts to be updated
-    /// 3. Prepare required data to avoid borrowing conflicts for parallel execution
-    /// 4. Parallel execution: update accounts and storage simultaneously
-    /// 5. Commit the changes
     pub fn finalise(
         &mut self, 
         parent_root: B256, 
@@ -179,29 +137,19 @@ where
     {
         
         self.state_at(parent_root, difflayer, prefetcher)?;
-
-        let intermediate_root_start = Instant::now();
-        let root_hash = self.intermediate_root(states, storage_states, states_rebuild)?;
-        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
-
-        let commit_start = Instant::now();
-        let (_, node_set) = self.commit(true)?;
-        self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
-
-        let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
-
-        self.clean();
-        
-        Ok((root_hash, node_set, diff_storage_roots))
+        self.intermediate_inner(states, storage_states, states_rebuild)?;
+        return self.commit_inner(true)
     }
 
-    pub fn intermediate_root(
+    fn intermediate_inner(
         &mut self, 
         accounts: HashMap<B256, Option<StateAccount>>,
         storages: HashMap<B256, HashMap<B256, Option<U256>>>,
         states_rebuild: HashSet<B256>) -> 
         Result<B256, TrieDBError> {
         
+        let intermediate_root_start = Instant::now();
+
         let intermediate_state_objects = Instant::now();
         let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;        
         self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
@@ -220,7 +168,8 @@ where
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             }
         }
-        let root_hash = self.account_trie.as_mut().unwrap().hash();        
+        let root_hash = self.account_trie.as_mut().unwrap().hash();
+        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());     
         return Ok(root_hash);
     }
 
@@ -381,7 +330,21 @@ where
         Ok(accounts_no_storage)
     }
 
-    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
+    fn commit_inner(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>, Arc<HashMap<B256, B256>>), TrieDBError>
+    where
+        DB: 'static,
+    {
+        let commit_start = Instant::now();
+        let (root_hash, node_set) = self.commit_state_objects(true)?;
+        self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
+
+        let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
+        self.clean();
+
+        Ok((root_hash, node_set, diff_storage_roots))
+    }
+
+    fn commit_state_objects(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
         let mut merged_node_set = Box::new(MergedNodeSet::new());
 
         // Start both tasks in parallel using rayon
@@ -411,6 +374,50 @@ where
             }
         }
         Ok((root_hash, Arc::from(*merged_node_set)))
+    }
+
+    pub fn intermediate_and_commit_hashed_post_state(
+        &mut self, 
+        parent_root: B256, 
+        difflayer: Option<&DiffLayers>, 
+        hashed_post_state: &TrieDBHashedPostState, 
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
+        Result<(B256, Arc<DiffLayer>), TrieDBError>
+    where
+        DB: 'static,
+    {
+        self.state_at(parent_root, difflayer, prefetcher)?;
+        self.intermediate_inner(
+            hashed_post_state.states.clone(), 
+            hashed_post_state.storage_states.clone(), 
+            hashed_post_state.states_rebuild.clone())?;
+        return self.commit(true)
+    }
+
+    pub fn intermediate_hashed_post_state(
+        &mut self,
+        parent_root: B256, 
+        difflayer: Option<&DiffLayers>, 
+        hashed_post_state: &TrieDBHashedPostState, 
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>
+    ) -> Result<B256, TrieDBError>
+    where
+        DB: 'static,
+    {
+        self.state_at(parent_root, difflayer, prefetcher)?;
+        return self.intermediate_inner(
+            hashed_post_state.states.clone(), 
+            hashed_post_state.storage_states.clone(), 
+            hashed_post_state.states_rebuild.clone());
+    }
+
+    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError> 
+    where
+        DB: 'static,
+    {
+        let (root_hash, node_set, diff_storage_roots) = self.commit_inner(true)?;
+        let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
+        Ok((root_hash, difflayer)) 
     }
 }
 

@@ -9,8 +9,6 @@ use reth_metrics::{
 #[derive(Metrics, Clone)]
 #[metrics(scope = "rust.eth.triedb")]
 pub(crate) struct TrieDBMetrics {
-    /// Histogram of validate durations (in seconds)
-    pub(crate) validate_histogram: Histogram,
     /// Histogram of intermediate root durations (in seconds)
     pub(crate) intermediate_root_histogram: Histogram,
     /// Histogram of update state objects durations (in seconds)
@@ -26,10 +24,6 @@ pub(crate) struct TrieDBMetrics {
 }
 
 impl TrieDBMetrics {
-    pub(crate) fn record_validate_duration(&self, duration: f64) {
-        self.validate_histogram.record(duration);
-    }
-
     pub(crate) fn record_intermediate_root_duration(&self, duration: f64) {
         self.intermediate_root_histogram.record(duration);
     }
