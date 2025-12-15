@@ -2,9 +2,8 @@ use eyre::Result;
 use alloy_primitives::{B256, U256, keccak256};
 use rust_eth_triedb::{init_global_triedb_manager, get_global_triedb, TrieDBHashedPostState};
 use rust_eth_triedb_state_trie::account::StateAccount;
-use rust_eth_triedb_common::{TrieDatabase, DiffLayer};
+use rust_eth_triedb_common::{TrieDatabase};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::GenerateStorageRootMainTask;
@@ -30,9 +29,9 @@ fn test_generate_storage_root_smoke() -> Result<()> {
     // Step 2: Get the global triedb instance
     let mut triedb = get_global_triedb();
 
-    // Step 3: Create 1 million hash_addresses with random storage roots
+    // Step 3: Create 1 million hash_addresses with storage data
     const NUM_ACCOUNTS: usize = 1_000_000;
-    let mut expected_mapping: HashMap<B256, B256> = HashMap::new();
+    let mut hashed_addresses: Vec<B256> = Vec::new();
     let mut hashed_post_state = TrieDBHashedPostState::default();
 
     tracing::info!("Creating {} accounts with random storage roots...", NUM_ACCOUNTS);
@@ -42,22 +41,29 @@ fn test_generate_storage_root_smoke() -> Result<()> {
         let address_bytes = format!("account_{}", i).into_bytes();
         let hashed_address = keccak256(address_bytes);
 
-        // Generate a random storage root
-        let storage_root_bytes = format!("storage_root_{}", i).into_bytes();
-        let storage_root = keccak256(storage_root_bytes);
+        // Generate a random storage root by creating actual storage data
+        // This ensures the storage root is properly calculated and saved
+        let storage_key_bytes = format!("storage_key_{}", i).into_bytes();
+        let hashed_storage_key = keccak256(storage_key_bytes);
+        let storage_value = U256::from(i as u64);
 
-        // Create StateAccount with the random storage root
+        // Create StateAccount (storage_root will be calculated from actual storage data)
         let state_account = StateAccount::default()
             .with_nonce(i as u64)
             .with_balance(U256::from(i as u64))
-            .with_storage_root(storage_root)
             .with_code_hash(keccak256(b"code_hash"));
 
-        // Store the mapping
-        expected_mapping.insert(hashed_address, storage_root);
+        // Add storage data to hashed_post_state
+        // This will cause the storage root to be calculated correctly
+        let mut storage_map = HashMap::new();
+        storage_map.insert(hashed_storage_key, Some(storage_value));
+        hashed_post_state.storage_states.insert(hashed_address, storage_map);
 
         // Add to hashed_post_state
         hashed_post_state.states.insert(hashed_address, Some(state_account));
+        
+        // Store hashed_address for later verification
+        hashed_addresses.push(hashed_address);
 
         if (i + 1) % 100000 == 0 {
             tracing::info!("Created {} accounts...", i + 1);
@@ -68,31 +74,38 @@ fn test_generate_storage_root_smoke() -> Result<()> {
 
     // Step 4: Commit the hashed post state
     let initial_root = alloy_trie::EMPTY_ROOT_HASH;
-    let (new_root, difflayers) = triedb.commit_hashed_post_state(
+    let (new_root, difflayer) = triedb.intermediate_and_commit_hashed_post_state(
         initial_root,
         None,
         &hashed_post_state,
         None
     )?;
 
-    let difflayer = if let Some(difflayer) = difflayers {
-        let new_difflayer = DiffLayer::new(
-            difflayer.diff_nodes.clone(),
-            Arc::from(HashMap::new())  // Empty diff_storage_roots
-        );
-        Some(Arc::new(new_difflayer))
-    } else {
-        None
-    };
-
     tracing::info!("Committed state root: {:?}", new_root);
 
     // Flush to disk (using block number 1 and the new root)
-    triedb.flush(1, new_root, &difflayer)?;
+    triedb.flush(1, new_root, &Some(difflayer))?;
 
     tracing::info!("Flushed changes to disk");
 
-    // Step 5: Create GenerateStorageRootMainTask and start
+    triedb.state_at(new_root, None, None)?;
+    // Step 5: Read expected storage roots from committed accounts
+    // These are the storage roots that should be saved by GenerateStorageRootMainTask
+    tracing::info!("Reading expected storage roots from committed accounts...");
+    let mut expected_mapping: HashMap<B256, B256> = HashMap::new();
+    for hashed_address in &hashed_addresses {
+        match triedb.get_account_with_hash_state(*hashed_address)? {
+            Some(account) => {
+                expected_mapping.insert(*hashed_address, account.storage_root);
+            }
+            None => {
+                return Err(eyre::eyre!("Account not found for hashed_address: {:?}", hashed_address));
+            }
+        }
+    }
+    tracing::info!("Read {} expected storage roots", expected_mapping.len());
+
+    // Step 6: Create GenerateStorageRootMainTask and start
     tracing::info!("Creating GenerateStorageRootMainTask...");
     let path_db = triedb.get_mut_path_db_ref().clone();
 
@@ -103,6 +116,7 @@ fn test_generate_storage_root_smoke() -> Result<()> {
     main_task.start()?;
     tracing::info!("GenerateStorageRootMainTask execution completed");
 
+    // Step 7: Verify storage roots
     tracing::info!("Verifying storage roots...");
     let mut verified_count = 0;
     let mut mismatch_count = 0;
