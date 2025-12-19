@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use alloy_rlp::{Decodable, Encodable, Header, Error as RlpError};
 use alloy_primitives::{keccak256, B256};
-use crate::node::rlp_raw::*;
-use crate::node::{HashNode, Node, NodeFlag};
+use super::rlp_raw::*;
+use super::{HashNode, Node, NodeFlag};
 
 /// Full node with 17 children (16 hex digits + value)
 #[derive(Clone, Debug, PartialEq)]

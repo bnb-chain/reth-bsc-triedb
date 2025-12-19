@@ -20,6 +20,8 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 [dependencies]
 # alloy
 alloy-primitives = { workspace = true , asm-keccak = true}
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
 
 # misc
 auto_impl.workspace = true

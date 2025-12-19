@@ -180,8 +180,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::ShortNode;
-    use crate::encoding::*;
+    use super::ShortNode;
 
     #[test]
     fn fullnode_roundtrip_basic() {
@@ -218,6 +217,7 @@ mod tests {
     #[test]
     fn shortnode_roundtrip_basic() {
         // Build a short node: key is a nibble-terminated path, value is a byte string
+        use crate::encoding::{key_to_nibbles, hex_to_compact};
         let key_bytes = vec![0x12, 0x34];
         let hex_key = key_to_nibbles(&key_bytes); // includes terminator
         let compact_key = hex_to_compact(&hex_key);
@@ -250,6 +250,7 @@ mod tests {
 
     #[test]
     fn fullnode_child1_short_with_1byte_value() {
+        use crate::encoding::{key_to_nibbles, hex_to_compact};
         init_empty_root_node();
         // Build leaf short with 1-byte value
         let hex_key = key_to_nibbles(&[0x0A]);
@@ -282,6 +283,7 @@ mod tests {
 
     #[test]
     fn shortnode_with_fullnode_value_with_1byte_in_17th_child() {
+        use crate::encoding::{write_hex_key, hex_to_compact};
         init_empty_root_node();
         // Inner full node with 17th (index 16) child = 1-byte value
         let mut inner_full = FullNode::new();

@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use alloy_rlp::{Decodable, Encodable, Header, Error as RlpError, };
 use alloy_primitives::{keccak256, B256};
-use crate::encoding::*;
-use crate::node::rlp_raw::*;
+use crate::encoding::{compact_to_hex, has_terminator};
+use super::rlp_raw::*;
 use super::{Node, NodeFlag, HashNode};
 
 

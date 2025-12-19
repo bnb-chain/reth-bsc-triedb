@@ -3,8 +3,8 @@
 use std::{sync::Arc};
 
 use alloy_primitives::{Address, B256, U256};
-use super::account::StateAccount;
-use super::node::{NodeSet};
+use rust_eth_triedb_common::StateAccount;
+use rust_eth_triedb_common::node::NodeSet;
 
 /// Error type for secure trie operations
 pub type SecureTrieError = super::secure_trie::SecureTrieError;

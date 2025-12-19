@@ -1,7 +1,7 @@
 use eyre::Result;
 use alloy_primitives::{B256, U256, keccak256};
 use rust_eth_triedb::{init_global_triedb_manager, get_global_triedb, TrieDBHashedPostState};
-use rust_eth_triedb_state_trie::account::StateAccount;
+use rust_eth_triedb_common::StateAccount;
 use rust_eth_triedb_common::{TrieDatabase};
 use std::collections::HashMap;
 use tempfile::TempDir;

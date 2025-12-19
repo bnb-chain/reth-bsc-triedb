@@ -1,7 +1,7 @@
 // use crate::reth_trie_state_root::RethTrieStateRootPreparer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::SmokeTest;
-use rust_eth_triedb_state_trie::node::init_empty_root_node;
+use rust_eth_triedb_common::node::init_empty_root_node;
 
 #[test]
 fn test_state_trie_smoke_test() -> Result<(), Box<dyn std::error::Error>> {

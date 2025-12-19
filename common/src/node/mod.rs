@@ -25,4 +25,4 @@ pub use node::{HashNode, Node, NodeFlag, ValueNode, init_empty_root_node, get_em
 pub use node_set::{NodeSet, MergedNodeSet};
 pub use short_node::ShortNode;
 // Re-export TrieNode, DiffLayer, DiffLayers from common crate
-pub use rust_eth_triedb_common::{TrieNode, DiffLayer, DiffLayers};
+pub use crate::{TrieNode, DiffLayer, DiffLayers};

@@ -5,7 +5,7 @@ use rust_eth_triedb_common::TrieDatabase;
 use thiserror::Error;
 use alloy_trie::EMPTY_ROOT_HASH;
 use super::state_trie::StateTrie;
-use super::node::DiffLayers;
+use rust_eth_triedb_common::DiffLayers;
 
 // use super::state_trie::StateTrie;
 

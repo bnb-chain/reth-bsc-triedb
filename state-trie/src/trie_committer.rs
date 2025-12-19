@@ -8,9 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::node::{Node, FullNode, NodeSet, TrieNode};
+use rust_eth_triedb_common::node::{Node, FullNode, NodeSet};
+use rust_eth_triedb_common::TrieNode;
 use crate::trie_tracer::TrieTracer;
-use crate::encoding::hex_to_compact;
+use rust_eth_triedb_common::encoding::hex_to_compact;
 
 /// Committer is used for the trie commit operation.
 /// It captures all dirty nodes during commit and keeps them cached in insertion order.

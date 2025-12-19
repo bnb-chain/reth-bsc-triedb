@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 
 use alloy_primitives::B256;
-use rust_eth_triedb_common::{Leaf, TrieNode};
+use crate::{Leaf, TrieNode};
 use crate::encoding;
 
 /// NodeSet contains a set of nodes collected during the commit operation.

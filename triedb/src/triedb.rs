@@ -7,9 +7,9 @@ use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
 
 use rust_eth_triedb_common::TrieDatabase;
-use rust_eth_triedb_state_trie::node::DiffLayers;
+use rust_eth_triedb_common::DiffLayers;
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
-use rust_eth_triedb_state_trie::account::StateAccount;
+use rust_eth_triedb_common::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieBuilder};
 
 use crate::triedb_metrics::TrieDBMetrics;

@@ -7,16 +7,10 @@
 // Note: Global allocator is configured in the main triedb crate to avoid conflicts
 // This crate still supports jemalloc feature for dependency resolution
 
-/// Key encoding utilities for trie operations
-pub mod encoding;
-/// Node structures for trie implementation
-pub mod node;
 /// Core trie implementation
 pub mod trie;
 /// Traits for secure trie operations
 pub mod traits;
-/// Account structure and implementation
-pub mod account;
 /// Secure trie identifier and builder
 pub mod secure_trie;
 /// State trie implementation
@@ -31,10 +25,15 @@ pub mod trie_committer;
 #[cfg(test)]
 mod trie_test;
 
+// Re-export from common crate
+pub use rust_eth_triedb_common::{
+    StateAccount,
+    encoding,
+    node::{NodeSet, Node, FullNode, ShortNode, HashNode, ValueNode, NodeFlag, init_empty_root_node, get_empty_root_node},
+    TrieNode, DiffLayer, DiffLayers,
+};
+
 pub use state_trie::StateTrie;
-pub use account::StateAccount;
 pub use traits::SecureTrieTrait;
-pub use node::NodeSet;
 // Re-export TrieNode, DiffLayer, DiffLayers from common crate
 pub use secure_trie::{SecureTrieId, SecureTrieBuilder, SecureTrieError};
-pub use rust_eth_triedb_common::{TrieNode, DiffLayer, DiffLayers};

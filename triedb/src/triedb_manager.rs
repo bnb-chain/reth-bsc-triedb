@@ -7,7 +7,7 @@ use std::sync::{OnceLock};
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
 // use rust_eth_triedb_snapshotdb::{SnapshotDB, PathProviderConfig as SnapshotPathProviderConfig};
 use super::TrieDB;
-use rust_eth_triedb_state_trie::node::init_empty_root_node;
+use rust_eth_triedb_common::node::init_empty_root_node;
 use tracing::info;
 
 // Global singleton for active_triedb flag - can only be initialized once

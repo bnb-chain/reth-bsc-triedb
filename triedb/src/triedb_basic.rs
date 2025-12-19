@@ -4,7 +4,7 @@ use alloy_primitives::{keccak256, Address, B256};
 use alloy_trie::EMPTY_ROOT_HASH;
 use rust_eth_triedb_common::TrieDatabase;
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
-use rust_eth_triedb_state_trie::account::StateAccount;
+use rust_eth_triedb_common::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
 use crate::triedb::{TrieDB, TrieDBError};

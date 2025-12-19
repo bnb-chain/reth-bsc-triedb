@@ -3,8 +3,8 @@
 //! This module provides a hasher for computing trie hashes.
 use std::sync::Arc;
 use alloy_primitives::{keccak256};
-use crate::node::{Node, ShortNode, FullNode};
-use crate::encoding::hex_to_compact;
+use rust_eth_triedb_common::node::{Node, ShortNode, FullNode};
+use rust_eth_triedb_common::encoding::hex_to_compact;
 use rayon::prelude::*;
 
 /// Hasher structure for computing trie hashes
@@ -170,7 +170,7 @@ mod tests {
     use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
     use std::env;
     use alloy_primitives::{B256, keccak256};
-    use crate::node::init_empty_root_node;
+    use rust_eth_triedb_common::node::init_empty_root_node;
 
     /// Create a test trie with specified operations
     fn create_test_trie(operations: &[(Vec<u8>, Option<Vec<u8>>)]) -> Trie<PathDB> {

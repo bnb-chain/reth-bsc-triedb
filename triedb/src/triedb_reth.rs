@@ -7,9 +7,10 @@ use std::time::Instant;
 
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
-use rust_eth_triedb_state_trie::node::{MergedNodeSet, NodeSet, DiffLayer, DiffLayers};
+use rust_eth_triedb_common::node::{MergedNodeSet, NodeSet};
+use rust_eth_triedb_common::{DiffLayer, DiffLayers};
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
-use rust_eth_triedb_state_trie::account::StateAccount;
+use rust_eth_triedb_common::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
 use crate::triedb::{TrieDB, TrieDBError};

@@ -6,12 +6,12 @@ use std::{sync::Arc};
 use alloy_rlp::{Encodable, Decodable};
 use rust_eth_triedb_common::TrieDatabase;
 
-use super::account::StateAccount;
+use rust_eth_triedb_common::StateAccount;
 use super::secure_trie::{SecureTrieId, SecureTrieError};
 use super::traits::SecureTrieTrait;
 use super::trie::Trie;
-use super::node::{NodeSet, DiffLayers};
-use super::node::rlp_raw;
+use rust_eth_triedb_common::node::{NodeSet, rlp_raw};
+use rust_eth_triedb_common::DiffLayers;
 
 /// Ethereum-compatible state trie implementation with secure key hashing.
 ///

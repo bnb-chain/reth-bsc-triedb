@@ -4,7 +4,7 @@ use alloy_primitives::{B256, keccak256};
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
 use crate::secure_trie::{SecureTrieBuilder, SecureTrieId};
 use crate::traits::SecureTrieTrait;
-use super::node::init_empty_root_node;
+use rust_eth_triedb_common::node::init_empty_root_node;
 use alloy_trie::{EMPTY_ROOT_HASH};
 use std::env;
 
@@ -1949,7 +1949,7 @@ fn test_committer_parallel_equivalence() {
     use crate::trie_committer::Committer;
     use std::sync::{Arc, Mutex};
     use std::env;
-    use crate::node::{NodeSet, Node};
+    use rust_eth_triedb_common::node::{NodeSet, Node};
 
     // Prepare temporary DB directories
     let temp_dir1 = env::temp_dir().join("trie_commit_equiv1");
