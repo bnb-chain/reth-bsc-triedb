@@ -191,46 +191,27 @@ impl<'a> Committer<'a> {
         children
     }
 
-    fn clear_node_flags(&self, node: Arc<Node>) -> Option<Arc<Node>> {
+    fn clear_node_flags(&self, node: Arc<Node>) -> Arc<Node> {
         match node.as_ref() {
             Node::Full(full) => {
-                for i in 0..16 {
-                    match &*full.children[i] {
-                        Node::Full(_) => {
-                            return None;
-                        }
-                        Node::Short(_) => {
-                            return None;
-                        }
-                        _ => {}
-                    }
+                let mut new_full = Box::new(FullNode::new());
+                
+                for i in 0..17 {
+                    new_full.set_child(i, &self.clear_node_flags(full.children[i].clone()));
                 }
-                let new_full = FullNode{
-                    children: full.children.clone(),
-                    flags: NodeFlag::default(),
-                };
-                return Some(Arc::new(Node::Full(Arc::new(new_full))));
+                return Arc::new(Node::Full(Arc::from(new_full)));
             }
             Node::Short(short) => {
-                match &*short.val {
-                    Node::Full(_) => {
-                        return None;
-                    }
-                    Node::Short(_) => {
-                        return None;
-                    }
-                    _ => {}
-                }
                 let new_key = compact_to_hex(&short.key);
                 let new_short = ShortNode{
                     key: new_key,
-                    val: short.val.clone(),
+                    val: self.clear_node_flags(short.val.clone()),
                     flags: NodeFlag::default(),
                 };
-                return Some(Arc::new(Node::Short(Arc::new(new_short))));
+                return Arc::new(Node::Short(Arc::new(new_short)));
             }
             _ => {
-                return Some(node);
+                return node;
             }
         }
     }
@@ -252,7 +233,7 @@ impl<'a> Committer<'a> {
             let node_bytes = Node::node_to_bytes(node.clone());
             let mut nodeset = self.nodes.lock().unwrap();
             let cleared_node = self.clear_node_flags(node.clone());
-            nodeset.add_node(path.as_slice(), Arc::new(TrieNode::new(hash, Some(node_bytes))), cleared_node);
+            nodeset.add_node(path.as_slice(), Arc::new(TrieNode::new(hash, Some(node_bytes))), Some(cleared_node));
         }
 
         if self.collect_leaf {
