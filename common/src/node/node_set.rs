@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use alloy_primitives::B256;
 use crate::{Leaf, TrieNode};
 use crate::encoding;
+use super::Node;
 
 /// NodeSet contains a set of nodes collected during the commit operation.
 /// Each node is keyed by path. It's not thread-safe to use.
@@ -25,7 +26,7 @@ pub struct NodeSet {
     /// Count of deleted nodes
     pub deletes: usize,
     /// Diff layer
-    pub difflayer: Box<HashMap<Vec<u8>, Arc<TrieNode>>>,
+    pub difflayer: Box<HashMap<Vec<u8>, (Arc<TrieNode>, Option<Arc<Node>>)>>,
 }
 
 impl NodeSet {
@@ -42,22 +43,22 @@ impl NodeSet {
     }
 
     /// Adds a node to the set
-    pub fn add_node(&mut self, path: &[u8], node: Arc<TrieNode>) {
+    pub fn add_node(&mut self, path: &[u8], rlp_node: Arc<TrieNode>, node: Option<Arc<Node>>) {
         let path_str = String::from_utf8_lossy(path).to_string();
 
         // Add the new node
-        if node.is_deleted() {
+        if rlp_node.is_deleted() {
             self.deletes += 1;
         } else {
             self.updates += 1;
         }
 
         if self.owner == B256::ZERO {
-            self.difflayer.insert(encoding::account_trie_node_key(path), node.clone());
+            self.difflayer.insert(encoding::account_trie_node_key(path), (rlp_node.clone(), node.clone()));
         } else {
-            self.difflayer.insert(encoding::storage_trie_node_key(self.owner.as_slice(), path), node.clone());
+            self.difflayer.insert(encoding::storage_trie_node_key(self.owner.as_slice(), path), (rlp_node.clone(), node.clone()));
         }
-        self.nodes.insert(path_str, node);
+        self.nodes.insert(path_str, rlp_node);
     }
 
     /// Adds a leaf node to the set
@@ -224,7 +225,7 @@ impl std::fmt::Debug for NodeSet {
 #[allow(dead_code)]
 pub struct MergedNodeSet {
     pub sets: HashMap<B256, Arc<NodeSet>>,
-    pub difflayer: HashMap<Vec<u8>, Arc<TrieNode>>,
+    pub difflayer: HashMap<Vec<u8>, (Arc<TrieNode>, Option<Arc<Node>>)>,
 }
 
 impl MergedNodeSet {
@@ -246,7 +247,7 @@ impl MergedNodeSet {
     }
 
     /// Convert the merged node set to a difflayer, consuming self
-    pub fn to_diff_nodes(&self) -> Arc<HashMap<Vec<u8>, Arc<TrieNode>>> {
+    pub fn to_diff_nodes(&self) -> Arc<HashMap<Vec<u8>, (Arc<TrieNode>, Option<Arc<Node>>)>> {
         Arc::new(self.difflayer.clone())
     }
 }
@@ -268,8 +269,8 @@ mod tests {
         let mut set = NodeSet::new(B256::ZERO);
         assert_eq!(set.size(), (0, 0));
 
-        set.add_node(b"abc", make_node(1, b"v1"));
-        set.add_node(b"def", Arc::new(TrieNode::new(Some(B256::ZERO), Some(Vec::new())))); // deleted
+        set.add_node(b"abc", make_node(1, b"v1"), None);
+        set.add_node(b"def", Arc::new(TrieNode::new(Some(B256::ZERO), Some(Vec::new()))), None); // deleted
         assert_eq!(set.size(), (1, 1));
         assert_eq!(set.nodes().len(), 2);
     }

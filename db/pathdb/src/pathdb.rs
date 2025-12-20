@@ -14,6 +14,7 @@ use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
 use crate::traits::*;
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
+use rust_eth_triedb_common::node::Node;
 
 // use reth_metrics::{
 //     metrics::{Counter},
@@ -111,7 +112,7 @@ pub struct PathDB {
     pub read_options: ReadOptions,
     /// Thread-safe LRU cache for trie node key-value pairs.
     /// Uses mini_moka for high-concurrency performance with sharded locks.
-    pub trie_node_cache: Arc<Cache<Vec<u8>, Option<Vec<u8>>>>,
+    pub trie_node_cache: Arc<Cache<Vec<u8>, Arc<Node>>>,
     /// Thread-safe LRU cache for storage root key-value pairs.
     /// Uses mini_moka for high-concurrency performance with sharded locks.
     pub storage_root_cache: Arc<Cache<Vec<u8>, Option<Vec<u8>>>>,
@@ -221,7 +222,7 @@ impl PathDB {
         // to control the actual number of entries (though this is not ideal, it should work for now)
         let trie_node_cache = Arc::new(
             CacheBuilder::new(trie_node_cache_size as u64)
-                .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
+                .weigher(|_k: &Vec<u8>, _v: &Arc<Node>| -> u32 { 1 })
                 .max_capacity(trie_node_cache_size as u64 * 2) // Allow many entries
                 .build()
         );
@@ -277,15 +278,17 @@ impl PathDB {
 }
 
 impl PathDB {
-    pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
+    pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Arc<Node>>> {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
         // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
-        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
-            // self.metrics.trie_node_cache_hits.increment(1);
-            trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-            return Ok(cached_value);
+        {
+            if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+                // self.metrics.trie_node_cache_hits.increment(1);
+                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+                return Ok(Some(cached_value.clone()));
+            }
         }
         // self.metrics.trie_node_cache_misses.increment(1);
 
@@ -299,93 +302,17 @@ impl PathDB {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
                 // Insert into cache - mini_moka handles LRU eviction automatically
-                self.trie_node_cache.insert(key_vec, Some(value.clone()));
-                Ok(Some(value))
+                let node = Node::decode_node(None, &value).map_err(|e| PathProviderError::Database(format!("Failed to decode trie node: {:?}", e)))?;
+                self.trie_node_cache.insert(key_vec, node.clone());
+                Ok(Some(node))
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}': 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Cache None values to avoid repeated DB lookups
-                self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
                 error!(target: "pathdb::rocksdb", "Error getting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
                 Err(PathProviderError::Database(format!("RocksDB get in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
-            }
-        }
-    }
-
-    pub fn put_raw_trie_node(&self, key: &[u8], value: &[u8]) -> PathProviderResult<()> {
-        trace!(target: "pathdb::rocksdb", "Putting key: {:?}, value_len: {}", key, value.len());
-
-        let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
-            PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
-        })?;
-
-        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-
-        // Write to DB first
-        match self.db.put_cf_opt(&cf, key, value, &self.write_options) {
-            Ok(()) => {
-                trace!(target: "pathdb::rocksdb", "Successfully put in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Update cache after successful write - mini_moka is thread-safe
-                self.trie_node_cache.insert(key.to_vec(), Some(value.to_vec()));
-                Ok(())
-            }
-            Err(e) => {
-                error!(target: "pathdb::rocksdb", "Error putting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                Err(PathProviderError::Database(format!("RocksDB put in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
-            }
-        }
-    }
-
-    pub fn delete_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<()> {
-        trace!(target: "pathdb::rocksdb", "Deleting key: {:?}", key);
-
-        let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
-            PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
-        })?;
-
-        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        let key_vec = key.to_vec();
-
-        // Delete from DB first
-        match self.db.delete_cf_opt(&cf, key, &self.write_options) {
-            Ok(()) => {
-                trace!(target: "pathdb::rocksdb", "Successfully deleted in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Remove from cache after successful delete
-                self.trie_node_cache.invalidate(&key_vec);
-                Ok(())
-            }
-            Err(e) => {
-                error!(target: "pathdb::rocksdb", "Error deleting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                Err(PathProviderError::Database(format!("RocksDB delete in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
-            }
-        }
-    }
-
-    pub fn exists_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<bool> {
-        trace!(target: "pathdb::rocksdb", "Checking existence of key: {:?}", key);
-
-        let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
-            PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
-        })?;
-            
-        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-
-        // Cache miss, check DB
-        match self.db.get_cf_opt(&cf, key, &self.read_options) {
-            Ok(Some(_)) => {
-                trace!(target: "pathdb::rocksdb", "Key exists in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                Ok(true)
-            }
-            Ok(None) => {
-                trace!(target: "pathdb::rocksdb", "Key does not exist in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                Ok(false)
-            }
-            Err(e) => {
-                error!(target: "pathdb::rocksdb", "Error checking existence of key in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                Err(PathProviderError::Database(format!("RocksDB exists in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
             }
         }
     }
@@ -455,7 +382,7 @@ impl PathDB {
     pub fn get_raw_meta_data(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         // Check cache first - metadata uses trie_node_cache
         let key_vec = key.to_vec();
-        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+        if let Some(cached_value) = self.storage_root_cache.get(&key_vec) {
             trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
             return Ok(cached_value);
         }
@@ -472,13 +399,13 @@ impl PathDB {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
                 // Insert into cache - mini_moka handles LRU eviction automatically
-                self.trie_node_cache.insert(key_vec, Some(value.clone()));
+                self.storage_root_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
                 // Cache None values to avoid repeated DB lookups
-                self.trie_node_cache.invalidate(&key_vec);
+                self.storage_root_cache.invalidate(&key_vec);
                 Ok(None)
             }
             Err(e) => {
@@ -523,20 +450,8 @@ impl PathProviderManager for PathDB {
 impl TrieDatabase for PathDB {
     type Error = PathProviderError;
 
-    fn get_trie_node(&self, path: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn get_trie_node(&self, path: &[u8]) -> Result<Option<Arc<Node>>, Self::Error> {
         self.get_raw_trie_node(path)
-    }
-
-    fn insert_trie_node(&self, path: &[u8], data: Vec<u8>) -> Result<(), Self::Error> {
-        self.put_raw_trie_node(path, &data)
-    }
-
-    fn contains_trie_node(&self, path: &[u8]) -> Result<bool, Self::Error> {
-        self.exists_raw_trie_node(path)
-    }
-
-    fn remove_trie_node(&self, path: &[u8]) {
-        let _ = self.delete_raw_trie_node(path);
     }
 
     fn get_storage_root(&self, hased_address: B256) -> Result<Option<B256>, Self::Error> {
@@ -603,20 +518,22 @@ impl TrieDatabase for PathDB {
             batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
             batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
         
-            self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
-            self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+            self.storage_root_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
+            self.storage_root_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
 
             if let Some(difflayer) = difflayer {
                 diff_nodes_len = difflayer.diff_nodes.len();
                 diff_storage_roots_len = difflayer.diff_storage_roots.len();
 
-                for (key, node) in difflayer.diff_nodes.iter() {
-                    if node.is_deleted() {
+                for (key, (rlp_node, node)) in difflayer.diff_nodes.iter() {
+                    if rlp_node.is_deleted() {
                         self.trie_node_cache.invalidate(key);
                         batch.delete_cf(&default_cf, key);
                     } else {
-                        if let Some(blob) = &node.blob {
-                            self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                        if let Some(blob) = &rlp_node.blob {
+                            if let Some(node) = node {
+                                self.trie_node_cache.insert(key.clone(), node.clone());
+                            }
                             batch.put_cf(&default_cf, key, blob);
                         }
                     }

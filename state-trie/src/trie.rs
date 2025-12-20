@@ -96,7 +96,7 @@ where
 
             let mut nodes = NodeSet::new(self.owner);
             for path in paths {
-                nodes.add_node(path.as_slice(), Arc::new(TrieNode::default()));
+                nodes.add_node(path.as_slice(), Arc::new(TrieNode::default()), None);
             }
             self.committed = true;
             return Ok((EMPTY_ROOT_HASH, Some(Arc::new(nodes))));
@@ -115,7 +115,7 @@ where
         {
             let mut nodeset = nodes.lock().unwrap();
             for path in self.tracer.deleted_nodes() {
-                nodeset.add_node(path.as_slice(), Arc::new(TrieNode::default()));
+                nodeset.add_node(path.as_slice(), Arc::new(TrieNode::default()), None);
             }
         }
 
@@ -719,7 +719,7 @@ where
     }
 
     /// Resolves a hash and tracks it in the difflayer
-    pub fn resolve_and_track(&mut self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
+    pub fn resolve_and_track(&mut self, _hash: &B256, prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
         let key = if self.owner == B256::ZERO {
             account_trie_node_key(prefix)
         } else {
@@ -728,16 +728,16 @@ where
         
         // 1. Check if the hash is in the difflayer
         if let Some(difflayers) = &self.difflayers {
-            if let Some(node) = difflayers.get_trie_nodes(key.clone()) {
-                self.tracer.on_read(prefix, node.blob.clone().unwrap());              
-                return Ok(Node::must_decode_node(Some(*hash), &node.blob.clone().unwrap()));
+            if let Some(node) = difflayers.get_trie_node(key.clone()) {
+                self.tracer.on_read(prefix, node.clone());              
+                return Ok(node);
             }           
         }
 
         // 2. Check if the hash is in the database
-        if let Some(node_blob) = self.database.get_trie_node(&key).map_err(|e| SecureTrieError::Database(format!("{:?}", e)))? {
-            self.tracer.on_read(prefix, node_blob.clone());
-            return Ok(Node::must_decode_node(Some(*hash), &node_blob));
+        if let Some(node) = self.database.get_trie_node(&key).map_err(|e| SecureTrieError::Database(format!("{:?}", e)))? {
+            self.tracer.on_read(prefix, node.clone());
+            return Ok(node);
         }
 
         let owner_hex = format!("0x{:x}", self.owner);

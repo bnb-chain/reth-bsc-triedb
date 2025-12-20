@@ -8,10 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use rust_eth_triedb_common::node::{Node, FullNode, NodeSet};
+use rust_eth_triedb_common::node::{Node, FullNode, ShortNode, NodeSet, NodeFlag};
 use rust_eth_triedb_common::TrieNode;
 use crate::trie_tracer::TrieTracer;
-use rust_eth_triedb_common::encoding::hex_to_compact;
+use rust_eth_triedb_common::encoding::{hex_to_compact, compact_to_hex};
 
 /// Committer is used for the trie commit operation.
 /// It captures all dirty nodes during commit and keeps them cached in insertion order.
@@ -191,7 +191,49 @@ impl<'a> Committer<'a> {
         children
     }
 
-    
+    fn clear_node_flags(&self, node: Arc<Node>) -> Option<Arc<Node>> {
+        match node.as_ref() {
+            Node::Full(full) => {
+                for i in 0..16 {
+                    match &*full.children[i] {
+                        Node::Full(_) => {
+                            return None;
+                        }
+                        Node::Short(_) => {
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                let new_full = FullNode{
+                    children: full.children.clone(),
+                    flags: NodeFlag::default(),
+                };
+                return Some(Arc::new(Node::Full(Arc::new(new_full))));
+            }
+            Node::Short(short) => {
+                match &*short.val {
+                    Node::Full(_) => {
+                        return None;
+                    }
+                    Node::Short(_) => {
+                        return None;
+                    }
+                    _ => {}
+                }
+                let new_key = compact_to_hex(&short.key);
+                let new_short = ShortNode{
+                    key: new_key,
+                    val: short.val.clone(),
+                    flags: NodeFlag::default(),
+                };
+                return Some(Arc::new(Node::Short(Arc::new(new_short))));
+            }
+            _ => {
+                return Some(node);
+            }
+        }
+    }
 
     /// Store the node and add it to the modified nodeset.
     /// If leaf collection is enabled, leaf nodes will be tracked in the modified nodeset as well.
@@ -201,7 +243,7 @@ impl<'a> Committer<'a> {
         if hash.is_none() {
             if self.tracer.access_list().contains_key(path.as_slice()) {
                 let mut nodeset = self.nodes.lock().unwrap();
-                nodeset.add_node(path.as_slice(), Arc::new(TrieNode::default()));
+                nodeset.add_node(path.as_slice(), Arc::new(TrieNode::default()), None);
             }
             return node;
         }
@@ -209,7 +251,8 @@ impl<'a> Committer<'a> {
         {
             let node_bytes = Node::node_to_bytes(node.clone());
             let mut nodeset = self.nodes.lock().unwrap();
-            nodeset.add_node(path.as_slice(), Arc::new(TrieNode::new(hash, Some(node_bytes))));
+            let cleared_node = self.clear_node_flags(node.clone());
+            nodeset.add_node(path.as_slice(), Arc::new(TrieNode::new(hash, Some(node_bytes))), cleared_node);
         }
 
         if self.collect_leaf {

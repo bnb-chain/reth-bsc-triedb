@@ -374,7 +374,5 @@ fn test_multiple_accounts_update() {
     triedb.clean();
 
     println!("Result: {:?}", root_hash);
-
-    
 }
 

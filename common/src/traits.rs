@@ -4,6 +4,7 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 use auto_impl::auto_impl;
 use crate::difflayer::DiffLayer;
+use crate::node::Node;
 
 /// A trait defining the interface for trie database operations.
 ///
@@ -64,69 +65,7 @@ pub trait TrieDatabase {
     ///
     /// This method may return errors related to database I/O, serialization,
     /// or backend-specific failures.
-    fn get_trie_node(&self, path: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
-
-    /// Inserts or updates a trie node in the database.
-    ///
-    /// This method stores the encoded node data at the specified path. If a
-    /// node already exists at this path, it will be overwritten with the new data.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A byte slice representing the path where the node should be stored.
-    /// * `data` - The encoded node data to store. This is typically RLP-encoded
-    ///   or in another format specific to the trie implementation.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - The node was successfully stored.
-    /// * `Err(error)` - An error occurred during the database write operation.
-    ///
-    /// # Errors
-    ///
-    /// This method may return errors related to database I/O, serialization,
-    /// or backend-specific write failures.
-    fn insert_trie_node(&self, path: &[u8], data: Vec<u8>) -> Result<(), Self::Error>;
-
-    /// Checks whether a trie node exists in the database.
-    ///
-    /// This method performs a lightweight existence check without retrieving
-    /// the full node data, which can be more efficient than calling
-    /// `get_trie_node` when only the presence of the node is needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A byte slice representing the path to check.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(true)` - The node exists in the database.
-    /// * `Ok(false)` - The node does not exist in the database.
-    /// * `Err(error)` - An error occurred during the database lookup.
-    ///
-    /// # Errors
-    ///
-    /// This method may return errors related to database I/O or backend-specific
-    /// failures.
-    fn contains_trie_node(&self, path: &[u8]) -> Result<bool, Self::Error>;
-
-    /// Removes a trie node from the database.
-    ///
-    /// This method deletes the node at the specified path. If the node does
-    /// not exist, this operation is a no-op and does not return an error.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A byte slice representing the path of the node to remove.
-    ///
-    /// # Note
-    ///
-    /// Unlike other methods in this trait, this method does not return a `Result`.
-    /// Implementations should handle errors internally, typically by logging them
-    /// or ignoring them if the node doesn't exist. This design choice allows for
-    /// simpler error handling in common use cases where node deletion failures
-    /// are not critical.
-    fn remove_trie_node(&self, path: &[u8]);
+    fn get_trie_node(&self, path: &[u8]) -> Result<Option<Arc<Node>>, Self::Error>;
 
     /// Retrieves the storage trie root for a given account address.
     ///

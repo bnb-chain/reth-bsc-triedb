@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use rust_eth_triedb_common::node::Node;
 
 /// TrieTracer tracks inserted, deleted and accessed trie nodes by their path.
 ///
@@ -13,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 pub struct TrieTracer {
     inserts: HashSet<Vec<u8>>,      // set of node paths inserted
     deletes: HashSet<Vec<u8>>,      // set of node paths deleted
-    access_list: HashMap<Vec<u8>, Vec<u8>>, // path -> rlp-encoded blob as loaded from DB
+    access_list: HashMap<Vec<u8>, Arc<Node>>, // path -> rlp-encoded blob as loaded from DB
 }
 
 impl TrieTracer {
@@ -23,9 +25,9 @@ impl TrieTracer {
     }
 
     /// Tracks a newly loaded trie node and caches its RLP-encoded blob.
-    /// The provided `val` is stored as-is without additional cloning.
-    pub fn on_read(&mut self, path: impl AsRef<[u8]>, val: Vec<u8>) {
-        self.access_list.insert(path.as_ref().to_vec(), val);
+    /// The provided `node` is stored as-is without additional cloning.
+    pub fn on_read(&mut self, path: impl AsRef<[u8]>, node: Arc<Node>) {
+        self.access_list.insert(path.as_ref().to_vec(), node);
     }
 
     /// Tracks a newly inserted trie node. If the path is currently in the
@@ -76,6 +78,6 @@ impl TrieTracer {
     /// Returns references to the internal tracking collections.
     pub fn inserts(&self) -> &HashSet<Vec<u8>> { &self.inserts }
     pub fn deletes(&self) -> &HashSet<Vec<u8>> { &self.deletes }
-    pub fn access_list(&self) -> &HashMap<Vec<u8>, Vec<u8>> { &self.access_list }
+    pub fn access_list(&self) -> &HashMap<Vec<u8>, Arc<Node>> { &self.access_list }
 }
 

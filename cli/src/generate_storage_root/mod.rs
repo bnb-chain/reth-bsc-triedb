@@ -212,14 +212,14 @@ impl GenerateStorageRootMainTask {
         }
     }
 
-    pub fn resolve_hash_node(&self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>> {
+    pub fn resolve_hash_node(&self, _hash: &B256, prefix: &[u8]) -> Result<Arc<Node>> {
         let key = account_trie_node_key(prefix);
         let node_blob = self.path_db.get_trie_node(&key)
             .map_err(|e| eyre::eyre!("Failed to get trie node: prefix: 0x{}, error: {}", hex::encode(prefix), e))?;
 
         match node_blob {
-            Some(node_blob) => {
-                return Ok(Node::must_decode_node(Some(*hash), &node_blob));
+            Some(node) => {
+                return Ok(node);
             }
             None => {
                 panic!("Failed to get trie node: {:?}", key);
@@ -347,14 +347,14 @@ impl GenerateStorageRootSubTask {
         }
     }
 
-    pub fn resolve_hash_node(&self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>> {
+    pub fn resolve_hash_node(&self, _hash: &B256, prefix: &[u8]) -> Result<Arc<Node>> {
         let key = account_trie_node_key(prefix);
         let node_blob = self.path_db.get_trie_node(&key)
             .map_err(|e| eyre::eyre!("Failed to get trie node: prefix: 0x{}, error: {}", hex::encode(prefix), e))?;
 
         match node_blob {
-            Some(node_blob) => {
-                return Ok(Node::must_decode_node(Some(*hash), &node_blob));
+            Some(node) => {
+                return Ok(node);
             }
             None => {
                 panic!("Failed to get trie node: {:?}", key);

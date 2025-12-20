@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::collections::HashMap;
 use alloy_primitives::B256;
+use crate::node::Node;
 
 // Trie state storage keys
 pub const TRIE_STATE_ROOT_KEY: &[u8] = b"state_root";
@@ -58,7 +59,7 @@ pub struct Leaf {
 
 
 /// DiffLayer is a collection of updated trie nodes and storage roots for a special block
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct DiffLayer {
     /// A map of trie node path prefixes to their corresponding trie nodes.
     ///
@@ -74,7 +75,7 @@ pub struct DiffLayer {
     /// ```
     /// // A path prefix might represent: [0x01, 0x23, 0x45] for a node at depth 3
     /// ```
-    pub diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>,
+    pub diff_nodes: Arc<HashMap<Vec<u8>, (Arc<TrieNode>, Option<Arc<Node>>)>>,
     
     /// A map of account address hashes to their corresponding storage trie roots.
     ///
@@ -93,13 +94,26 @@ pub struct DiffLayer {
 
 impl DiffLayer {
     /// Create a new diff layer
-    pub fn new(diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>, diff_storage_roots: Arc<HashMap<B256, B256>>) -> Self {
+    pub fn new(diff_nodes: Arc<HashMap<Vec<u8>, (Arc<TrieNode>, Option<Arc<Node>>)>>, diff_storage_roots: Arc<HashMap<B256, B256>>) -> Self {
         Self { diff_nodes: diff_nodes.clone(), diff_storage_roots: diff_storage_roots.clone() }
     }
 
-    /// Get a trie node by prefix
-    pub fn get_trie_nodes(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
-        self.diff_nodes.get(&prefix).map(|node: &Arc<TrieNode>| node.clone())
+    /// Get a rlp node by prefix
+    pub fn get_rlp_node(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
+        self.diff_nodes.get(&prefix).map(|(node, _)| node.clone())
+    }
+
+    /// Get a node by prefix
+    pub fn get_trie_node(&self, prefix: Vec<u8>) -> Option<Arc<Node>> {
+        if let Some((rlp_node, node)) = self.diff_nodes.get(&prefix) {
+            if let Some(node) = node {
+                return Some(node.clone());
+            }
+            if let Some(blob) = &rlp_node.blob {
+                return Node::decode_node(rlp_node.hash, blob).ok();
+            }
+        }
+        None
     }
 
     /// Get a storage root by hased address
@@ -120,6 +134,29 @@ impl DiffLayer {
         diff_storage_roots_str
     }
 }
+
+impl PartialEq for DiffLayer {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare diff_nodes by content
+        if self.diff_nodes.len() != other.diff_nodes.len() {
+            return false;
+        }
+        for (key, (self_trie_node, _)) in self.diff_nodes.iter() {
+            if let Some((other_trie_node, _)) = other.diff_nodes.get(key) {
+                // Compare TrieNode
+                if self_trie_node != other_trie_node {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        // Compare diff_storage_roots
+        *self.diff_storage_roots == *other.diff_storage_roots
+    }
+}
+
+impl Eq for DiffLayer {}
 
 /// A collection of diff layers for uncommitted blocks in the trie state.
 ///
@@ -181,9 +218,9 @@ impl DiffLayers {
     }
 
     /// Get a trie node by prefix
-    pub fn get_trie_nodes(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
+    pub fn get_trie_node(&self, prefix: Vec<u8>) -> Option<Arc<Node>> {
         for difflayer in &self.diff_layers {
-            if let Some(node) = difflayer.get_trie_nodes(prefix.clone()) {
+            if let Some(node) = difflayer.get_trie_node(prefix.clone()) {
                 return Some(node);
             }
         }
