@@ -12,6 +12,17 @@ pub const DEFAULT_CREATE_IF_MISSING: bool = true;
 pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 20_000_000; // 2KW entries
 pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 200_000_000; // 20KW entries
 
+// BlockBasedTable configuration constants (directly impacts random reads)
+//
+// NOTE: RocksDB's default block cache is ~8MB if unset, which is far too small
+// for trie node random reads. We expose these explicitly so callers can tune
+// based on machine memory and workload.
+pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8GB
+pub const DEFAULT_BLOOM_FILTER_BITS_PER_KEY: f64 = 10.0;
+pub const DEFAULT_BLOOM_FILTER_BLOCK_BASED: bool = true;
+pub const DEFAULT_CACHE_INDEX_AND_FILTER_BLOCKS: bool = true;
+pub const DEFAULT_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE: bool = true;
+
 // ReadOptions configuration constants
 pub const DEFAULT_FILL_CACHE: bool = true;
 pub const DEFAULT_READAHEAD_SIZE: usize = 128 * 1024; // 128KB
@@ -69,6 +80,18 @@ pub struct PathProviderConfig {
     pub trie_node_cache_size: u32,
     /// LRU cache size in number of entries (default: 1M entries).
     pub storage_root_cache_size: u32,
+
+    /// RocksDB BlockBasedTable: block cache size in bytes.
+    pub block_cache_size_bytes: usize,
+    /// RocksDB BlockBasedTable: bloom filter bits per key.
+    pub bloom_filter_bits_per_key: f64,
+    /// RocksDB BlockBasedTable: whether to use block-based bloom filter.
+    pub bloom_filter_block_based: bool,
+    /// RocksDB BlockBasedTable: cache index/filter blocks in block cache.
+    pub cache_index_and_filter_blocks: bool,
+    /// RocksDB BlockBasedTable: pin L0 index/filter blocks in cache.
+    pub pin_l0_filter_and_index_blocks_in_cache: bool,
+
     /// Whether to fill cache on reads.
     pub fill_cache: bool,
     /// Readahead size in bytes for sequential reads.
@@ -90,6 +113,12 @@ impl Default for PathProviderConfig {
             create_if_missing: DEFAULT_CREATE_IF_MISSING,
             trie_node_cache_size: DEFAULT_TRIE_NODECACHE_SIZE,
             storage_root_cache_size: DEFAULT_STORAGE_ROOT_CACHE_SIZE,
+            block_cache_size_bytes: DEFAULT_BLOCK_CACHE_SIZE_BYTES,
+            bloom_filter_bits_per_key: DEFAULT_BLOOM_FILTER_BITS_PER_KEY,
+            bloom_filter_block_based: DEFAULT_BLOOM_FILTER_BLOCK_BASED,
+            cache_index_and_filter_blocks: DEFAULT_CACHE_INDEX_AND_FILTER_BLOCKS,
+            pin_l0_filter_and_index_blocks_in_cache:
+                DEFAULT_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE,
             fill_cache: DEFAULT_FILL_CACHE,
             readahead_size: DEFAULT_READAHEAD_SIZE,
             async_io: DEFAULT_ASYNC_IO,

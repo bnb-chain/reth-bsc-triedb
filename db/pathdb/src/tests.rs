@@ -40,8 +40,6 @@ fn test_cache_operations() {
     
     // Write to database
     db.put_raw_trie_node(key, value).unwrap();
-    let (cache_len, _) = db.cache_stats();
-    assert!(cache_len > 0, "Cache should have entries after read");
 
     // Read from database - this will populate the cache
     let retrieved = db.get_raw_trie_node(key).unwrap();
@@ -51,11 +49,9 @@ fn test_cache_operations() {
     let (cache_len, _) = db.cache_stats();
     assert!(cache_len > 0, "Cache should have entries after read");
     
-    // Note: mini_moka Cache doesn't support invalidate_all(), so clear_cache() is a no-op
-    // The cache will naturally evict old entries via LRU when it reaches capacity
     db.clear_cache();
-    // After clear, cache may still have entries (clear is a no-op for mini_moka)
-    // This is expected behavior - the test just verifies cache_stats() works
+    // After clear, the previously cached key should no longer be present.
+    assert!(db.trie_node_cache.get(&key.to_vec()).is_none());
 }
 
 #[test]

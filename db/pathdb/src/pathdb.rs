@@ -5,9 +5,12 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rocksdb::{ColumnFamilyDescriptor,DB, Options, ReadOptions, WriteBatch, WriteOptions};
+use rocksdb::{
+    BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
+    WriteBatch, WriteOptions,
+};
 // use schnellru::{ByLength, LruMap};
-use mini_moka::sync::{Cache, CacheBuilder};
+use mini_moka::sync::{Cache as MokaCache, CacheBuilder};
 use tracing::{error, trace, warn};
 
 use alloy_primitives::B256;
@@ -111,10 +114,10 @@ pub struct PathDB {
     pub read_options: ReadOptions,
     /// Thread-safe LRU cache for trie node key-value pairs.
     /// Uses mini_moka for high-concurrency performance with sharded locks.
-    pub trie_node_cache: Arc<Cache<Vec<u8>, Option<Vec<u8>>>>,
+    pub trie_node_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Thread-safe LRU cache for storage root key-value pairs.
     /// Uses mini_moka for high-concurrency performance with sharded locks.
-    pub storage_root_cache: Arc<Cache<Vec<u8>, Option<Vec<u8>>>>,
+    pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     // /// Metrics for the PathDB.
     // metrics: PathDBMetrics,
 }
@@ -160,6 +163,18 @@ impl PathDB {
         db_opts.set_target_file_size_base(config.target_file_size_base);
         db_opts.set_max_background_jobs(config.max_background_jobs);
         db_opts.create_if_missing(config.create_if_missing);
+
+        // Explicitly configure BlockBasedTable. This directly impacts random reads
+        // of trie nodes. If unset, RocksDB defaults to a tiny internal cache (~8MB).
+        let rocks_block_cache = RocksCache::new_lru_cache(config.block_cache_size_bytes);
+        let mut block_based = BlockBasedOptions::default();
+        block_based.set_block_cache(&rocks_block_cache);
+        block_based.set_bloom_filter(config.bloom_filter_bits_per_key, config.bloom_filter_block_based);
+        block_based.set_cache_index_and_filter_blocks(config.cache_index_and_filter_blocks);
+        block_based.set_pin_l0_filter_and_index_blocks_in_cache(
+            config.pin_l0_filter_and_index_blocks_in_cache,
+        );
+        db_opts.set_block_based_table_factory(&block_based);
         
         // Disable auto compaction during startup to avoid slow initialization
         // Compaction will happen automatically in the background during runtime
@@ -174,6 +189,7 @@ impl PathDB {
             let mut cf_opts = Options::default();
             cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
             cf_opts.set_write_buffer_size(config.write_buffer_size);
+            cf_opts.set_block_based_table_factory(&block_based);
             // Disable auto compaction for each column family as well
             cf_opts.set_disable_auto_compactions(true);
             cf_descriptors.push(ColumnFamilyDescriptor::new(cf_name, cf_opts));
