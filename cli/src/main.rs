@@ -2,8 +2,10 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod compact_db;
 mod generate_storage_root;
 
+use compact_db::CompactDbArgs;
 use generate_storage_root::GenerateStorageRootArgs;
 
 /// Rust Ethereum TrieDB CLI tools
@@ -19,6 +21,8 @@ struct Cli {
 enum Commands {
     /// Generate storage root from a directory
     GenerateStorageRoot(GenerateStorageRootArgs),
+    /// Run a full RocksDB compaction for a database directory
+    CompactDb(CompactDbArgs),
 }
 
 fn main() -> Result<()> {
@@ -35,6 +39,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::GenerateStorageRoot(args) => {
+            if let Err(e) = args.execute() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::CompactDb(args) => {
             if let Err(e) = args.execute() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);

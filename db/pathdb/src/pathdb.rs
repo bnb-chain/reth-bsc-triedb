@@ -122,6 +122,22 @@ pub struct PathDB {
     // metrics: PathDBMetrics,
 }
 
+/// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
+///
+/// Returns the cache object alongside the options to ensure the cache stays alive while the
+/// options are being installed into DB/CF options.
+fn build_block_based_options(config: &PathProviderConfig) -> (RocksCache, BlockBasedOptions) {
+    let rocks_block_cache = RocksCache::new_lru_cache(config.block_cache_size_bytes);
+    let mut block_based = BlockBasedOptions::default();
+    block_based.set_block_cache(&rocks_block_cache);
+    block_based.set_bloom_filter(config.bloom_filter_bits_per_key, config.bloom_filter_block_based);
+    block_based.set_cache_index_and_filter_blocks(config.cache_index_and_filter_blocks);
+    block_based.set_pin_l0_filter_and_index_blocks_in_cache(
+        config.pin_l0_filter_and_index_blocks_in_cache,
+    );
+    (rocks_block_cache, block_based)
+}
+
 impl Debug for PathDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PathDB")
@@ -166,14 +182,7 @@ impl PathDB {
 
         // Explicitly configure BlockBasedTable. This directly impacts random reads
         // of trie nodes. If unset, RocksDB defaults to a tiny internal cache (~8MB).
-        let rocks_block_cache = RocksCache::new_lru_cache(config.block_cache_size_bytes);
-        let mut block_based = BlockBasedOptions::default();
-        block_based.set_block_cache(&rocks_block_cache);
-        block_based.set_bloom_filter(config.bloom_filter_bits_per_key, config.bloom_filter_block_based);
-        block_based.set_cache_index_and_filter_blocks(config.cache_index_and_filter_blocks);
-        block_based.set_pin_l0_filter_and_index_blocks_in_cache(
-            config.pin_l0_filter_and_index_blocks_in_cache,
-        );
+        let (_rocks_block_cache, block_based) = build_block_based_options(&config);
         db_opts.set_block_based_table_factory(&block_based);
         
         // Disable auto compaction during startup to avoid slow initialization
@@ -181,7 +190,7 @@ impl PathDB {
         db_opts.set_disable_auto_compactions(true);
 
         // Ensure all required Column Families exist
-        ensure_column_families(path, &db_opts, &config)?;
+        ensure_column_families(path, &db_opts, &config, &block_based)?;
 
         // Now open database with all required Column Families
         let mut cf_descriptors = Vec::new();
@@ -531,7 +540,21 @@ impl PathProviderManager for PathDB {
     fn compact(&self) -> PathProviderResult<()> {
         trace!(target: "pathdb::rocksdb", "Compacting database");
 
-        // Simplified compact implementation
+        // Compact all column families over the full key-range.
+        //
+        // This can be useful to:
+        // - Rewrite existing SSTs so bloom/filter/index blocks match current table settings.
+        // - Reduce read amplification after large write bursts / state transitions.
+        for cf_name in COLUMN_FAMILY_NAMES {
+            let cf = self.db.cf_handle(cf_name).ok_or_else(|| {
+                PathProviderError::Database(format!(
+                    "Column Family '{}' handle not found for compaction",
+                    cf_name
+                ))
+            })?;
+            self.db
+                .compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+        }
         Ok(())
     }
 }
@@ -676,6 +699,7 @@ fn ensure_column_families(
     path: &str,
     db_opts: &Options,
     config: &PathProviderConfig,
+    block_based: &BlockBasedOptions,
 ) -> PathProviderResult<()> {
     // List existing Column Families in the database
     let existing_cfs = DB::list_cf(db_opts, path)
@@ -711,6 +735,7 @@ fn ensure_column_families(
         let mut cf_opts = Options::default();
         cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
         cf_opts.set_write_buffer_size(config.write_buffer_size);
+        cf_opts.set_block_based_table_factory(block_based);
         // Disable auto compaction during startup
         cf_opts.set_disable_auto_compactions(true);
         existing_cf_descriptors.push(ColumnFamilyDescriptor::new(cf_name, cf_opts));
@@ -724,6 +749,7 @@ fn ensure_column_families(
         let mut cf_opts = Options::default();
         cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
         cf_opts.set_write_buffer_size(config.write_buffer_size);
+        cf_opts.set_block_based_table_factory(block_based);
         temp_db.create_cf(cf_name, &cf_opts).map_err(|e| {
             PathProviderError::Database(format!(
                 "Failed to create Column Family '{}': {}",
