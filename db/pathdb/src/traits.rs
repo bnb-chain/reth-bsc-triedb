@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 // Default configuration constants
 pub const DEFAULT_MAX_OPEN_FILES: i32 = 10000000;
-pub const DEFAULT_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024 * 1024; // 4GB
+pub const DEFAULT_WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024; // 256MB
 pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 pub const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 64 * 1024 * 1024; // 64MB
 pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
