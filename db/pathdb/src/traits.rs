@@ -25,7 +25,8 @@ pub const DEFAULT_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE: bool = true;
 
 // ReadOptions configuration constants
 pub const DEFAULT_FILL_CACHE: bool = true;
-pub const DEFAULT_READAHEAD_SIZE: usize = 128 * 1024; // 128KB
+// For trie node random reads, large readahead can add unnecessary IO and cache pollution.
+pub const DEFAULT_READAHEAD_SIZE: usize = 4 * 1024; // 4KB
 pub const DEFAULT_ASYNC_IO: bool = true;
 pub const DEFAULT_VERIFY_CHECKSUMS: bool = false;
 
