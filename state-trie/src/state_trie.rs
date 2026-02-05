@@ -13,6 +13,42 @@ use super::trie::Trie;
 use super::node::{NodeSet, DiffLayers};
 use super::node::rlp_raw;
 
+/// RLP-encodes a `U256` into a fixed-size stack buffer and returns the written slice.
+///
+/// This matches `alloy_rlp::encode(&value)` for all `U256` values, but avoids heap
+/// allocations on the hot path.
+///
+/// Output length is at most 33 bytes: 1-byte header + up to 32 bytes payload.
+fn rlp_encode_u256_into<'a>(value: &U256, out: &'a mut [u8; 33]) -> &'a [u8] {
+    // Convert to minimal big-endian bytes (no leading zeros).
+    let be = value.to_be_bytes::<32>();
+    let first_nonzero = be.iter().position(|b| *b != 0);
+    let payload = match first_nonzero {
+        None => &be[32..32], // empty slice => zero
+        Some(i) => &be[i..],
+    };
+
+    match payload.len() {
+        0 => {
+            // RLP empty string (used for integer zero)
+            out[0] = 0x80;
+            &out[..1]
+        }
+        1 if payload[0] < 0x80 => {
+            // Single byte whose value is in [0x00, 0x7f] is its own RLP encoding.
+            out[0] = payload[0];
+            &out[..1]
+        }
+        len => {
+            debug_assert!(len <= 32);
+            // Short string: 0x80 + len, followed by payload.
+            out[0] = 0x80u8 + (len as u8);
+            out[1..1 + len].copy_from_slice(payload);
+            &out[..1 + len]
+        }
+    }
+}
+
 /// Ethereum-compatible state trie implementation with secure key hashing.
 ///
 /// `StateTrie` is a high-level wrapper around the underlying `Trie` structure that
@@ -204,7 +240,8 @@ where
     }
 
     fn update_account_with_hash_state(&mut self, hashed_address: B256, account: &StateAccount) -> Result<(), Self::Error> {
-        let mut encoded_account = Vec::new();
+        // Pre-allocate the exact RLP length to avoid repeated growth/reallocations on the hot path.
+        let mut encoded_account = Vec::with_capacity(account.length());
         account.encode(&mut encoded_account);
         self.trie.update(hashed_address.as_slice(), &encoded_account)?;
         Ok(())
@@ -244,8 +281,9 @@ where
     }
 
     fn update_storage_u256_with_hash_state(&mut self, _: B256, hashed_key: B256, value: U256) -> Result<(), Self::Error> {
-        let encoded_value = alloy_rlp::encode(&value);
-        self.trie.update(hashed_key.as_slice(), &encoded_value)?;
+        let mut buf = [0u8; 33];
+        let encoded = rlp_encode_u256_into(&value, &mut buf);
+        self.trie.update(hashed_key.as_slice(), encoded)?;
         Ok(())
     }
 
@@ -282,3 +320,35 @@ where
 
 /// Type alias for secure trie
 pub type SecureTrie<DB> = StateTrie<DB>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rlp_encode_u256_matches_alloy_rlp() {
+        // Representative edge cases and patterns.
+        let cases = [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(0x7fu64),
+            U256::from(0x80u64),
+            U256::from(0xffu64),
+            U256::from(0x0100u64),
+            U256::from(0x1234u64),
+            U256::from(0xabcdefu64),
+            U256::MAX,
+            // High-bit set with trailing zeros.
+            U256::from_be_bytes([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            // Alternating pattern.
+            U256::from_be_bytes([0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55]),
+        ];
+
+        for value in cases {
+            let mut buf = [0u8; 33];
+            let ours = rlp_encode_u256_into(&value, &mut buf);
+            let theirs = alloy_rlp::encode(&value);
+            assert_eq!(ours, &theirs[..], "mismatch for value={value:?}");
+        }
+    }
+}

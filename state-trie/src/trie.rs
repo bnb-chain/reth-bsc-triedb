@@ -6,11 +6,28 @@ use alloy_primitives::{B256};
 use alloy_trie::EMPTY_ROOT_HASH;
 use rust_eth_triedb_common::TrieDatabase;
 use crate::trie_committer::Committer;
-use super::encoding::{common_prefix_length, key_to_nibbles, account_trie_node_key, storage_trie_node_key};
+use super::encoding::{
+    account_trie_node_key, common_prefix_length, key_to_nibbles, key_to_nibbles_into_32,
+    storage_trie_node_key,
+};
 use super::node::{Node, NodeFlag, FullNode, ShortNode, NodeSet, TrieNode, DiffLayers};
 use super::secure_trie::{SecureTrieId, SecureTrieError};
 use super::trie_hasher::Hasher;
 use super::trie_tracer::TrieTracer;
+
+#[inline]
+fn with_nibbles_key<R>(key: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+    if let Ok(k32) = <&[u8; 32]>::try_from(key) {
+        // Hot path: all state keys are 32-byte hashed values.
+        let mut buf = [0u8; 65];
+        key_to_nibbles_into_32(k32, &mut buf);
+        f(&buf)
+    } else {
+        // Fallback (tests / non-standard usage).
+        let nibbles = key_to_nibbles(key);
+        f(&nibbles)
+    }
+}
 
 /// Core trie implementation
 #[derive(Clone, Debug)]
@@ -21,8 +38,50 @@ pub struct Trie<DB> {
     unhashed: usize,
     uncommitted: usize,
     pub tracer: TrieTracer,
+    resolve_stats: ResolveStats,
     database: DB,
     difflayers: Option<DiffLayers>,
+}
+
+/// Resolve-path statistics for performance analysis.
+///
+/// These counters are **diagnostic-only** and do not affect trie semantics.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResolveStats {
+    /// Total `resolve_and_track` calls.
+    pub calls: u64,
+    /// Hits served from difflayer.
+    pub difflayer_hits: u64,
+    /// Hits served from DB.
+    pub db_hits: u64,
+    /// Missing nodes (neither difflayer nor DB).
+    pub misses: u64,
+    /// Total bytes of RLP blobs read (difflayer + DB).
+    pub bytes_read: u64,
+}
+
+impl ResolveStats {
+    #[inline]
+    fn on_hit(&mut self, source: ResolveSource, bytes: usize) {
+        self.calls += 1;
+        self.bytes_read += bytes as u64;
+        match source {
+            ResolveSource::DiffLayer => self.difflayer_hits += 1,
+            ResolveSource::Db => self.db_hits += 1,
+        }
+    }
+
+    #[inline]
+    fn on_miss(&mut self) {
+        self.calls += 1;
+        self.misses += 1;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolveSource {
+    DiffLayer,
+    Db,
 }
 
 /// Basic Trie operations
@@ -40,6 +99,7 @@ where
             unhashed: 0,
             uncommitted: 0,
             tracer: TrieTracer::new(),
+            resolve_stats: ResolveStats::default(),
             database,
             difflayers: difflayer.map(|d| d.clone()),
         };
@@ -152,15 +212,10 @@ where
             return Err(SecureTrieError::AlreadyCommitted);
         }
 
-        // Convert key to nibbles + terminator format
-        let nibbles_key = key_to_nibbles(key);
-
-        // Get value from internal trie structure
-        let (value, new_root, did_resolve) = self.get_internal(
-            self.root.clone(),
-            nibbles_key,
-            0
-        )?;
+        // Convert key to nibbles + terminator format (allocation-free for 32-byte keys)
+        let (value, new_root, did_resolve) = with_nibbles_key(key, |nibbles_key| {
+            self.get_internal(self.root.clone(), nibbles_key, 0)
+        })?;
 
         // Update root if it was resolved (CoW optimization)
         if did_resolve {
@@ -189,31 +244,28 @@ where
             Some(Node::Value(value.to_vec()))
         };
 
-        // Convert key to nibbles + terminator format
-        let nibbles_key = key_to_nibbles(key);
-
-        // Handle empty value (delete operation)
-        if value_node.is_none() {
-            // Delete the value from the trie
-            let (_, new_root) = self.delete_internal(
-                self.root.clone(),
-                vec![],
-                nibbles_key)?;
-
-            // Update the root with the new trie structure
-            self.root = new_root;
-        } else {
-            // Insert the new value into the trie
-            let (_, new_root) = self.insert_internal(
-                self.root.clone(),
-                vec![],
-                nibbles_key,
-                Arc::new(value_node.unwrap())
-            )?;
-
-            // Update the root with the new trie structure
-            self.root = new_root;
-        }
+        // Convert key to nibbles + terminator format (allocation-free for 32-byte keys)
+        with_nibbles_key(key, |nibbles_key| -> Result<(), SecureTrieError> {
+            // Handle empty value (delete operation)
+            if value_node.is_none() {
+                // Delete the value from the trie
+                let (_, new_root) =
+                    self.delete_internal(self.root.clone(), vec![], nibbles_key)?;
+                // Update the root with the new trie structure
+                self.root = new_root;
+            } else {
+                // Insert the new value into the trie
+                let (_, new_root) = self.insert_internal(
+                    self.root.clone(),
+                    vec![],
+                    nibbles_key,
+                    Arc::new(value_node.unwrap()),
+                )?;
+                // Update the root with the new trie structure
+                self.root = new_root;
+            }
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -229,19 +281,28 @@ where
         self.unhashed += 1;
         self.uncommitted += 1;
 
-        // Convert key to nibbles + terminator format
-        let nibbles_key = key_to_nibbles(key);
-
-        // Delete the value from the trie
-        let (_, new_root) = self.delete_internal(
-            self.root.clone(),
-            vec![],
-            nibbles_key
-        )?;
+        // Convert key to nibbles + terminator format (allocation-free for 32-byte keys)
+        let (_, new_root) = with_nibbles_key(key, |nibbles_key| {
+            self.delete_internal(self.root.clone(), vec![], nibbles_key)
+        })?;
 
         // Update the root with the new trie structure
         self.root = new_root;
         Ok(())
+    }
+
+    /// Returns current resolve statistics snapshot.
+    #[inline]
+    pub fn resolve_stats(&self) -> ResolveStats {
+        self.resolve_stats
+    }
+
+    /// Resets resolve statistics counters.
+    ///
+    /// This is safe to call at any time; counters are diagnostic-only.
+    #[inline]
+    pub fn reset_resolve_stats(&mut self) {
+        self.resolve_stats = ResolveStats::default();
     }
 }
 
@@ -258,9 +319,10 @@ where
     /// - new_node: The potentially updated node (for CoW)
     /// - resolved: Whether the node was resolved from hash
     fn get_internal(
-        &mut self, node: Arc<Node>,
-        nibbles_key: Vec<u8>,
-        pos: usize
+        &mut self,
+        node: Arc<Node>,
+        nibbles_key: &[u8],
+        pos: usize,
     ) -> Result<(Option<Vec<u8>>, Arc<Node>, bool), SecureTrieError> {
         match &*node {
             // Empty root - no value found
@@ -336,11 +398,11 @@ where
     fn insert_internal(
         &mut self, node: Arc<Node>,
         prefix: Vec<u8>,
-        nibbles_key: Vec<u8>,
+        nibbles_key: &[u8],
         value: Arc<Node>
     ) -> Result<(bool, Arc<Node>), SecureTrieError> {
         // Base case: reached the end of the key
-        if nibbles_key.len() == 0 {
+        if nibbles_key.is_empty() {
             match &*node {
                 Node::Value(existing_value) => {
                     if let Node::Value(new_value) = &*value {
@@ -376,7 +438,7 @@ where
                     let (dirty, new_child) = self.insert_internal(
                         short.val.clone(),
                         new_prefix,
-                        nibbles_key[matchlen..].to_vec(),
+                        &nibbles_key[matchlen..],
                         value
                     )?;
 
@@ -402,7 +464,7 @@ where
                 let (_, new_child1) = self.insert_internal(
                     Node::empty_root(),
                     short_prefix,
-                    short.key[matchlen + 1..].to_vec(),
+                    &short.key[matchlen + 1..],
                     short.val.clone()
                 )?;
                 branch.set_child(short.key[matchlen] as usize, new_child1.as_ref());
@@ -413,7 +475,7 @@ where
                 let (_, new_child2) = self.insert_internal(
                     Node::empty_root(),
                     new_prefix,
-                    nibbles_key[matchlen + 1..].to_vec(),
+                    &nibbles_key[matchlen + 1..],
                     value
                 )?;
                 branch.set_child(nibbles_key[matchlen] as usize, new_child2.as_ref());
@@ -446,7 +508,7 @@ where
                 let (dirty, new_child) = self.insert_internal(
                     child,
                     new_prefix,
-                    nibbles_key[1..].to_vec(),
+                    &nibbles_key[1..],
                     value
                 )?;
 
@@ -466,7 +528,13 @@ where
 
                 // Trace the insert operation
                 self.tracer.on_insert(prefix.clone());
-                return Ok((true, Arc::new(Node::Short(Arc::new(ShortNode::new(nibbles_key, value.as_ref()))))));
+                return Ok((
+                    true,
+                    Arc::new(Node::Short(Arc::new(ShortNode::new(
+                        nibbles_key.to_vec(),
+                        value.as_ref(),
+                    )))),
+                ));
             }
 
             // Hash node - resolve and continue insertion
@@ -501,7 +569,7 @@ where
         &mut self,
         node: Arc<Node>,
         prefix: Vec<u8>,
-        nibbles_key: Vec<u8>
+        nibbles_key: &[u8],
     ) -> Result<(bool, Arc<Node>), SecureTrieError> {
 
         match &*node {
@@ -528,7 +596,7 @@ where
                 let (dirty, new_child) = self.delete_internal(
                     short.val.clone(),
                     new_prefix,
-                    nibbles_key[short.key.len()..].to_vec()
+                    &nibbles_key[short.key.len()..]
                 )?;
 
                 // Child wasn't modified - return unchanged node
@@ -580,7 +648,7 @@ where
                 let (dirty, new_child) = self.delete_internal(
                     full.get_child(child_index),
                     new_prefix,
-                    nibbles_key[1..].to_vec(),
+                    &nibbles_key[1..],
                 )?;
 
                 // Child wasn't modified - return unchanged node
@@ -728,17 +796,21 @@ where
         // 1. Check if the hash is in the difflayer
         if let Some(difflayers) = &self.difflayers {
             if let Some(node) = difflayers.get_trie_nodes(key.clone()) {
-                self.tracer.on_read(prefix, node.blob.clone().unwrap());              
-                return Ok(Node::must_decode_node(Some(*hash), &node.blob.clone().unwrap()));
+                let blob = node.blob.clone().unwrap();
+                self.resolve_stats.on_hit(ResolveSource::DiffLayer, blob.len());
+                self.tracer.on_read(prefix, blob.clone());
+                return Ok(Node::must_decode_node(Some(*hash), &blob));
             }           
         }
 
         // 2. Check if the hash is in the database
         if let Some(node_blob) = self.database.get_trie_node(&key).map_err(|e| SecureTrieError::Database(format!("{:?}", e)))? {
+            self.resolve_stats.on_hit(ResolveSource::Db, node_blob.len());
             self.tracer.on_read(prefix, node_blob.clone());
             return Ok(Node::must_decode_node(Some(*hash), &node_blob));
         }
 
+        self.resolve_stats.on_miss();
         let owner_hex = format!("0x{:x}", self.owner);
         let prefix_hex = prefix.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();

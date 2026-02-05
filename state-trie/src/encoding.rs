@@ -33,6 +33,23 @@ pub fn key_to_nibbles(key: &[u8]) -> Vec<u8> {
     nibbles
 }
 
+/// Convert a 32-byte key to nibbles + terminator format, writing into a fixed-size buffer.
+///
+/// This is an allocation-free variant of [`key_to_nibbles`] for the hot path where
+/// keys are always 32 bytes (hashed addresses / hashed storage keys).
+///
+/// The output length is always 65: 64 nibbles + terminator (16).
+#[inline]
+pub fn key_to_nibbles_into_32(key: &[u8; 32], out: &mut [u8; 65]) {
+    // Convert each byte to two nibbles.
+    for (i, &b) in key.iter().enumerate() {
+        out[i * 2] = b >> 4;
+        out[i * 2 + 1] = b & 0x0f;
+    }
+    // Add terminator.
+    out[64] = 16;
+}
+
 /// Check if a nibble array has a terminator (value 16) at the end
 pub fn has_terminator(nibbles: &[u8]) -> bool {
     !nibbles.is_empty() && nibbles[nibbles.len() - 1] == 16

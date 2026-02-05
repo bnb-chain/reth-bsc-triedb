@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::time::Instant;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
@@ -14,6 +15,23 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
 use crate::triedb::{TrieDB, TrieDBError};
+
+/// Dedicated rayon thread-pool for trie batch work.
+///
+/// This isolates `update_state_objects` (task1/task2) from other rayon work in the process
+/// (and vice versa), helping reduce tail-latency spikes caused by cross-component contention.
+fn triedb_rayon_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        // Match rayon's global pool size by default, but isolate scheduling.
+        let num_threads = 48;
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|i| format!("triedb-rayon-{i}"))
+            .build()
+            .expect("failed to build triedb rayon thread pool")
+    })
+}
 
 /// Reth-compatible interface functions using hashed keys for TrieDB.
 ///
@@ -337,6 +355,7 @@ where
         }
 
         // Parallel execution: process accounts and storages simultaneously
+        let pool = triedb_rayon_pool();
         let (
             (account_result, task1_elapsed),
             (storage_result, task2_elapsed, task2_queue_stats, task2_slowest_trie),
@@ -351,7 +370,7 @@ where
                 Task2QueueStats,
                 Option<Task2SlowestTrie>,
             ),
-        ) = rayon::join(
+        ) = pool.install(|| rayon::join(
             || {
                 // Task 1: Process accounts that don't have storage updates (parallel)
                 let task1_start = Instant::now();
@@ -448,10 +467,18 @@ where
                                         };
 
                                     let apply_start = Instant::now();
+                                    // Reset diagnostic-only counters to attribute resolve stats to this apply window.
+                                    storage_trie.trie_mut().reset_resolve_stats();
+                                    let tracer_inserts_before = storage_trie.trie().tracer.inserts().len();
+                                    let tracer_deletes_before = storage_trie.trie().tracer.deletes().len();
+                                    let tracer_access_before = storage_trie.trie().tracer.access_list().len();
+                                    let mut kvs_updates: usize = 0;
+                                    let mut kvs_deletes: usize = 0;
+
                                     // Keep the original semantics (apply updates for this address sequentially)
-                                    let kvs_vec: Vec<_> = kvs.into_iter().collect();
-                                    for (hashed_key, new_value) in kvs_vec {
+                                    for (hashed_key, new_value) in kvs.into_iter() {
                                         if let Some(new_value) = new_value {
+                                            kvs_updates += 1;
                                             storage_trie.update_storage_u256_with_hash_state(
                                                 hashed_address,
                                                 hashed_key,
@@ -467,6 +494,7 @@ where
                                                 ))
                                             })?;
                                         } else {
+                                            kvs_deletes += 1;
                                             storage_trie
                                                 .delete_storage_with_hash_state(
                                                     hashed_address,
@@ -483,6 +511,36 @@ where
                                         }
                                     }
                                     let apply_kvs_ms = apply_start.elapsed().as_millis();
+                                    if apply_kvs_ms >= 100 {
+                                        let rs = storage_trie.trie().resolve_stats();
+                                        let tracer_inserts_after = storage_trie.trie().tracer.inserts().len();
+                                        let tracer_deletes_after = storage_trie.trie().tracer.deletes().len();
+                                        let tracer_access_after = storage_trie.trie().tracer.access_list().len();
+                                        tracing::debug!(
+                                            target: "triedb::reth",
+                                            hashed_address = ?hashed_address,
+                                            kvs_len,
+                                            kvs_updates,
+                                            kvs_deletes,
+                                            apply_kvs_ms,
+                                            // resolve path stats during apply window
+                                            resolve_calls = rs.calls,
+                                            resolve_difflayer_hits = rs.difflayer_hits,
+                                            resolve_db_hits = rs.db_hits,
+                                            resolve_misses = rs.misses,
+                                            resolve_bytes_read = rs.bytes_read,
+                                            // tracer sizes (use deltas to understand how much bookkeeping grew)
+                                            tracer_inserts_before,
+                                            tracer_inserts_after,
+                                            tracer_deletes_before,
+                                            tracer_deletes_after,
+                                            tracer_access_before,
+                                            tracer_access_after,
+                                            prefetch_trie_hit,
+                                            rayon_thread = ?rayon::current_thread_index(),
+                                            "storage_trie task2 apply_kvs longtail"
+                                        );
+                                    }
 
                                     let hash_start = Instant::now();
                                     let new_storage_root = storage_trie.hash();
@@ -601,7 +659,7 @@ where
                 metrics_clone.record_intermediate_state_objects_storage_duration(elapsed.as_secs_f64());
                 (result, elapsed, stats, slowest)
             }
-        );
+        ));
 
         let merge_start = Instant::now();
         // Merge results
@@ -703,11 +761,12 @@ where
         let mut merged_node_set = Box::new(MergedNodeSet::new());
 
         // Start both tasks in parallel using rayon
+        let pool = triedb_rayon_pool();
         let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
         let ((account_commit_result, account_commit_elapsed), (storage_commit_results, storage_commit_elapsed)): (
             (Result<(B256, Option<Arc<NodeSet>>), _>, std::time::Duration),
             (Vec<(B256, Option<Arc<NodeSet>>)>, std::time::Duration),
-        ) = rayon::join(
+        ) = pool.install(|| rayon::join(
             || {
                 let start = Instant::now();
                 let res = account_trie_clone.commit(true);
@@ -725,7 +784,7 @@ where
                     .collect();
                 (res, start.elapsed())
             },
-        );
+        ));
 
         let (root_hash, account_node_set) = account_commit_result?;
 
@@ -892,10 +951,11 @@ where
         };
 
         // Parallel execution: process accounts and storages simultaneously
+        let pool = triedb_rayon_pool();
         let (account_result, storage_result): (
             Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>), TrieDBError>,
             Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>, Box<MergedNodeSet>), TrieDBError>
-        ) = rayon::join(
+        ) = pool.install(|| rayon::join(
             || {
                 // Task 1: Process accounts that don't have storage updates (parallel)
                 let task1_start = Instant::now();
@@ -988,7 +1048,7 @@ where
                 metrics_clone.record_intermediate_state_objects_storage_duration(task2_start.elapsed().as_secs_f64());
                 result
             }
-        );
+        ));
 
         let (mut accounts_no_storage, mut roots_no_storage) = account_result?;
         let (accounts_with_storage, roots_with_storage, mut merged_node_set) = storage_result?;
