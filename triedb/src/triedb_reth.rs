@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::time::Instant;
-use std::sync::{mpsc, Mutex};
-use std::thread;
 
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
@@ -150,26 +148,17 @@ where
         states_rebuild: HashSet<B256>) -> 
         Result<B256, TrieDBError> {
         
-        let accounts_len = accounts.len();
-        let storages_accounts_len = storages.len();
-        let storages_slots_len: usize = storages.values().map(|m| m.len()).sum();
-        let states_rebuild_len = states_rebuild.len();
-
         let intermediate_root_start = Instant::now();
 
-        let intermediate_state_objects_start = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;
-        let intermediate_state_objects_elapsed = intermediate_state_objects_start.elapsed();
-        self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects_elapsed.as_secs_f64());
+        let intermediate_state_objects = Instant::now();
+        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;        
+        self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
         
-        let delete_rebuild_start = Instant::now();
         for hashed_address in states_rebuild {
             self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
         }
-        let delete_rebuild_elapsed = delete_rebuild_start.elapsed();
         
-        let apply_updated_accounts_start = Instant::now();
         for (hashed_address, account) in updated_accounts {
             if let Some(account) = account {
                 self.update_account_with_hash_state(hashed_address, &account)
@@ -179,29 +168,8 @@ where
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             }
         }
-        let apply_updated_accounts_elapsed = apply_updated_accounts_start.elapsed();
-
-        let account_trie_hash_start = Instant::now();
         let root_hash = self.account_trie.as_mut().unwrap().hash();
-        let account_trie_hash_elapsed = account_trie_hash_start.elapsed();
-
-        let intermediate_total_elapsed = intermediate_root_start.elapsed();
-        self.metrics.record_intermediate_root_duration(intermediate_total_elapsed.as_secs_f64());
-
-        tracing::debug!(
-            target: "triedb::reth",
-            total_ms = intermediate_total_elapsed.as_millis(),
-            update_state_objects_ms = intermediate_state_objects_elapsed.as_millis(),
-            delete_rebuild_ms = delete_rebuild_elapsed.as_millis(),
-            apply_updated_accounts_ms = apply_updated_accounts_elapsed.as_millis(),
-            account_trie_hash_ms = account_trie_hash_elapsed.as_millis(),
-            accounts_len,
-            storages_accounts_len,
-            storages_slots_len,
-            states_rebuild_len,
-            "intermediate_inner finished"
-        );
-
+        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());     
         return Ok(root_hash);
     }
 
@@ -212,293 +180,153 @@ where
         states_rebuild: HashSet<B256>) -> 
         Result<HashMap<B256, Option<StateAccount>>, TrieDBError> {
        
-        let update_state_objects_start = Instant::now();
-
-        // Replace Rayon inside this function with a std::thread worker pool + work queue.
-        let num_workers = 48;
-
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
         let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
+        let accounts_clone = accounts.clone();
+        let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
+        let storages_for_task2 = storages;
         let metrics_clone = self.metrics.clone();
         let prefetcher_clone = self.prefetcher.clone();
-        let prefetcher_for_roots = self.prefetcher.clone();
 
-        let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
-        let storages_vec: Vec<(B256, HashMap<B256, Option<U256>>)> = storages.into_iter().collect();
-        let accounts_arc = Arc::new(accounts);
-        let states_rebuild = Arc::new(states_rebuild);
-
-        // Build work items
-        let accounts_no_storage_items: Vec<(B256, Option<StateAccount>)> = accounts_arc
-            .iter()
-            .filter(|(hashed_address, _)| !storages_keys.contains(*hashed_address))
-            .map(|(hashed_address, account)| (*hashed_address, account.clone()))
-            .collect();
-
-        // Chunk helper (moves items into owned Vecs for worker queue).
-        fn chunk_items<T>(items: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
-            let mut out = Vec::new();
-            let mut it = items.into_iter();
-            loop {
-                let mut chunk = Vec::with_capacity(chunk_size);
-                for _ in 0..chunk_size {
-                    if let Some(item) = it.next() {
-                        chunk.push(item);
-                    } else {
-                        break;
-                    }
-                }
-                if chunk.is_empty() {
-                    break;
-                }
-                out.push(chunk);
+        // Closure to get storage root from difflayer or path_db
+        let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
+            if states_rebuild.contains(&hashed_address) {
+                return Ok(alloy_trie::EMPTY_ROOT_HASH);
             }
-            out
-        }
 
-        let target_chunks = (num_workers * 4).max(1);
-        let acc_chunk_size =
-            ((accounts_no_storage_items.len() + target_chunks - 1) / target_chunks).max(1);
-        let sto_chunk_size = ((storages_vec.len() + target_chunks - 1) / target_chunks).max(1);
+            if let Some(prefetcher) = &self.prefetcher {
+                if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
+                    return Ok(*root);
+                }
+            }
 
-        let acc_chunks = chunk_items(accounts_no_storage_items, acc_chunk_size);
-        let sto_chunks = chunk_items(storages_vec, sto_chunk_size);
-        let mut acc_left = acc_chunks.len();
-        let mut sto_left = sto_chunks.len();
+            if let Some(dl) = difflayer_clone.as_ref() {
+                if let Some(root) = dl.get_storage_root(hashed_address) {
+                    return Ok(root);
+                }
+            }
+            path_db_clone.get_storage_root(hashed_address)
+                .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))
+                .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
+        };
 
-        enum WorkResult<DB> {
-            Accounts(Result<Vec<(B256, Option<StateAccount>, B256)>, TrieDBError>),
-            Storages(Result<Vec<(B256, Option<StateAccount>, B256, StateTrie<DB>)>, TrieDBError>),
-        }
-
-        enum WorkItem {
-            Accounts(Vec<(B256, Option<StateAccount>)>),
-            Storages(Vec<(B256, HashMap<B256, Option<U256>>)>),
-        }
-
-        let mut accounts_no_storage: HashMap<B256, Option<StateAccount>> = HashMap::new();
-        let mut roots_no_storage: Box<HashMap<B256, B256>> = Box::new(HashMap::new());
-        let mut accounts_with_storage: HashMap<B256, Option<StateAccount>> = HashMap::new();
-        let mut roots_with_storage: Box<HashMap<B256, B256>> = Box::new(HashMap::new());
-        let mut storage_tries: HashMap<B256, StateTrie<DB>> = HashMap::new();
-
-        // Run a scoped worker pool so we can execute tasks without requiring `DB: 'static`.
-        thread::scope(|scope| -> Result<(), TrieDBError> {
-            let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
-            let work_rx = Arc::new(Mutex::new(work_rx));
-            let (result_tx, result_rx) = mpsc::channel::<WorkResult<DB>>();
-
-            // Spawn worker threads.
-            for i in 0..num_workers {
-                let work_rx = Arc::clone(&work_rx);
-                let result_tx = result_tx.clone();
-
-                let path_db = path_db_clone.clone();
-                let difflayer = difflayer_clone.clone();
-                let prefetcher = prefetcher_clone.clone();
-                let prefetcher_roots = prefetcher_for_roots.clone();
-                let accounts_arc = Arc::clone(&accounts_arc);
-                let states_rebuild = Arc::clone(&states_rebuild);
-
-                let builder = thread::Builder::new().name(format!("triedb-update-state-{i}"));
-                builder
-                    .spawn_scoped(scope, move || loop {
-                        let item = {
-                            let guard = work_rx.lock().expect("work queue receiver poisoned");
-                            guard.recv()
-                        };
-                        let Ok(item) = item else { break };
-
-                        let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
-                            if states_rebuild.contains(&hashed_address) {
-                                return Ok(alloy_trie::EMPTY_ROOT_HASH);
+        // Parallel execution: process accounts and storages simultaneously
+        let (account_result, storage_result): (
+            Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>), TrieDBError>,
+            Result<(HashMap<B256, Option<StateAccount>>, Box<HashMap<B256, B256>>, HashMap<B256, StateTrie<DB>>), TrieDBError>
+        ) = rayon::join(
+            || {
+                // Task 1: Process accounts that don't have storage updates (parallel)
+                let task1_start = Instant::now();
+                let result = accounts_clone
+                    .par_iter()
+                    .filter(|(hashed_address, _)| !storages_keys.contains(*hashed_address))
+                    .map(|(hashed_address, account)| {
+                        match account {
+                            Some(account) => {
+                                let mut new_account = account.clone();
+                                let storage_root = get_storage_root(*hashed_address)?;
+                                new_account.storage_root = storage_root;
+                                Ok((*hashed_address, (Some(new_account), storage_root)))
                             }
-
-                            if let Some(prefetcher) = &prefetcher_roots {
-                                if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
-                                    return Ok(*root);
-                                }
+                            None => {
+                                Ok((*hashed_address, (None, alloy_trie::EMPTY_ROOT_HASH)))
                             }
-
-                            if let Some(dl) = difflayer.as_ref() {
-                                if let Some(root) = dl.get_storage_root(hashed_address) {
-                                    return Ok(root);
-                                }
-                            }
-
-                            path_db
-                                .get_storage_root(hashed_address)
-                                .map_err(|e| {
-                                    TrieDBError::Database(format!(
-                                        "Failed to get storage root for hashed_address: 0x{}, error: {:?}",
-                                        hex::encode(hashed_address),
-                                        e
-                                    ))
-                                })
-                                .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
-                        };
-
-                        let msg = match item {
-                            WorkItem::Accounts(chunk) => {
-                                let mut out = Vec::with_capacity(chunk.len());
-                                let res: Result<Vec<_>, TrieDBError> = (|| {
-                                    for (hashed_address, account) in chunk {
-                                        match account {
-                                            Some(mut account) => {
-                                                let storage_root = get_storage_root(hashed_address)?;
-                                                account.storage_root = storage_root;
-                                                out.push((hashed_address, Some(account), storage_root));
-                                            }
-                                            None => out.push((hashed_address, None, alloy_trie::EMPTY_ROOT_HASH)),
-                                        }
-                                    }
-                                    Ok(out)
-                                })();
-                                WorkResult::Accounts(res)
-                            }
-                            WorkItem::Storages(chunk) => {
-                                let mut out = Vec::with_capacity(chunk.len());
-                                let res: Result<Vec<_>, TrieDBError> = (|| {
-                                    for (hashed_address, kvs) in chunk {
-                                        // Try to get storage_trie from prefetcher, otherwise create a new one
-                                        let mut storage_trie = match prefetcher
-                                            .as_ref()
-                                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                                            .cloned()
-                                        {
-                                            Some(trie) => trie,
-                                            None => {
-                                                let storage_root = get_storage_root(hashed_address)?;
-                                                let id = SecureTrieId::new(storage_root).with_owner(hashed_address);
-                                                SecureTrieBuilder::new(path_db.clone())
-                                                    .with_id(id)
-                                                    .build_with_difflayer(difflayer.as_ref())
-                                                    .map_err(|e| {
-                                                        TrieDBError::Database(format!(
-                                                            "Failed to build storage trie for hashed_address: 0x{}, error: {}",
-                                                            hex::encode(hashed_address),
-                                                            e
-                                                        ))
-                                                    })?
-                                            }
-                                        };
-
-                                        for (hashed_key, new_value) in kvs {
-                                            if let Some(new_value) = new_value {
-                                                storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
-                                                    .map_err(|e| TrieDBError::Database(format!(
-                                                        "Failed to update storage for hashed_address: 0x{}, hashed_key: 0x{}, new_value: {:#x}, error: {}",
-                                                        hex::encode(hashed_address), hex::encode(hashed_key), new_value, e
-                                                    )))?;
-                                            } else {
-                                                storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
-                                                    .map_err(|e| TrieDBError::Database(format!(
-                                                        "Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}",
-                                                        hex::encode(hashed_address), hex::encode(hashed_key), e
-                                                    )))?;
-                                            }
-                                        }
-
-                                        let new_storage_root = storage_trie.hash();
-                                        let mut new_account = accounts_arc.get(&hashed_address).unwrap().as_ref().unwrap().clone();
-                                        new_account.storage_root = new_storage_root;
-
-                                        out.push((hashed_address, Some(new_account), new_storage_root, storage_trie));
-                                    }
-                                    Ok(out)
-                                })();
-                                WorkResult::Storages(res)
-                            }
-                        };
-
-                        let _ = result_tx.send(msg);
+                        }
                     })
-                    .expect("failed to spawn triedb update_state_objects worker");
-            }
-
-            drop(result_tx);
-
-            // Enqueue work.
-            let acc_start = Instant::now();
-            let sto_start = Instant::now();
-
-            for chunk in acc_chunks {
-                work_tx
-                    .send(WorkItem::Accounts(chunk))
-                    .map_err(|_| TrieDBError::Database("failed to enqueue accounts work".to_string()))?;
-            }
-            for chunk in sto_chunks {
-                work_tx
-                    .send(WorkItem::Storages(chunk))
-                    .map_err(|_| TrieDBError::Database("failed to enqueue storages work".to_string()))?;
-            }
-            drop(work_tx);
-
-            // Collect results.
-            while acc_left > 0 || sto_left > 0 {
-                let msg = result_rx.recv().map_err(|e| {
-                    TrieDBError::Database(format!("thread pool result channel dropped: {e}"))
-                })?;
-
-                match msg {
-                    WorkResult::Accounts(res) => {
-                        acc_left = acc_left.saturating_sub(1);
-                        let chunk = res?;
-                        for (hashed_address, account, storage_root) in chunk {
-                            accounts_no_storage.insert(hashed_address, account);
-                            roots_no_storage.insert(hashed_address, storage_root);
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|vec| {
+                        let mut new_accounts = HashMap::new();
+                        let mut diff_account_storage_roots = Box::new(HashMap::new());
+                        for (hashed_address, (account, storage_root)) in vec {
+                            new_accounts.insert(hashed_address, account);
+                            diff_account_storage_roots.insert(hashed_address, storage_root);
                         }
-                        if acc_left == 0 {
-                            metrics_clone.record_intermediate_state_objects_account_duration(
-                                acc_start.elapsed().as_secs_f64(),
-                            );
+                        (new_accounts, diff_account_storage_roots)
+                    });
+                metrics_clone.record_intermediate_state_objects_account_duration(task1_start.elapsed().as_secs_f64());
+                result
+            },
+            || {
+                // Task 2: Process accounts with storage updates (parallel)
+                let task2_start = Instant::now();
+                let result = storages_for_task2
+                    .into_par_iter()
+                    .map(|(hashed_address, kvs)| {
+
+                        // Try to get storage_trie from prefetcher, otherwise create a new one
+                        let mut storage_trie = match prefetcher_clone.as_ref()
+                            .and_then(|p| p.storage_tries.get(&hashed_address))
+                            .cloned()
+                        {
+                            Some(trie) => trie,
+                            None => {
+                                // Get storage root from path_db or difflayer
+                                let storage_root = get_storage_root(hashed_address)?;
+                                let id = SecureTrieId::new(storage_root)
+                                    .with_owner(hashed_address);
+                                SecureTrieBuilder::new(path_db_clone.clone())
+                                    .with_id(id)
+                                    .build_with_difflayer(difflayer_clone.as_ref())
+                                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?
+                            }
+                        };
+                        
+                        // Get storage root from path_db or difflayer (same logic as task 1)
+                        // let storage_root = get_storage_root(hashed_address)?;
+                        // let id = SecureTrieId::new(storage_root)
+                        //     .with_owner(hashed_address);
+                        // let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
+                        //     .with_id(id)
+                        //     .build_with_difflayer(difflayer_clone.as_ref())
+                        //     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+
+                        // Parallel execution for kvs within each address
+                        let kvs_vec: Vec<_> = kvs.into_iter().collect();
+                        for (hashed_key, new_value) in kvs_vec {
+                            if let Some(new_value) = new_value {
+                                storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
+                                    .map_err(|e| TrieDBError::Database(format!("Failed to update storage for hashed_address: 0x{}, hashed_key: 0x{}, new_value: {:#x}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), new_value, e)))?;
+                            } else {
+                                storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
+                                    .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
+                            }
                         }
-                    }
-                    WorkResult::Storages(res) => {
-                        sto_left = sto_left.saturating_sub(1);
-                        let chunk = res?;
-                        for (hashed_address, account, storage_root, storage_trie) in chunk {
-                            accounts_with_storage.insert(hashed_address, account);
-                            roots_with_storage.insert(hashed_address, storage_root);
+
+                        let new_storage_root = storage_trie.hash();
+                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
+                        new_account.storage_root = new_storage_root;
+
+                        Ok((hashed_address, (Some(new_account), new_storage_root, storage_trie)))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|vec| {
+                        let mut new_accounts = HashMap::new();
+                        let mut diff_account_storage_roots = Box::new(HashMap::new());
+                        let mut storage_tries = HashMap::new();
+                        for (hashed_address, (account, storage_root, storage_trie)) in vec {
+                            new_accounts.insert(hashed_address, account);
+                            diff_account_storage_roots.insert(hashed_address, storage_root);
                             storage_tries.insert(hashed_address, storage_trie);
                         }
-                        if sto_left == 0 {
-                            metrics_clone.record_intermediate_state_objects_storage_duration(
-                                sto_start.elapsed().as_secs_f64(),
-                            );
-                        }
-                    }
-                }
+                        (new_accounts, diff_account_storage_roots, storage_tries)
+                    });
+                metrics_clone.record_intermediate_state_objects_storage_duration(task2_start.elapsed().as_secs_f64());
+                result
             }
-
-            // If a group had no work, still record near-zero duration for consistency.
-            if accounts_no_storage.is_empty() {
-                metrics_clone.record_intermediate_state_objects_account_duration(0.0);
-            }
-            if storage_tries.is_empty() {
-                metrics_clone.record_intermediate_state_objects_storage_duration(0.0);
-            }
-
-            Ok(())
-        })?;
+        );
 
         // Merge results
+        let (mut accounts_no_storage, mut roots_no_storage) = account_result?;
+        let (accounts_with_storage, roots_with_storage, storage_tries) = storage_result?;
+
         accounts_no_storage.extend(accounts_with_storage);
         roots_no_storage.extend(roots_with_storage.into_iter());
 
-        let updated_storage_trie_count = storage_tries.len();
         self.storage_tries = storage_tries;
         self.updated_storage_roots = roots_no_storage;
-
-        let elapsed = update_state_objects_start.elapsed();
-        tracing::debug!(
-            target: "triedb::reth",
-            elapsed_ms = elapsed.as_millis(),
-            updated_storage_trie_count,
-            "update_state_objects finished"
-        );
-
+        
         Ok(accounts_no_storage)
     }
 
