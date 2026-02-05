@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
@@ -198,7 +199,15 @@ where
 
     /// Reset the state of the trie db to the given root hash and difflayer
     pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
+        let start = Instant::now();
+        let has_difflayer = difflayer.is_some();
+        let has_prefetcher = prefetcher.is_some();
+
+        let set_prefetcher_start = Instant::now();
         self.prefetcher = prefetcher;
+        let set_prefetcher_elapsed = set_prefetcher_start.elapsed();
+
+        let build_account_trie_start = Instant::now();
         if let Some(prefetcher) = &self.prefetcher {
             self.account_trie = Some(prefetcher.account_trie.clone());
         } else {
@@ -209,11 +218,28 @@ where
                 .build_with_difflayer(difflayer)?
             );
         }
+        let build_account_trie_elapsed = build_account_trie_start.elapsed();
+
+        let reset_fields_start = Instant::now();
         self.root_hash = root_hash;
         self.updated_storage_roots.clear();
         self.difflayer = difflayer.map(|d| d.clone());
         self.storage_tries.clear();
         self.accounts_with_storage_trie.clear();
+        let reset_fields_elapsed = reset_fields_start.elapsed();
+
+        let total_elapsed = start.elapsed();
+        tracing::debug!(
+            target: "triedb::reth",
+            total_ms = total_elapsed.as_millis(),
+            set_prefetcher_ms = set_prefetcher_elapsed.as_millis(),
+            build_account_trie_ms = build_account_trie_elapsed.as_millis(),
+            reset_fields_ms = reset_fields_elapsed.as_millis(),
+            has_difflayer,
+            has_prefetcher,
+            root_hash = ?root_hash,
+            "state_at finished"
+        );
         Ok(())
     }
 
