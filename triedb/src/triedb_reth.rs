@@ -852,6 +852,72 @@ where
         let merge_elapsed = merge_start.elapsed();
 
         let total_elapsed = commit_state_objects_start.elapsed();
+        // High-signal commit size stats: only compute bytes/deletes for slow commits to avoid
+        // adding overhead to the fast path.
+        let merged_sets_len = merged_node_set.sets.len();
+        let diff_nodes_len = merged_node_set.difflayer.len();
+        let slow_commit = total_elapsed.as_millis() >= 50;
+        // Split stats between account trie (owner == B256::ZERO) and storage tries (owner != ZERO).
+        let (account_updates, account_deletes, account_nodes, account_leaves) = merged_node_set
+            .sets
+            .get(&B256::ZERO)
+            .map(|set| (set.updates, set.deletes, set.nodes.len(), set.leaf_count()))
+            .unwrap_or((0, 0, 0, 0));
+        let (storage_updates, storage_deletes, storage_nodes, storage_leaves) = merged_node_set
+            .sets
+            .iter()
+            .filter(|(owner, _)| **owner != B256::ZERO)
+            .fold((0usize, 0usize, 0usize, 0usize), |(u, d, n, l), (_, set)| {
+                (
+                    u + set.updates,
+                    d + set.deletes,
+                    n + set.nodes.len(),
+                    l + set.leaf_count(),
+                )
+            });
+        let merged_updates = account_updates + storage_updates;
+        let merged_deletes = account_deletes + storage_deletes;
+        let merged_nodes = account_nodes + storage_nodes;
+        let merged_leaves = account_leaves + storage_leaves;
+
+        // Byte-size estimates of difflayer writes; only compute on slow commits.
+        let (account_diff_nodes_len, account_diff_nodes_bytes, account_diff_nodes_deletes) = slow_commit
+            .then(|| {
+                merged_node_set
+                    .sets
+                    .get(&B256::ZERO)
+                    .map(|set| {
+                        let len = set.difflayer.len();
+                        let bytes: usize = set.difflayer.values().map(|n| n.size()).sum();
+                        let deletes: usize = set.difflayer.values().filter(|n| n.is_deleted()).count();
+                        (len, Some(bytes), Some(deletes))
+                    })
+                    .unwrap_or((0usize, Some(0usize), Some(0usize)))
+            })
+            .unwrap_or((0usize, None, None));
+
+        let (storage_diff_nodes_len, storage_diff_nodes_bytes, storage_diff_nodes_deletes) = slow_commit
+            .then(|| {
+                let mut len: usize = 0;
+                let mut bytes: usize = 0;
+                let mut deletes: usize = 0;
+                for (owner, set) in merged_node_set.sets.iter() {
+                    if *owner == B256::ZERO {
+                        continue;
+                    }
+                    len += set.difflayer.len();
+                    bytes += set.difflayer.values().map(|n| n.size()).sum::<usize>();
+                    deletes += set.difflayer.values().filter(|n| n.is_deleted()).count();
+                }
+                (len, Some(bytes), Some(deletes))
+            })
+            .unwrap_or((0usize, None, None));
+
+        // For convenience, also keep the total difflayer bytes/deletes.
+        let diff_nodes_bytes: Option<usize> = slow_commit
+            .then(|| merged_node_set.difflayer.values().map(|n| n.size()).sum());
+        let diff_nodes_deletes: Option<usize> = slow_commit
+            .then(|| merged_node_set.difflayer.values().filter(|n| n.is_deleted()).count());
         tracing::debug!(
             target: "triedb::reth",
             total_ms = total_elapsed.as_millis(),
@@ -859,6 +925,28 @@ where
             storage_commit_ms = storage_commit_elapsed.as_millis(),
             merge_nodesets_ms = merge_elapsed.as_millis(),
             storage_tries_len,
+            merged_sets_len,
+            merged_updates,
+            merged_deletes,
+            merged_nodes,
+            merged_leaves,
+            account_updates,
+            account_deletes,
+            account_nodes,
+            account_leaves,
+            storage_updates,
+            storage_deletes,
+            storage_nodes,
+            storage_leaves,
+            diff_nodes_len,
+            diff_nodes_bytes,
+            diff_nodes_deletes,
+            account_diff_nodes_len,
+            account_diff_nodes_bytes,
+            account_diff_nodes_deletes,
+            storage_diff_nodes_len,
+            storage_diff_nodes_bytes,
+            storage_diff_nodes_deletes,
             "commit_state_objects finished"
         );
         Ok((root_hash, Arc::from(*merged_node_set)))
