@@ -424,6 +424,7 @@ where
                         let path_db_clone = path_db_clone.clone();
                         let difflayer_clone = difflayer_clone.clone();
                         let prefetcher_clone = prefetcher_clone.clone();
+                        let states_rebuild = Arc::clone(&states_rebuild);
                         let accounts_clone = Arc::clone(&accounts_clone);
                         let get_storage_root_task2 = &get_storage_root_task2;
 
@@ -512,6 +513,31 @@ where
                                     }
                                     let apply_kvs_ms = apply_start.elapsed().as_millis();
                                     if apply_kvs_ms >= 100 {
+                                        let storage_root_source = if prefetch_trie_hit {
+                                            "prefetch_trie"
+                                        } else if states_rebuild.contains(&hashed_address) {
+                                            "rebuild"
+                                        } else if prefetcher_clone
+                                            .as_ref()
+                                            .and_then(|p| p.storage_roots.get(&hashed_address))
+                                            .is_some()
+                                        {
+                                            "prefetch_root"
+                                        } else if difflayer_clone
+                                            .as_ref()
+                                            .and_then(|dl| dl.get_storage_root(hashed_address))
+                                            .is_some()
+                                        {
+                                            "difflayer"
+                                        } else {
+                                            "pathdb"
+                                        };
+                                        let prefetch_storage_roots_len = prefetcher_clone
+                                            .as_ref()
+                                            .map(|p| p.storage_roots.len());
+                                        let prefetch_storage_tries_len = prefetcher_clone
+                                            .as_ref()
+                                            .map(|p| p.storage_tries.len());
                                         let rs = storage_trie.trie().resolve_stats();
                                         let tracer_inserts_after = storage_trie.trie().tracer.inserts().len();
                                         let tracer_deletes_after = storage_trie.trie().tracer.deletes().len();
@@ -523,6 +549,9 @@ where
                                             kvs_updates,
                                             kvs_deletes,
                                             apply_kvs_ms,
+                                            storage_root_source,
+                                            prefetch_storage_roots_len,
+                                            prefetch_storage_tries_len,
                                             // resolve path stats during apply window
                                             resolve_calls = rs.calls,
                                             resolve_difflayer_hits = rs.difflayer_hits,
@@ -568,6 +597,25 @@ where
                                     };
 
                                     if total_ms >= STORAGE_TRIE_SLOW_LOG_THRESHOLD_MS {
+                                        let storage_root_source = if prefetch_trie_hit {
+                                            "prefetch_trie"
+                                        } else if states_rebuild.contains(&hashed_address) {
+                                            "rebuild"
+                                        } else if prefetcher_clone
+                                            .as_ref()
+                                            .and_then(|p| p.storage_roots.get(&hashed_address))
+                                            .is_some()
+                                        {
+                                            "prefetch_root"
+                                        } else if difflayer_clone
+                                            .as_ref()
+                                            .and_then(|dl| dl.get_storage_root(hashed_address))
+                                            .is_some()
+                                        {
+                                            "difflayer"
+                                        } else {
+                                            "pathdb"
+                                        };
                                         tracing::debug!(
                                             target: "triedb::reth",
                                             hashed_address = ?hashed_address,
@@ -579,6 +627,7 @@ where
                                             hash_ms,
                                             total_ms,
                                             prefetch_trie_hit,
+                                            storage_root_source,
                                             rayon_thread = ?rayon::current_thread_index(),
                                             "storage_trie task2 slow"
                                         );
