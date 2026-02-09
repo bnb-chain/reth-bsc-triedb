@@ -198,7 +198,7 @@ impl<'a> Committer<'a> {
         let (hash, _) = node.cache();
 
         if hash.is_none() {
-            if self.tracer.access_list().contains_key(path.as_slice()) {
+            if self.tracer.access_list().contains(path.as_slice()) {
                 let mut nodeset = self.nodes.lock().unwrap();
                 nodeset.add_node(path.as_slice(), Arc::new(TrieNode::default()));
             }

@@ -798,7 +798,7 @@ where
             if let Some(node) = difflayers.get_trie_nodes(key.clone()) {
                 let blob = node.blob.clone().unwrap();
                 self.resolve_stats.on_hit(ResolveSource::DiffLayer, blob.len());
-                self.tracer.on_read(prefix, blob.clone());
+                self.tracer.on_read(prefix);
                 return Ok(Node::must_decode_node(Some(*hash), &blob));
             }           
         }
@@ -806,7 +806,7 @@ where
         // 2. Check if the hash is in the database
         if let Some(node_blob) = self.database.get_trie_node(&key).map_err(|e| SecureTrieError::Database(format!("{:?}", e)))? {
             self.resolve_stats.on_hit(ResolveSource::Db, node_blob.len());
-            self.tracer.on_read(prefix, node_blob.clone());
+            self.tracer.on_read(prefix);
             return Ok(Node::must_decode_node(Some(*hash), &node_blob));
         }
 

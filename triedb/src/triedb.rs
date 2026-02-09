@@ -209,7 +209,7 @@ where
 
         let build_account_trie_start = Instant::now();
         if let Some(prefetcher) = &self.prefetcher {
-            self.account_trie = Some(prefetcher.account_trie.clone());
+            self.account_trie = Some(prefetcher.account_trie_clone());
         } else {
             let id = SecureTrieId::new(root_hash);
             self.account_trie = Some(

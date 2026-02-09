@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// TrieTracer tracks inserted, deleted and accessed trie nodes by their path.
 ///
 /// Semantics mirror geth's tracer in `bsc/trie/tracer.go`:
-/// - on_read caches the RLP blob for a path (used to validate effective deletions)
+/// - on_read records that a path was accessed
 /// - on_insert removes from `deletes` if present (resurrection), otherwise marks in `inserts`
 /// - on_delete removes from `inserts` if present (untouched), otherwise marks in `deletes`
 /// - deleted_nodes returns only paths that were actually present (exist in `access_list`)
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 pub struct TrieTracer {
     inserts: HashSet<Vec<u8>>,      // set of node paths inserted
     deletes: HashSet<Vec<u8>>,      // set of node paths deleted
-    access_list: HashMap<Vec<u8>, Vec<u8>>, // path -> rlp-encoded blob as loaded from DB
+    access_list: HashSet<Vec<u8>>,  // set of node paths accessed (resolved)
 }
 
 impl TrieTracer {
@@ -22,10 +22,13 @@ impl TrieTracer {
         Self::default()
     }
 
-    /// Tracks a newly loaded trie node and caches its RLP-encoded blob.
-    /// The provided `val` is stored as-is without additional cloning.
-    pub fn on_read(&mut self, path: impl AsRef<[u8]>, val: Vec<u8>) {
-        self.access_list.insert(path.as_ref().to_vec(), val);
+    /// Tracks a newly loaded (resolved) trie node path.
+    ///
+    /// Note: we only need membership ("was this path ever accessed") for commit-time
+    /// bookkeeping. Storing the full RLP blob here is unnecessary and very expensive
+    /// on the hot path.
+    pub fn on_read(&mut self, path: impl AsRef<[u8]>) {
+        self.access_list.insert(path.as_ref().to_vec());
     }
 
     /// Tracks a newly inserted trie node. If the path is currently in the
@@ -61,7 +64,7 @@ impl TrieTracer {
     pub fn deleted_nodes(&self) -> Vec<Vec<u8>> {
         let mut paths = Vec::new();
         for path in &self.deletes {
-            if self.access_list.contains_key(path) {
+            if self.access_list.contains(path) {
                 paths.push(path.clone());
             }
         }
@@ -76,6 +79,6 @@ impl TrieTracer {
     /// Returns references to the internal tracking collections.
     pub fn inserts(&self) -> &HashSet<Vec<u8>> { &self.inserts }
     pub fn deletes(&self) -> &HashSet<Vec<u8>> { &self.deletes }
-    pub fn access_list(&self) -> &HashMap<Vec<u8>, Vec<u8>> { &self.access_list }
+    pub fn access_list(&self) -> &HashSet<Vec<u8>> { &self.access_list }
 }
 

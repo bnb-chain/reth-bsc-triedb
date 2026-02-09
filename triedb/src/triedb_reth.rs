@@ -1,6 +1,6 @@
 //! Reth-compatible implementations for TrieDB.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::time::Instant;
@@ -131,9 +131,100 @@ where
     DB: TrieDatabase + Clone + Send + Sync,
     DB::Error: std::fmt::Debug,
 {
-    pub account_trie: StateTrie<DB>,
-    pub storage_roots: HashMap<B256, B256>,
-    pub storage_tries: HashMap<B256, StateTrie<DB>>,
+    /// Prefetched account trie.
+    ///
+    /// This is actively cache-warmed by the prefetcher task, therefore it must be synchronized.
+    /// Callers should `clone()` it when handing off into a hot path to avoid cross-thread mutation.
+    pub account_trie: Arc<Mutex<StateTrie<DB>>>,
+    /// Best-effort storage root cache populated by the prefetcher task.
+    pub storage_roots: Arc<RwLock<HashMap<B256, B256>>>,
+    /// Best-effort prefetched storage tries, keyed by hashed address.
+    ///
+    /// This map is shared between the prefetcher and root-computation. Root computation may
+    /// `take()` (remove) entries to transfer ownership and avoid cloning.
+    pub storage_tries: Arc<RwLock<HashMap<B256, StateTrie<DB>>>>,
+}
+
+impl<DB> TrieDBPrefetchState<DB>
+where
+    DB: TrieDatabase + Clone + Send + Sync,
+    DB::Error: std::fmt::Debug,
+{
+    /// Create an empty live prefetch state.
+    pub fn new(account_trie: StateTrie<DB>) -> Self {
+        Self {
+            account_trie: Arc::new(Mutex::new(account_trie)),
+            storage_roots: Arc::new(RwLock::new(HashMap::new())),
+            storage_tries: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Clone the prefetched account trie.
+    ///
+    /// This is intended for handing off into trie-root computation so it can be used without
+    /// sharing mutable state with the background prefetcher.
+    pub fn account_trie_clone(&self) -> StateTrie<DB> {
+        self.account_trie
+            .lock()
+            .expect("TrieDBPrefetchState.account_trie lock poisoned")
+            .clone()
+    }
+
+    /// Number of cached storage roots.
+    pub fn storage_roots_len(&self) -> usize {
+        self.storage_roots
+            .read()
+            .expect("TrieDBPrefetchState.storage_roots lock poisoned")
+            .len()
+    }
+
+    /// Number of prefetched storage tries currently available.
+    pub fn storage_tries_len(&self) -> usize {
+        self.storage_tries
+            .read()
+            .expect("TrieDBPrefetchState.storage_tries lock poisoned")
+            .len()
+    }
+
+    /// Returns the storage root for `hashed_address` if present in the prefetch cache.
+    pub fn get_storage_root(&self, hashed_address: &B256) -> Option<B256> {
+        self.storage_roots
+            .read()
+            .expect("TrieDBPrefetchState.storage_roots lock poisoned")
+            .get(hashed_address)
+            .copied()
+    }
+
+    /// Returns true if a storage root is cached for `hashed_address`.
+    pub fn has_storage_root(&self, hashed_address: &B256) -> bool {
+        self.get_storage_root(hashed_address).is_some()
+    }
+
+    /// Inserts a storage root if absent.
+    pub fn insert_storage_root_if_absent(&self, hashed_address: B256, root: B256) {
+        let mut g = self
+            .storage_roots
+            .write()
+            .expect("TrieDBPrefetchState.storage_roots lock poisoned");
+        g.entry(hashed_address).or_insert(root);
+    }
+
+    /// Inserts a prefetched storage trie if absent.
+    pub fn insert_storage_trie_if_absent(&self, hashed_address: B256, trie: StateTrie<DB>) {
+        let mut g = self
+            .storage_tries
+            .write()
+            .expect("TrieDBPrefetchState.storage_tries lock poisoned");
+        g.entry(hashed_address).or_insert(trie);
+    }
+
+    /// Removes and returns a prefetched storage trie, transferring ownership to the caller.
+    pub fn take_storage_trie(&self, hashed_address: &B256) -> Option<StateTrie<DB>> {
+        self.storage_tries
+            .write()
+            .expect("TrieDBPrefetchState.storage_tries lock poisoned")
+            .remove(hashed_address)
+    }
 }
 
 /// Compatible with Reth client usage scenarios
@@ -292,9 +383,9 @@ where
                 }
 
                 if let Some(prefetcher) = &prefetcher_roots {
-                    if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
+                    if let Some(root) = prefetcher.get_storage_root(&hashed_address) {
                         stats.prefetcher.fetch_add(1, Ordering::Relaxed);
-                        return Ok(*root);
+                        return Ok(root);
                     }
                 }
 
@@ -440,8 +531,7 @@ where
                                     let (mut storage_trie, prefetch_trie_hit, get_root_ms, build_trie_ms) =
                                         match prefetcher_clone
                                             .as_ref()
-                                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                                            .cloned()
+                                            .and_then(|p| p.take_storage_trie(&hashed_address))
                                         {
                                             Some(trie) => (trie, true, 0u128, 0u128),
                                             None => {
@@ -476,8 +566,18 @@ where
                                     let mut kvs_updates: usize = 0;
                                     let mut kvs_deletes: usize = 0;
 
-                                    // Keep the original semantics (apply updates for this address sequentially)
-                                    for (hashed_key, new_value) in kvs.into_iter() {
+                                    // Keep the original semantics (apply updates for this address sequentially),
+                                    // but make the iteration order deterministic and locality-friendly.
+                                    //
+                                    // `HashMap` iteration order is randomized, which tends to thrash trie
+                                    // cursor locality (more divergent prefixes) and increases tracer
+                                    // bookkeeping. Sorting by hashed key improves cache behavior and tends
+                                    // to reduce the `apply_kvs` CPU cost on large batches.
+                                    let mut kvs_sorted: Vec<(B256, Option<U256>)> =
+                                        kvs.into_iter().collect();
+                                    kvs_sorted.sort_unstable_by(|(a, _), (b, _)| a.as_slice().cmp(b.as_slice()));
+
+                                    for (hashed_key, new_value) in kvs_sorted.into_iter() {
                                         if let Some(new_value) = new_value {
                                             kvs_updates += 1;
                                             storage_trie.update_storage_u256_with_hash_state(
@@ -519,8 +619,7 @@ where
                                             "rebuild"
                                         } else if prefetcher_clone
                                             .as_ref()
-                                            .and_then(|p| p.storage_roots.get(&hashed_address))
-                                            .is_some()
+                                            .map_or(false, |p| p.has_storage_root(&hashed_address))
                                         {
                                             "prefetch_root"
                                         } else if difflayer_clone
@@ -534,10 +633,10 @@ where
                                         };
                                         let prefetch_storage_roots_len = prefetcher_clone
                                             .as_ref()
-                                            .map(|p| p.storage_roots.len());
+                                            .map(|p| p.storage_roots_len());
                                         let prefetch_storage_tries_len = prefetcher_clone
                                             .as_ref()
-                                            .map(|p| p.storage_tries.len());
+                                            .map(|p| p.storage_tries_len());
                                         let rs = storage_trie.trie().resolve_stats();
                                         let tracer_inserts_after = storage_trie.trie().tracer.inserts().len();
                                         let tracer_deletes_after = storage_trie.trie().tracer.deletes().len();
@@ -603,8 +702,7 @@ where
                                             "rebuild"
                                         } else if prefetcher_clone
                                             .as_ref()
-                                            .and_then(|p| p.storage_roots.get(&hashed_address))
-                                            .is_some()
+                                            .map_or(false, |p| p.has_storage_root(&hashed_address))
                                         {
                                             "prefetch_root"
                                         } else if difflayer_clone
@@ -1072,8 +1170,8 @@ where
             }
 
             if let Some(prefetcher) = &self.prefetcher {
-                if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
-                    return Ok(*root);
+                if let Some(root) = prefetcher.get_storage_root(&hashed_address) {
+                    return Ok(root);
                 }
             }
 
@@ -1134,8 +1232,7 @@ where
 
                         // Try to get storage_trie from prefetcher, otherwise create a new one
                         let mut storage_trie = match prefetcher_clone.as_ref()
-                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                            .cloned()
+                            .and_then(|p| p.take_storage_trie(&hashed_address))
                         {
                             Some(trie) => trie,
                             None => {
