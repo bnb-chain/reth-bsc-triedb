@@ -235,6 +235,8 @@ where
             hashed_address: B256,
             kvs_len: usize,
             duration: std::time::Duration,
+            apply_kvs_duration: std::time::Duration,
+            hash_duration: std::time::Duration,
             prefetch_storage_trie_hit: bool,
             storage_root_source: &'static str,
         }
@@ -378,6 +380,7 @@ where
 
                         // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();
+                        let apply_kvs_start = Instant::now();
                         for (hashed_key, new_value) in kvs_vec {
                             if let Some(new_value) = new_value {
                                 storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
@@ -387,8 +390,11 @@ where
                                     .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
                             }
                         }
+                        let apply_kvs_duration = apply_kvs_start.elapsed();
 
+                        let hash_start = Instant::now();
                         let new_storage_root = storage_trie.hash();
+                        let hash_duration = hash_start.elapsed();
                         let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
                         new_account.storage_root = new_storage_root;
 
@@ -397,6 +403,8 @@ where
                             hashed_address,
                             kvs_len,
                             duration,
+                            apply_kvs_duration,
+                            hash_duration,
                             prefetch_storage_trie_hit,
                             storage_root_source,
                         };
@@ -470,6 +478,8 @@ where
                 task2_total_kvs = task2_timing.total_kvs,
                 slowest_hashed_address = %hex::encode(slowest.hashed_address),
                 slowest_ms = slowest.duration.as_secs_f64() * 1000.0,
+                slowest_apply_kvs_ms = slowest.apply_kvs_duration.as_secs_f64() * 1000.0,
+                slowest_hash_ms = slowest.hash_duration.as_secs_f64() * 1000.0,
                 slowest_kvs = slowest.kvs_len,
                 slowest_prefetch_storage_trie_hit = slowest.prefetch_storage_trie_hit,
                 slowest_storage_root_source = slowest.storage_root_source,
