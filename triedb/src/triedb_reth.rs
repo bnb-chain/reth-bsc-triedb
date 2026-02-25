@@ -237,6 +237,7 @@ where
             duration: std::time::Duration,
             apply_kvs_duration: std::time::Duration,
             hash_duration: std::time::Duration,
+            trie_update_stats: Option<rust_eth_triedb_state_trie::trie::TrieUpdateStatsSnapshot>,
             prefetch_storage_trie_hit: bool,
             storage_root_source: &'static str,
         }
@@ -380,6 +381,7 @@ where
 
                         // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();
+                        storage_trie.trie_mut().reset_update_stats();
                         let apply_kvs_start = Instant::now();
                         for (hashed_key, new_value) in kvs_vec {
                             if let Some(new_value) = new_value {
@@ -391,6 +393,7 @@ where
                             }
                         }
                         let apply_kvs_duration = apply_kvs_start.elapsed();
+                        let trie_update_stats = storage_trie.trie_mut().take_update_stats_snapshot();
 
                         let hash_start = Instant::now();
                         let new_storage_root = storage_trie.hash();
@@ -405,6 +408,7 @@ where
                             duration,
                             apply_kvs_duration,
                             hash_duration,
+                            trie_update_stats,
                             prefetch_storage_trie_hit,
                             storage_root_source,
                         };
@@ -462,6 +466,53 @@ where
         // Note: queue_delay indicates how long it took for the branch closure to start after
         // `rayon::join` was initiated (a proxy for pool contention/queueing).
         if let Some(slowest) = slowest_storage.or_else(|| task2_timing.slowest.clone()) {
+            let (
+                slowest_trie_stats_present,
+                slowest_trie_update_calls,
+                slowest_trie_delete_calls,
+                slowest_trie_key_to_nibbles_us,
+                slowest_trie_value_alloc_bytes_total,
+                slowest_trie_insert_internal_calls,
+                slowest_trie_delete_internal_calls,
+                slowest_trie_prefix_clone_bytes_total,
+                slowest_trie_key_slice_to_vec_bytes_total,
+                slowest_trie_shortnode_split_count,
+                slowest_trie_fullnode_collapse_count,
+                slowest_trie_resolve_calls,
+                slowest_trie_resolve_difflayer_hits,
+                slowest_trie_resolve_db_hits,
+                slowest_trie_resolve_us,
+                slowest_trie_resolve_decode_us,
+                slowest_trie_resolve_blob_bytes_total,
+                slowest_trie_node_key_alloc_bytes_total,
+            ) = slowest
+                .trie_update_stats
+                .as_ref()
+                .map(|s| {
+                    (
+                        true,
+                        s.update_calls,
+                        s.delete_calls,
+                        s.key_to_nibbles_us,
+                        s.value_alloc_bytes_total,
+                        s.insert_internal_calls,
+                        s.delete_internal_calls,
+                        s.prefix_clone_bytes_total,
+                        s.key_slice_to_vec_bytes_total,
+                        s.shortnode_split_count,
+                        s.fullnode_collapse_count,
+                        s.resolve_calls,
+                        s.resolve_difflayer_hits,
+                        s.resolve_db_hits,
+                        s.resolve_us,
+                        s.resolve_decode_us,
+                        s.resolve_blob_bytes_total,
+                        s.node_key_alloc_bytes_total,
+                    )
+                })
+                .unwrap_or((
+                    false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ));
             debug!(
                 target: "triedb::update_state_objects",
                 accounts_len,
@@ -483,6 +534,24 @@ where
                 slowest_kvs = slowest.kvs_len,
                 slowest_prefetch_storage_trie_hit = slowest.prefetch_storage_trie_hit,
                 slowest_storage_root_source = slowest.storage_root_source,
+                slowest_trie_stats_present,
+                slowest_trie_update_calls,
+                slowest_trie_delete_calls,
+                slowest_trie_key_to_nibbles_ms = (slowest_trie_key_to_nibbles_us as f64) / 1000.0,
+                slowest_trie_value_alloc_bytes_total,
+                slowest_trie_insert_internal_calls,
+                slowest_trie_delete_internal_calls,
+                slowest_trie_prefix_clone_bytes_total,
+                slowest_trie_key_slice_to_vec_bytes_total,
+                slowest_trie_shortnode_split_count,
+                slowest_trie_fullnode_collapse_count,
+                slowest_trie_resolve_calls,
+                slowest_trie_resolve_difflayer_hits,
+                slowest_trie_resolve_db_hits,
+                slowest_trie_resolve_ms = (slowest_trie_resolve_us as f64) / 1000.0,
+                slowest_trie_resolve_decode_ms = (slowest_trie_resolve_decode_us as f64) / 1000.0,
+                slowest_trie_resolve_blob_bytes_total,
+                slowest_trie_node_key_alloc_bytes_total,
                 "update_state_objects timing"
             );
         } else {
