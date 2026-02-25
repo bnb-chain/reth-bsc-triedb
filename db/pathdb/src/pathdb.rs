@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rocksdb::{
     BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
@@ -118,8 +119,21 @@ pub struct PathDB {
     /// Thread-safe LRU cache for storage root key-value pairs.
     /// Uses mini_moka for high-concurrency performance with sharded locks.
     pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
+    /// Shared counters for diagnosing trie-node cache hit ratio.
+    trie_node_cache_counters: Arc<TrieNodeCacheCounters>,
     // /// Metrics for the PathDB.
     // metrics: PathDBMetrics,
+}
+
+#[derive(Debug, Default)]
+struct TrieNodeCacheCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    rocksdb_get_calls: AtomicU64,
+    rocksdb_get_found: AtomicU64,
+    rocksdb_get_not_found: AtomicU64,
+    rocksdb_get_errors: AtomicU64,
+    rocksdb_get_us_total: AtomicU64,
 }
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
@@ -164,6 +178,7 @@ impl Clone for PathDB {
             read_options,
             trie_node_cache: self.trie_node_cache.clone(),
             storage_root_cache: self.storage_root_cache.clone(),
+            trie_node_cache_counters: self.trie_node_cache_counters.clone(),
             // metrics: self.metrics.clone(),
         }
     }
@@ -265,6 +280,7 @@ impl PathDB {
             read_options,
             trie_node_cache,
             storage_root_cache,
+            trie_node_cache_counters: Arc::new(TrieNodeCacheCounters::default()),
             // metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
         })
     }
@@ -308,11 +324,11 @@ impl PathDB {
         // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
-            // self.metrics.trie_node_cache_hits.increment(1);
+            self.trie_node_cache_counters.hits.fetch_add(1, Ordering::Relaxed);
             trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
             return Ok(cached_value);
         }
-        // self.metrics.trie_node_cache_misses.increment(1);
+        self.trie_node_cache_counters.misses.fetch_add(1, Ordering::Relaxed);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -320,20 +336,39 @@ impl PathDB {
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
         // Cache miss, read from DB
-        match self.db.get_cf_opt(&cf, key, &self.read_options) {
+        self.trie_node_cache_counters
+            .rocksdb_get_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let rocksdb_get_start = std::time::Instant::now();
+        let res = self.db.get_cf_opt(&cf, key, &self.read_options);
+        let rocksdb_get_us = rocksdb_get_start.elapsed().as_micros() as u64;
+        self.trie_node_cache_counters
+            .rocksdb_get_us_total
+            .fetch_add(rocksdb_get_us, Ordering::Relaxed);
+
+        match res {
             Ok(Some(value)) => {
+                self.trie_node_cache_counters
+                    .rocksdb_get_found
+                    .fetch_add(1, Ordering::Relaxed);
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
                 // Insert into cache - mini_moka handles LRU eviction automatically
                 self.trie_node_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
+                self.trie_node_cache_counters
+                    .rocksdb_get_not_found
+                    .fetch_add(1, Ordering::Relaxed);
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}': 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
                 // Cache None values to avoid repeated DB lookups
                 self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
+                self.trie_node_cache_counters
+                    .rocksdb_get_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 error!(target: "pathdb::rocksdb", "Error getting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
                 Err(PathProviderError::Database(format!("RocksDB get in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
             }
@@ -564,6 +599,23 @@ impl TrieDatabase for PathDB {
 
     fn get_trie_node(&self, path: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         self.get_raw_trie_node(path)
+    }
+
+    fn trie_node_cache_counters(&self) -> Option<(u64, u64)> {
+        Some((
+            self.trie_node_cache_counters.hits.load(Ordering::Relaxed),
+            self.trie_node_cache_counters.misses.load(Ordering::Relaxed),
+        ))
+    }
+
+    fn trie_node_rocksdb_counters(&self) -> Option<(u64, u64, u64, u64, u64)> {
+        Some((
+            self.trie_node_cache_counters.rocksdb_get_calls.load(Ordering::Relaxed),
+            self.trie_node_cache_counters.rocksdb_get_found.load(Ordering::Relaxed),
+            self.trie_node_cache_counters.rocksdb_get_not_found.load(Ordering::Relaxed),
+            self.trie_node_cache_counters.rocksdb_get_errors.load(Ordering::Relaxed),
+            self.trie_node_cache_counters.rocksdb_get_us_total.load(Ordering::Relaxed),
+        ))
     }
 
     fn insert_trie_node(&self, path: &[u8], data: Vec<u8>) -> Result<(), Self::Error> {

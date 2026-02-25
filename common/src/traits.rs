@@ -66,6 +66,36 @@ pub trait TrieDatabase {
     /// or backend-specific failures.
     fn get_trie_node(&self, path: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
+    /// Returns counters for the trie-node read-through cache, if available.
+    ///
+    /// This is intended for performance diagnostics: it lets callers estimate how many
+    /// `get_trie_node` lookups were served from an in-memory cache vs required an underlying
+    /// DB read.
+    ///
+    /// Return value is `(cache_hits, cache_misses)` for trie node lookups.
+    ///
+    /// Default implementation returns `None` for backends that do not expose cache stats.
+    #[inline]
+    fn trie_node_cache_counters(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Returns counters for RocksDB reads of trie nodes, if available.
+    ///
+    /// Return value is:
+    /// `(rocksdb_get_calls, rocksdb_get_found, rocksdb_get_not_found, rocksdb_get_errors, rocksdb_get_us_total)`.
+    ///
+    /// - **calls**: how many times the backend actually invoked a RocksDB `get` for a trie node.
+    /// - **found/not_found**: result cardinality (Ok(Some)/Ok(None)).
+    /// - **errors**: number of RocksDB read errors.
+    /// - **us_total**: total time spent inside the RocksDB `get` call (microseconds).
+    ///
+    /// Default implementation returns `None` for backends that do not expose these counters.
+    #[inline]
+    fn trie_node_rocksdb_counters(&self) -> Option<(u64, u64, u64, u64, u64)> {
+        None
+    }
+
     /// Inserts or updates a trie node in the database.
     ///
     /// This method stores the encoded node data at the specified path. If a

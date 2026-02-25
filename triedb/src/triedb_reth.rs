@@ -255,6 +255,24 @@ where
         let accounts_len = accounts.len();
         let storages_len = storages.len();
 
+        // Snapshot PathDB trie-node cache counters (if supported by DB backend).
+        let (pathdb_cache_stats_present, pathdb_trie_node_cache_hits_start, pathdb_trie_node_cache_misses_start) =
+            match self.path_db.trie_node_cache_counters() {
+                Some((h, m)) => (true, h, m),
+                None => (false, 0u64, 0u64),
+            };
+        let (
+            pathdb_rocksdb_stats_present,
+            pathdb_rocksdb_trie_node_get_calls_start,
+            pathdb_rocksdb_trie_node_get_found_start,
+            pathdb_rocksdb_trie_node_get_not_found_start,
+            pathdb_rocksdb_trie_node_get_errors_start,
+            pathdb_rocksdb_trie_node_get_us_total_start,
+        ) = match self.path_db.trie_node_rocksdb_counters() {
+            Some((c, f, n, e, us)) => (true, c, f, n, e, us),
+            None => (false, 0u64, 0u64, 0u64, 0u64, 0u64),
+        };
+
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
         let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
@@ -490,6 +508,38 @@ where
         // Log timing and context (including approximate queue delay for each join-branch).
         // Note: queue_delay indicates how long it took for the branch closure to start after
         // `rayon::join` was initiated (a proxy for pool contention/queueing).
+        let (pathdb_trie_node_cache_hits, pathdb_trie_node_cache_misses, pathdb_trie_node_cache_hit_ratio) =
+            if pathdb_cache_stats_present {
+                let (h1, m1) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
+                let dh = h1.saturating_sub(pathdb_trie_node_cache_hits_start);
+                let dm = m1.saturating_sub(pathdb_trie_node_cache_misses_start);
+                let denom = dh.saturating_add(dm);
+                let ratio = if denom == 0 { 0.0 } else { (dh as f64) / (denom as f64) };
+                (dh, dm, ratio)
+            } else {
+                (0u64, 0u64, 0.0)
+            };
+        let (
+            pathdb_rocksdb_trie_node_get_calls,
+            pathdb_rocksdb_trie_node_get_found,
+            pathdb_rocksdb_trie_node_get_not_found,
+            pathdb_rocksdb_trie_node_get_errors,
+            pathdb_rocksdb_trie_node_get_ms_total,
+            pathdb_rocksdb_trie_node_get_avg_us,
+        ) = if pathdb_rocksdb_stats_present {
+            let (c1, f1, n1, e1, us1) = self.path_db.trie_node_rocksdb_counters().unwrap_or((0, 0, 0, 0, 0));
+            let dc = c1.saturating_sub(pathdb_rocksdb_trie_node_get_calls_start);
+            let df = f1.saturating_sub(pathdb_rocksdb_trie_node_get_found_start);
+            let dn = n1.saturating_sub(pathdb_rocksdb_trie_node_get_not_found_start);
+            let de = e1.saturating_sub(pathdb_rocksdb_trie_node_get_errors_start);
+            let dus = us1.saturating_sub(pathdb_rocksdb_trie_node_get_us_total_start);
+            let denom = if dc == 0 { 1 } else { dc };
+            let avg_us = (dus as f64) / (denom as f64);
+            (dc, df, dn, de, (dus as f64) / 1000.0, avg_us)
+        } else {
+            (0u64, 0u64, 0u64, 0u64, 0.0, 0.0)
+        };
+
         if let Some(slowest) = slowest_storage.or_else(|| task2_timing.slowest.clone()) {
             let (
                 slowest_trie_stats_present,
@@ -559,6 +609,17 @@ where
                 slowest_kvs = slowest.kvs_len,
                 slowest_prefetch_storage_trie_hit = slowest.prefetch_storage_trie_hit,
                 slowest_storage_root_source = slowest.storage_root_source,
+                pathdb_cache_stats_present,
+                pathdb_trie_node_cache_hits,
+                pathdb_trie_node_cache_misses,
+                pathdb_trie_node_cache_hit_ratio,
+                pathdb_rocksdb_stats_present,
+                pathdb_rocksdb_trie_node_get_calls,
+                pathdb_rocksdb_trie_node_get_found,
+                pathdb_rocksdb_trie_node_get_not_found,
+                pathdb_rocksdb_trie_node_get_errors,
+                pathdb_rocksdb_trie_node_get_ms_total,
+                pathdb_rocksdb_trie_node_get_avg_us,
                 slowest_trie_stats_present,
                 slowest_trie_update_calls,
                 slowest_trie_delete_calls,
@@ -594,6 +655,17 @@ where
                 task2_ms = task2_timing.work.as_secs_f64() * 1000.0,
                 task2_items = task2_timing.items,
                 task2_total_kvs = task2_timing.total_kvs,
+                pathdb_cache_stats_present,
+                pathdb_trie_node_cache_hits,
+                pathdb_trie_node_cache_misses,
+                pathdb_trie_node_cache_hit_ratio,
+                pathdb_rocksdb_stats_present,
+                pathdb_rocksdb_trie_node_get_calls,
+                pathdb_rocksdb_trie_node_get_found,
+                pathdb_rocksdb_trie_node_get_not_found,
+                pathdb_rocksdb_trie_node_get_errors,
+                pathdb_rocksdb_trie_node_get_ms_total,
+                pathdb_rocksdb_trie_node_get_avg_us,
                 "update_state_objects timing (no slowest item)"
             );
         }
