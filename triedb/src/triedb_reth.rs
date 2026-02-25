@@ -379,18 +379,43 @@ where
                         //     .build_with_difflayer(difflayer_clone.as_ref())
                         //     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
 
-                        // Parallel execution for kvs within each address
-                        let kvs_vec: Vec<_> = kvs.into_iter().collect();
+                        // Apply updates before deletes (Geth-style). This reduces structural churn
+                        // (collapse/split) during a batch of writes.
+                        let mut updates = Vec::with_capacity(kvs_len);
+                        let mut deletes = Vec::new();
+                        for (hashed_key, new_value) in kvs {
+                            if let Some(v) = new_value {
+                                updates.push((hashed_key, v));
+                            } else {
+                                deletes.push(hashed_key);
+                            }
+                        }
                         storage_trie.trie_mut().reset_update_stats();
                         let apply_kvs_start = Instant::now();
-                        for (hashed_key, new_value) in kvs_vec {
-                            if let Some(new_value) = new_value {
-                                storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
-                                    .map_err(|e| TrieDBError::Database(format!("Failed to update storage for hashed_address: 0x{}, hashed_key: 0x{}, new_value: {:#x}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), new_value, e)))?;
-                            } else {
-                                storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
-                                    .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
-                            }
+                        for (hashed_key, new_value) in updates {
+                            storage_trie
+                                .update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
+                                .map_err(|e| {
+                                    TrieDBError::Database(format!(
+                                        "Failed to update storage for hashed_address: 0x{}, hashed_key: 0x{}, new_value: {:#x}, error: {}",
+                                        hex::encode(hashed_address),
+                                        hex::encode(hashed_key),
+                                        new_value,
+                                        e
+                                    ))
+                                })?;
+                        }
+                        for hashed_key in deletes {
+                            storage_trie
+                                .delete_storage_with_hash_state(hashed_address, hashed_key)
+                                .map_err(|e| {
+                                    TrieDBError::Database(format!(
+                                        "Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}",
+                                        hex::encode(hashed_address),
+                                        hex::encode(hashed_key),
+                                        e
+                                    ))
+                                })?;
                         }
                         let apply_kvs_duration = apply_kvs_start.elapsed();
                         let trie_update_stats = storage_trie.trie_mut().take_update_stats_snapshot();
