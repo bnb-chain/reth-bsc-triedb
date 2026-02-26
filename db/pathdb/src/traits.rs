@@ -9,7 +9,7 @@ pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 pub const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 64 * 1024 * 1024; // 64MB
 pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
 pub const DEFAULT_CREATE_IF_MISSING: bool = true;
-pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 20_000_000; // 2KW entries
+pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 40_000_000; // 4KW entries
 pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 200_000_000; // 20KW entries
 
 // BlockBasedTable configuration constants (directly impacts random reads)
