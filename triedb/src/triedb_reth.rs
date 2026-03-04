@@ -785,17 +785,14 @@ where
             let storage_states_clone = hashed_post_state.storage_states.clone();
             let states_rebuild_clone = hashed_post_state.states_rebuild.clone();
 
-            let (h0, m0) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-
+            self.path_db.reset_trie_node_cache_counters();
             let mut clone_triedb = self.clone();
             clone_triedb.state_at(parent_root, difflayer, prefetcher_for_clone)?;
             let run1_start = Instant::now();
             clone_triedb.intermediate_inner(states_clone, storage_states_clone, states_rebuild_clone)?;
             let run1_elapsed_ms = run1_start.elapsed().as_secs_f64() * 1000.0;
 
-            let (h1, m1) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-            let run1_hits = h1.saturating_sub(h0);
-            let run1_misses = m1.saturating_sub(m0);
+            let (run1_hits, run1_misses) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
             let run1_total = run1_hits + run1_misses;
             let run1_ratio = if run1_total > 0 {
                 run1_hits as f64 / run1_total as f64
@@ -804,6 +801,7 @@ where
             };
             drop(clone_triedb);
 
+            self.path_db.reset_trie_node_cache_counters();
             let run2_start = Instant::now();
             self.intermediate_inner(
                 hashed_post_state.states.clone(),
@@ -812,9 +810,7 @@ where
             )?;
             let run2_elapsed_ms = run2_start.elapsed().as_secs_f64() * 1000.0;
 
-            let (h2, m2) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-            let run2_hits = h2.saturating_sub(h1);
-            let run2_misses = m2.saturating_sub(m1);
+            let (run2_hits, run2_misses) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
             let run2_total = run2_hits + run2_misses;
             let run2_ratio = if run2_total > 0 {
                 run2_hits as f64 / run2_total as f64

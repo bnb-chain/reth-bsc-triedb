@@ -80,6 +80,13 @@ pub trait TrieDatabase {
         None
     }
 
+    /// Resets trie-node cache hit/miss counters to zero, if the backend supports it.
+    ///
+    /// After reset, the next read of `trie_node_cache_counters()` reflects only activity
+    /// since this call. Default is a no-op.
+    #[inline]
+    fn reset_trie_node_cache_counters(&self) {}
+
     /// Returns counters for RocksDB reads of trie nodes, if available.
     ///
     /// Return value is:
