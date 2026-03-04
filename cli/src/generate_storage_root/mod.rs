@@ -47,8 +47,8 @@ impl GenerateStorageRootArgs {
             .ok_or_else(|| eyre::eyre!("Invalid path: {:?}", self.triedb_path))?;
 
         let mut config = PathProviderConfig::default();
-        config.trie_node_cache_size = 0;
-        config.storage_root_cache_size = 0;
+        config.trie_node_cache_capacity_bytes = 0;
+        config.storage_root_cache_capacity_bytes = 0;
 
         let pathdb = PathDB::new(&path_str, config).unwrap();
 
