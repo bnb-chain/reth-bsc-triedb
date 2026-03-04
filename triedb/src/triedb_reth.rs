@@ -165,62 +165,8 @@ where
     where
         DB: 'static,
     {
-        let prefetcher_for_clone = prefetcher.as_ref().map(Arc::clone);
         self.state_at(parent_root, difflayer, prefetcher)?;
-
-        if RUN_TWICE_FOR_CACHE_HIT_RATIO {
-            let states_clone = states.clone();
-            let storage_states_clone = storage_states.clone();
-            let states_rebuild_clone = states_rebuild.clone();
-
-            let (h0, m0) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-
-            let mut clone_triedb = self.clone();
-            clone_triedb.state_at(parent_root, difflayer, prefetcher_for_clone)?;
-            let run1_start = Instant::now();
-            clone_triedb.intermediate_inner(states_clone, storage_states_clone, states_rebuild_clone)?;
-            let run1_elapsed_ms = run1_start.elapsed().as_secs_f64() * 1000.0;
-
-            let (h1, m1) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-            let run1_hits = h1.saturating_sub(h0);
-            let run1_misses = m1.saturating_sub(m0);
-            let run1_total = run1_hits + run1_misses;
-            let run1_ratio = if run1_total > 0 {
-                run1_hits as f64 / run1_total as f64
-            } else {
-                0.0
-            };
-            drop(clone_triedb);
-
-            let run2_start = Instant::now();
-            self.intermediate_inner(states, storage_states, states_rebuild)?;
-            let run2_elapsed_ms = run2_start.elapsed().as_secs_f64() * 1000.0;
-
-            let (h2, m2) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-            let run2_hits = h2.saturating_sub(h1);
-            let run2_misses = m2.saturating_sub(m1);
-            let run2_total = run2_hits + run2_misses;
-            let run2_ratio = if run2_total > 0 {
-                run2_hits as f64 / run2_total as f64
-            } else {
-                0.0
-            };
-            info!(
-                target: "triedb::intermediate_inner",
-                run1_ms = run1_elapsed_ms,
-                run1_hits = run1_hits,
-                run1_misses = run1_misses,
-                run1_hit_ratio = %format!("{:.4}", run1_ratio),
-                run2_ms = run2_elapsed_ms,
-                run2_hits = run2_hits,
-                run2_misses = run2_misses,
-                run2_hit_ratio = %format!("{:.4}", run2_ratio),
-                "intermediate_inner run twice: run1 cold / run2 warm (trie node cache)"
-            );
-        } else {
-            self.intermediate_inner(states, storage_states, states_rebuild)?;
-        }
-
+        self.intermediate_inner(states, storage_states, states_rebuild)?;
         self.commit_inner(true)
     }
 
@@ -829,15 +775,71 @@ where
         let rebuild_len = hashed_post_state.states_rebuild.len();
 
         let state_at_start = Instant::now();
+        let prefetcher_for_clone = prefetcher.as_ref().map(Arc::clone);
         self.state_at(parent_root, difflayer, prefetcher)?;
         let state_at_elapsed = state_at_start.elapsed();
 
         let intermediate_start = Instant::now();
-        self.intermediate_inner(
-            hashed_post_state.states.clone(),
-            hashed_post_state.storage_states.clone(),
-            hashed_post_state.states_rebuild.clone(),
-        )?;
+        if RUN_TWICE_FOR_CACHE_HIT_RATIO {
+            let states_clone = hashed_post_state.states.clone();
+            let storage_states_clone = hashed_post_state.storage_states.clone();
+            let states_rebuild_clone = hashed_post_state.states_rebuild.clone();
+
+            let (h0, m0) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
+
+            let mut clone_triedb = self.clone();
+            clone_triedb.state_at(parent_root, difflayer, prefetcher_for_clone)?;
+            let run1_start = Instant::now();
+            clone_triedb.intermediate_inner(states_clone, storage_states_clone, states_rebuild_clone)?;
+            let run1_elapsed_ms = run1_start.elapsed().as_secs_f64() * 1000.0;
+
+            let (h1, m1) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
+            let run1_hits = h1.saturating_sub(h0);
+            let run1_misses = m1.saturating_sub(m0);
+            let run1_total = run1_hits + run1_misses;
+            let run1_ratio = if run1_total > 0 {
+                run1_hits as f64 / run1_total as f64
+            } else {
+                0.0
+            };
+            drop(clone_triedb);
+
+            let run2_start = Instant::now();
+            self.intermediate_inner(
+                hashed_post_state.states.clone(),
+                hashed_post_state.storage_states.clone(),
+                hashed_post_state.states_rebuild.clone(),
+            )?;
+            let run2_elapsed_ms = run2_start.elapsed().as_secs_f64() * 1000.0;
+
+            let (h2, m2) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
+            let run2_hits = h2.saturating_sub(h1);
+            let run2_misses = m2.saturating_sub(m1);
+            let run2_total = run2_hits + run2_misses;
+            let run2_ratio = if run2_total > 0 {
+                run2_hits as f64 / run2_total as f64
+            } else {
+                0.0
+            };
+            info!(
+                target: "triedb::intermediate_and_commit_hashed_post_state",
+                run1_ms = run1_elapsed_ms,
+                run1_hits = run1_hits,
+                run1_misses = run1_misses,
+                run1_hit_ratio = %format!("{:.4}", run1_ratio),
+                run2_ms = run2_elapsed_ms,
+                run2_hits = run2_hits,
+                run2_misses = run2_misses,
+                run2_hit_ratio = %format!("{:.4}", run2_ratio),
+                "intermediate_inner run twice: run1 cold / run2 warm (trie node cache)"
+            );
+        } else {
+            self.intermediate_inner(
+                hashed_post_state.states.clone(),
+                hashed_post_state.storage_states.clone(),
+                hashed_post_state.states_rebuild.clone(),
+            )?;
+        }
         let intermediate_elapsed = intermediate_start.elapsed();
 
         let commit_start = Instant::now();
