@@ -84,7 +84,7 @@ impl ShortNode {
     pub fn to_rlp(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.encode(&mut buf);
-        return buf;
+        buf
     }
 
     /// Decode the node from RLP bytes
@@ -129,11 +129,11 @@ impl Encodable for ShortNode {
             }
             Node::Hash(hash_node) => {
                 // Hash nodes encoded as byte strings
-                write_bytes(&mut temp_buf, &hash_node.as_slice());
+                write_bytes(&mut temp_buf, hash_node.as_slice());
             }
             Node::Value(value_node) => {
                 // Value nodes encoded as byte strings
-                write_bytes(&mut temp_buf, &value_node.as_slice());
+                write_bytes(&mut temp_buf, value_node.as_slice());
             }
         }
 
@@ -152,7 +152,7 @@ impl Decodable for ShortNode {
         let (key_buf, value_buf) = split_string(buf)
             .map_err(|_| RlpError::Custom("Split list failed"))?;
 
-        let key = compact_to_hex(&key_buf);
+        let key = compact_to_hex(key_buf);
         if has_terminator(&key) {
             let (val, _) = split_string(value_buf)
                 .map_err(|_| RlpError::Custom("Split string failed"))?;
@@ -160,6 +160,6 @@ impl Decodable for ShortNode {
         }
 
         let (val, _) = Node::decode_ref(value_buf)?;
-        return Ok(ShortNode::new(key, &val));
+        Ok(ShortNode::new(key, &val))
     }
 }

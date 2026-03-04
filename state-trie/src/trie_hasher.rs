@@ -109,7 +109,15 @@ impl Hasher {
         let mut collapsed = full.to_mutable_copy_with_cow();
         let mut cached = full.to_mutable_copy_with_cow();
 
-        if self.parallel {
+        // Only use parallel hashing when there are enough non-empty children
+        // to justify the rayon task scheduling overhead.
+        let non_empty_count = if self.parallel {
+            full.children.iter().take(16).filter(|c| !matches!(&***c, Node::Empty)).count()
+        } else {
+            0
+        };
+
+        if self.parallel && non_empty_count >= 2 {
             let child_results: Vec<(Arc<Node>, Arc<Node>)> = (0..16)
                 .into_par_iter()
                 .map(|i| {
@@ -127,24 +135,19 @@ impl Hasher {
                 .collect();
 
             // Write results to collapsed and cached children
-            for i in 0..16 {
-                let (child_collapsed, child_cached) = child_results[i].clone();
-                collapsed.set_child(i, &*child_collapsed);
-                cached.set_child(i, &*child_cached);
+            for (i, result) in child_results.iter().enumerate().take(16) {
+                let (child_collapsed, child_cached) = result.clone();
+                collapsed.set_child(i, &child_collapsed);
+                cached.set_child(i, &child_cached);
             }
         } else {
-            for i in 0..16 {
-                match &*full.children[i] {
-                    Node::Empty => {
-                        continue;
-                    }
-                    _ => {
-                        // Note: This would need proper implementation
-                        let (child_collapsed, child_cached) = self.hash(full.children[i].clone(), false);
-                        collapsed.set_child(i, &*child_collapsed);
-                        cached.set_child(i, &*child_cached);
-                    }
+            for (i, child) in full.children.iter().enumerate().take(16) {
+                if matches!(&**child, Node::Empty) {
+                    continue;
                 }
+                let (child_collapsed, child_cached) = self.hash(child.clone(), false);
+                collapsed.set_child(i, &child_collapsed);
+                cached.set_child(i, &child_cached);
             }
         }
         (Arc::new(collapsed), Arc::new(cached))

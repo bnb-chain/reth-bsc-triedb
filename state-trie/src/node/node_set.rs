@@ -153,21 +153,15 @@ impl NodeSet {
             buf.extend_from_slice(key_bytes);
 
             // hash field
-            match node.hash {
-                Some(h) => {
-                    buf.push(1u8);
-                    buf.extend_from_slice(h.as_slice());
-                }
-                None => {}
+            if let Some(h) = node.hash {
+                buf.push(1u8);
+                buf.extend_from_slice(h.as_slice());
             }
 
             // blob field
-            match &node.blob {
-                Some(b) => {
-                    buf.push(1u8);
-                    buf.extend_from_slice(b);
-                }
-                None => {},
+            if let Some(b) = &node.blob {
+                buf.push(1u8);
+                buf.extend_from_slice(b);
             }
         }
 
@@ -220,7 +214,7 @@ impl std::fmt::Debug for NodeSet {
 
 
 /// MergedNodeSet is a set of node sets that are merged together.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct MergedNodeSet {
     pub sets: HashMap<B256, Arc<NodeSet>>,
@@ -231,7 +225,7 @@ impl MergedNodeSet {
     /// Create a new merged node set
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self { sets: HashMap::new(), difflayer: HashMap::new() }
+        Self::default()
     }
 
     /// Merge a node set into the merged set

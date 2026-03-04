@@ -94,11 +94,11 @@ impl Node {
     /// Get the cached hash and dirty state
     pub fn cache(&self) -> (Option<HashNode>, bool) {
         match self {
-            Node::Full(full) => return full.cache(),
-            Node::Short(short) => return short.cache(),
-            Node::Hash(_) => return (None, false),
-            Node::Value(_) => return (None, false),
-            Node::Empty => return (None, false),
+            Node::Full(full) => full.cache(),
+            Node::Short(short) => short.cache(),
+            Node::Hash(_) => (None, false),
+            Node::Value(_) => (None, false),
+            Node::Empty => (None, false),
         }
     }
 

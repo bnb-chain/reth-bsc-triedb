@@ -89,7 +89,7 @@ pub const STORAGE_ROOT_COLUMN_FAMILY_NAME: &str = "storage_root";
 /// 4. `TRIE_NODE_COLUMN_FAMILY_NAME` - Target destination for trie node data migration
 const COLUMN_FAMILY_NAMES: [&str; 4] = [DEFAULT_COLUMN_FAMILY_NAME, META_COLUMN_FAMILY_NAME, STORAGE_ROOT_COLUMN_FAMILY_NAME, TRIE_NODE_COLUMN_FAMILY_NAME];
 
-/// Metrics for the `PathDB`.
+// Metrics for the `PathDB`.
 // #[derive(Metrics, Clone)]
 // #[metrics(scope = "rust.eth.triedb.pathdb")]
 // pub(crate) struct PathDBMetrics {
@@ -603,7 +603,7 @@ impl PathDB {
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
                 // Cache None values to avoid repeated DB lookups
-                self.trie_node_cache.invalidate(&key_vec);
+                self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
@@ -755,11 +755,11 @@ impl TrieDatabase for PathDB {
         let mut batch = WriteBatch::default();
         {
             batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
+            batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, block_number.to_le_bytes());
 
             // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
             batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
+            batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, block_number.to_le_bytes());
         
             self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
             self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
@@ -772,11 +772,9 @@ impl TrieDatabase for PathDB {
                     if node.is_deleted() {
                         self.trie_node_cache.invalidate(key);
                         batch.delete_cf(&default_cf, key);
-                    } else {
-                        if let Some(blob) = &node.blob {
-                            self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
-                            batch.put_cf(&default_cf, key, blob);
-                        }
+                    } else if let Some(blob) = &node.blob {
+                        self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                        batch.put_cf(&default_cf, key, blob);
                     }
                 }
 

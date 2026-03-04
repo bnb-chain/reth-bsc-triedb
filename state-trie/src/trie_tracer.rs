@@ -23,9 +23,20 @@ impl TrieTracer {
     }
 
     /// Tracks a newly loaded trie node and caches its RLP-encoded blob.
-    /// The provided `val` is stored as-is without additional cloning.
+    /// First-write-wins: if the path was already read, the duplicate is skipped.
+    /// Uses owned bytes to avoid extra allocations on hot DB read paths.
     pub fn on_read(&mut self, path: impl AsRef<[u8]>, val: Vec<u8>) {
-        self.access_list.insert(path.as_ref().to_vec(), val);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.access_list.entry(path.as_ref().to_vec()) {
+            entry.insert(val);
+        }
+    }
+
+    /// Tracks a newly loaded trie node and caches its RLP-encoded blob.
+    /// Uses borrowed bytes for paths that already hold references (difflayer reads).
+    pub fn on_read_ref(&mut self, path: impl AsRef<[u8]>, val: &[u8]) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.access_list.entry(path.as_ref().to_vec()) {
+            entry.insert(val.to_vec());
+        }
     }
 
     /// Tracks a newly inserted trie node. If the path is currently in the
@@ -78,4 +89,3 @@ impl TrieTracer {
     pub fn deletes(&self) -> &HashSet<Vec<u8>> { &self.deletes }
     pub fn access_list(&self) -> &HashMap<Vec<u8>, Vec<u8>> { &self.access_list }
 }
-

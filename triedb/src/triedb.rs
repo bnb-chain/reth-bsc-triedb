@@ -211,7 +211,7 @@ where
         }
         self.root_hash = root_hash;
         self.updated_storage_roots.clear();
-        self.difflayer = difflayer.map(|d| d.clone());
+        self.difflayer = difflayer.cloned();
         self.storage_tries.clear();
         self.accounts_with_storage_trie.clear();
         Ok(())

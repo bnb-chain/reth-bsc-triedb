@@ -244,7 +244,7 @@ where
     }
 
     fn update_storage_u256_with_hash_state(&mut self, _: B256, hashed_key: B256, value: U256) -> Result<(), Self::Error> {
-        let encoded_value = alloy_rlp::encode(&value);
+        let encoded_value = alloy_rlp::encode(value);
         self.trie.update(hashed_key.as_slice(), &encoded_value)?;
         Ok(())
     }

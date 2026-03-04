@@ -163,7 +163,7 @@ where
         
         self.state_at(parent_root, difflayer, prefetcher)?;
         self.intermediate_inner(states, storage_states, states_rebuild)?;
-        return self.commit_inner(true)
+        self.commit_inner(true)
     }
 
     fn intermediate_inner(
@@ -221,7 +221,7 @@ where
             "intermediate_inner timing"
         );
 
-        return Ok(root_hash);
+        Ok(root_hash)
     }
 
     fn update_state_objects (
@@ -275,7 +275,7 @@ where
 
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
-        let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
+        let difflayer_clone = self.difflayer.clone();
         let accounts_clone = accounts.clone();
         let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
         let storages_for_task2 = storages;
@@ -328,7 +328,7 @@ where
                     .map(|(hashed_address, account)| {
                         match account {
                             Some(account) => {
-                                let mut new_account = account.clone();
+                                let mut new_account = *account;
                                 let (storage_root, _src) = get_storage_root_with_source(*hashed_address)?;
                                 new_account.storage_root = storage_root;
                                 Ok((*hashed_address, (Some(new_account), storage_root)))
@@ -441,7 +441,7 @@ where
                         let hash_start = Instant::now();
                         let new_storage_root = storage_trie.hash();
                         let hash_duration = hash_start.elapsed();
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
+                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap();
                         new_account.storage_root = new_storage_root;
 
                         let duration = item_start.elapsed();
@@ -500,7 +500,7 @@ where
         let (accounts_with_storage, roots_with_storage, storage_tries, slowest_storage) = storage_result?;
 
         accounts_no_storage.extend(accounts_with_storage);
-        roots_no_storage.extend(roots_with_storage.into_iter());
+        roots_no_storage.extend(*roots_with_storage);
 
         self.storage_tries = storage_tries;
         self.updated_storage_roots = roots_no_storage;
@@ -549,8 +549,6 @@ where
                 slowest_trie_value_alloc_bytes_total,
                 slowest_trie_insert_internal_calls,
                 slowest_trie_delete_internal_calls,
-                slowest_trie_prefix_clone_bytes_total,
-                slowest_trie_key_slice_to_vec_bytes_total,
                 slowest_trie_shortnode_split_count,
                 slowest_trie_fullnode_collapse_count,
                 slowest_trie_resolve_calls,
@@ -572,8 +570,6 @@ where
                         s.value_alloc_bytes_total,
                         s.insert_internal_calls,
                         s.delete_internal_calls,
-                        s.prefix_clone_bytes_total,
-                        s.key_slice_to_vec_bytes_total,
                         s.shortnode_split_count,
                         s.fullnode_collapse_count,
                         s.resolve_calls,
@@ -586,7 +582,7 @@ where
                     )
                 })
                 .unwrap_or((
-                    false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ));
             debug!(
                 target: "triedb::update_state_objects",
@@ -627,8 +623,6 @@ where
                 slowest_trie_value_alloc_bytes_total,
                 slowest_trie_insert_internal_calls,
                 slowest_trie_delete_internal_calls,
-                slowest_trie_prefix_clone_bytes_total,
-                slowest_trie_key_slice_to_vec_bytes_total,
                 slowest_trie_shortnode_split_count,
                 slowest_trie_fullnode_collapse_count,
                 slowest_trie_resolve_calls,
@@ -732,13 +726,13 @@ where
         let merge_start = Instant::now();
         if let Some(node_set) = account_node_set {
             merged_node_set.merge(node_set)
-                .map_err(|e| TrieDBError::Database(e))?;
+                .map_err(TrieDBError::Database)?;
         }
 
         for (_, node_set) in storage_commit_results {
             if let Some(node_set) = node_set {
                 merged_node_set.merge(node_set)
-                    .map_err(|e| TrieDBError::Database(e))?;
+                    .map_err(TrieDBError::Database)?;
             }
         }
         let merge_elapsed = merge_start.elapsed();
@@ -814,10 +808,10 @@ where
         DB: 'static,
     {
         self.state_at(parent_root, difflayer, prefetcher)?;
-        return self.intermediate_inner(
+        self.intermediate_inner(
             hashed_post_state.states.clone(), 
             hashed_post_state.storage_states.clone(), 
-            hashed_post_state.states_rebuild.clone());
+            hashed_post_state.states_rebuild.clone())
     }
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError> 
@@ -843,7 +837,7 @@ where
 
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
-        let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
+        let difflayer_clone = self.difflayer.clone();
         let accounts_clone = hashed_post_state.states.clone();
         let storages_keys: HashSet<B256> = hashed_post_state.storage_states.keys().cloned().collect();
         let storages_for_task2 = hashed_post_state.storage_states.clone();
@@ -886,7 +880,7 @@ where
                     .map(|(hashed_address, account)| {
                         match account {
                             Some(account) => {
-                                let mut new_account = account.clone();
+                                let mut new_account = *account;
                                 let storage_root = get_storage_root(*hashed_address)?;
                                 new_account.storage_root = storage_root;
                                 Ok((*hashed_address, (Some(new_account), storage_root)))
@@ -947,7 +941,7 @@ where
                         }
 
                         let (new_storage_root, node_set) = storage_trie.commit(false)?;
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
+                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap();
                         new_account.storage_root = new_storage_root;
 
                         Ok((hashed_address, (Some(new_account), new_storage_root, node_set)))
@@ -975,7 +969,7 @@ where
         let (accounts_with_storage, roots_with_storage, mut merged_node_set) = storage_result?;
 
         accounts_no_storage.extend(accounts_with_storage);
-        roots_no_storage.extend(roots_with_storage.into_iter());
+        roots_no_storage.extend(*roots_with_storage);
 
         for hashed_address in hashed_post_state.states_rebuild.clone() {
             self.delete_account_with_hash_state(hashed_address)
@@ -1002,5 +996,4 @@ where
         Ok((root_hash, difflayer))
     }
 }
-
 

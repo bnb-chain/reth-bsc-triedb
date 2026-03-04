@@ -266,11 +266,8 @@ pub fn read_size(b: &[u8], slen: u8) -> Result<u64, RlpRawError> {
 /// and any remaining bytes after that value.
 ///
 /// This mirrors go-ethereum's `Split` helper.
-pub fn split<'a>(b: &'a [u8]) -> Result<(Kind, &'a [u8], &'a [u8]), RlpRawError> {
-    let (kind, tag_size, content_size) = match read_kind(b) {
-        Ok(res) => res,
-        Err(e) => return Err(e),
-    };
+pub fn split(b: &[u8]) -> Result<(Kind, &[u8], &[u8]), RlpRawError> {
+    let (kind, tag_size, content_size) = read_kind(b)?;
 
     let ts = tag_size as usize;
     let cs = content_size as usize;
@@ -283,7 +280,7 @@ pub fn split<'a>(b: &'a [u8]) -> Result<(Kind, &'a [u8], &'a [u8]), RlpRawError>
 /// Mirrors go-ethereum's `SplitList`:
 /// - Delegates to `split`
 /// - Returns `ExpectedList` if the first value is not a list
-pub fn split_list<'a>(b: &'a [u8]) -> Result<(&'a [u8], &'a [u8]), RlpRawError> {
+pub fn split_list(b: &[u8]) -> Result<(&[u8], &[u8]), RlpRawError> {
     let (k, content, rest) = split(b)?;
     if k != Kind::List {
         return Err(RlpRawError::ExpectedList);
@@ -312,7 +309,7 @@ pub fn count_values(mut b: &[u8]) -> Result<usize, RlpRawError> {
 /// Mirrors go-ethereum's `SplitString`:
 /// - Delegates to `split`
 /// - Returns `UnexpectedList` if the first value is a list (string expected)
-pub fn split_string<'a>(b: &'a [u8]) -> Result<(&'a [u8], &'a [u8]), RlpRawError> {
+pub fn split_string(b: &[u8]) -> Result<(&[u8], &[u8]), RlpRawError> {
     let (k, content, rest) = split(b)?;
     if k == Kind::List {
         return Err(RlpRawError::UnexpectedList);

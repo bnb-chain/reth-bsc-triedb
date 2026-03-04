@@ -97,7 +97,7 @@ impl SecureTrieId {
     /// Creates a new SecureTrieId with the given state root
     pub fn new(state_root: B256) -> Self {
         Self {
-            state_root: state_root,
+            state_root,
             owner: B256::ZERO,
         }
     }
@@ -139,7 +139,7 @@ where
 
     /// Builds the secure trie with difflayer
     pub fn build_with_difflayer(self, difflayer: Option<&DiffLayers>) -> Result<StateTrie<DB>, SecureTrieError> {
-        let id = self.id.unwrap_or_else(|| SecureTrieId::default());
+        let id = self.id.unwrap_or_default();
         StateTrie::new(id, self.database, difflayer)
     }
 }

@@ -14,6 +14,9 @@ use super::secure_trie::{SecureTrieId, SecureTrieError};
 use super::trie_hasher::Hasher;
 use super::trie_tracer::TrieTracer;
 
+/// Result of `get_internal`: (value, updated_node, was_resolved).
+type GetInternalResult = Result<(Option<Vec<u8>>, Arc<Node>, bool), SecureTrieError>;
+
 /// Aggregated stats for diagnosing trie update performance.
 ///
 /// This is intentionally lightweight (counters + byte totals + coarse timings),
@@ -31,12 +34,6 @@ pub struct TrieUpdateStatsSnapshot {
 
     pub insert_internal_calls: u64,
     pub delete_internal_calls: u64,
-
-    pub prefix_clone_count: u64,
-    pub prefix_clone_bytes_total: u64,
-
-    pub key_slice_to_vec_count: u64,
-    pub key_slice_to_vec_bytes_total: u64,
 
     pub shortnode_split_count: u64,
     pub fullnode_collapse_count: u64,
@@ -66,12 +63,6 @@ struct TrieUpdateStats {
 
     insert_internal_calls: u64,
     delete_internal_calls: u64,
-
-    prefix_clone_count: u64,
-    prefix_clone_bytes_total: u64,
-
-    key_slice_to_vec_count: u64,
-    key_slice_to_vec_bytes_total: u64,
 
     shortnode_split_count: u64,
     fullnode_collapse_count: u64,
@@ -104,10 +95,6 @@ impl TrieUpdateStats {
             value_alloc_bytes_total: self.value_alloc_bytes_total,
             insert_internal_calls: self.insert_internal_calls,
             delete_internal_calls: self.delete_internal_calls,
-            prefix_clone_count: self.prefix_clone_count,
-            prefix_clone_bytes_total: self.prefix_clone_bytes_total,
-            key_slice_to_vec_count: self.key_slice_to_vec_count,
-            key_slice_to_vec_bytes_total: self.key_slice_to_vec_bytes_total,
             shortnode_split_count: self.shortnode_split_count,
             fullnode_collapse_count: self.fullnode_collapse_count,
             resolve_calls: self.resolve_calls,
@@ -134,6 +121,9 @@ pub struct Trie<DB> {
     database: DB,
     difflayers: Option<DiffLayers>,
     update_stats: TrieUpdateStats,
+    /// When true, skip tracer tracking (on_read/on_insert/on_delete).
+    /// Used during prefetch where the tracer data is discarded afterward.
+    skip_tracer: bool,
 }
 
 /// Basic Trie operations
@@ -152,20 +142,16 @@ where
             uncommitted: 0,
             tracer: TrieTracer::new(),
             database,
-            difflayers: difflayer.map(|d| d.clone()),
+            difflayers: difflayer.cloned(),
             update_stats: TrieUpdateStats::default(),
+            skip_tracer: false,
         };
 
-        // Check if this is an empty trie (root is EmptyRootHash)
-        let root = if id.state_root == alloy_trie::EMPTY_ROOT_HASH {
-            let root =Node::empty_root();
-            root 
-        } else if id.state_root == B256::ZERO {
-            let root =Node::empty_root();
-            root 
+        // Check if this is an empty trie (root is EmptyRootHash or ZERO)
+        let root = if id.state_root == alloy_trie::EMPTY_ROOT_HASH || id.state_root == B256::ZERO {
+            Node::empty_root()
         } else {
-            let root = tr.resolve_and_track(&id.state_root, &[])?;
-            root
+            tr.resolve_and_track(&id.state_root, &[])?
         };
         tr.root = root;
         Ok(tr)
@@ -193,25 +179,19 @@ where
         self.update_stats.enabled = tracing::enabled!(Level::DEBUG);
     }
 
-    #[inline]
-    fn stats_prefix_clone(&mut self, len: usize) {
-        if self.update_stats.enabled {
-            self.update_stats.prefix_clone_count += 1;
-            self.update_stats.prefix_clone_bytes_total += len as u64;
-        }
-    }
-
-    #[inline]
-    fn stats_key_slice_to_vec(&mut self, len: usize) {
-        if self.update_stats.enabled {
-            self.update_stats.key_slice_to_vec_count += 1;
-            self.update_stats.key_slice_to_vec_bytes_total += len as u64;
-        }
-    }
+    // NOTE: prefix cloning and key-slice-to-vec allocations were eliminated
+    // by the push/truncate and &[u8] optimizations.
 
     /// Creates a new flag for the trie
     pub fn new_flag(&self) -> NodeFlag {
         NodeFlag::default()
+    }
+
+    /// Sets the skip_tracer flag.
+    /// When true, tracer tracking (on_read/on_insert/on_delete) is skipped.
+    /// Used during prefetch where the tracer data is discarded afterward.
+    pub fn set_skip_tracer(&mut self, skip: bool) {
+        self.skip_tracer = skip;
     }
 
     /// Gets the root node of the trie
@@ -238,7 +218,7 @@ where
     pub fn commit(&mut self, collect_leaf: bool) -> Result<(B256, Option<Arc<NodeSet>>), SecureTrieError> {
         if matches!(&*self.root, Node::Empty) {
             let paths = self.tracer.deleted_nodes();
-            if paths.len() == 0 {
+            if paths.is_empty() {
                 self.committed = true;
                 return Ok((EMPTY_ROOT_HASH, None));
             }
@@ -284,7 +264,7 @@ where
         self.uncommitted = 0;
         self.committed = true;
 
-        return Ok((root_hash, Some(nodeset)))
+        Ok((root_hash, Some(nodeset)))
     }
 }
 
@@ -294,7 +274,6 @@ where
     DB: TrieDatabase + Clone + Send + Sync,
     DB::Error: std::fmt::Debug,
 {
-    /// Gets a value from the trie by key
     /// Gets a value from the trie by key
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, SecureTrieError> {
         // Check if trie is already committed
@@ -308,7 +287,7 @@ where
         // Get value from internal trie structure
         let (value, new_root, did_resolve) = self.get_internal(
             self.root.clone(),
-            nibbles_key,
+            &nibbles_key,
             0
         )?;
 
@@ -360,26 +339,21 @@ where
             key_to_nibbles(key)
         };
 
-        // Handle empty value (delete operation)
-        if value_node.is_none() {
-            // Delete the value from the trie
-            let (_, new_root) = self.delete_internal(
-                self.root.clone(),
-                vec![],
-                nibbles_key)?;
-
-            // Update the root with the new trie structure
-            self.root = new_root;
-        } else {
-            // Insert the new value into the trie
+        // Handle empty value (delete) vs non-empty (insert)
+        let mut prefix = Vec::new();
+        if let Some(vn) = value_node {
             let (_, new_root) = self.insert_internal(
                 self.root.clone(),
-                vec![],
-                nibbles_key,
-                Arc::new(value_node.unwrap())
+                &mut prefix,
+                &nibbles_key,
+                Arc::new(vn)
             )?;
-
-            // Update the root with the new trie structure
+            self.root = new_root;
+        } else {
+            let (_, new_root) = self.delete_internal(
+                self.root.clone(),
+                &mut prefix,
+                &nibbles_key)?;
             self.root = new_root;
         }
 
@@ -414,13 +388,13 @@ where
         };
 
         // Delete the value from the trie
+        let mut prefix = Vec::new();
         let (_, new_root) = self.delete_internal(
             self.root.clone(),
-            vec![],
-            nibbles_key
+            &mut prefix,
+            &nibbles_key
         )?;
 
-        // Update the root with the new trie structure
         self.root = new_root;
         Ok(())
     }
@@ -432,43 +406,34 @@ where
     DB: TrieDatabase + Clone + Send + Sync,
     DB::Error: std::fmt::Debug,
 {
-    /// Gets a value from the trie by key
-    /// Internal function to get a value from the trie
+    /// Internal function to get a value from the trie.
+    /// Takes nibbles_key as a shared reference to avoid allocations on each recursive call.
     /// Returns: (value, new_node, resolved)
-    /// - value: The found value or None
-    /// - new_node: The potentially updated node (for CoW)
-    /// - resolved: Whether the node was resolved from hash
     fn get_internal(
         &mut self, node: Arc<Node>,
-        nibbles_key: Vec<u8>,
+        nibbles_key: &[u8],
         pos: usize
-    ) -> Result<(Option<Vec<u8>>, Arc<Node>, bool), SecureTrieError> {
+    ) -> GetInternalResult {
         match &*node {
-            // Empty root - no value found
             Node::Empty => {
                 Ok((None, node, false))
             }
 
-            // Value node - return the stored value
             Node::Value(value) => {
                 Ok((Some(value.clone()), node, false))
             }
 
-            // Short node - check if key matches and continue traversal
             Node::Short(short) => {
-                // Check if the remaining key starts with the short node's key
                 if !nibbles_key[pos..].starts_with(&short.key) {
                     return Ok((None, node, false));
                 }
 
-                // Recursively get from the child node
                 let (value, new_child, resolved) = self.get_internal(
                     short.val.clone(),
                     nibbles_key,
                     pos + short.key.len()
                 )?;
 
-                // If child was resolved, create a new short node with CoW
                 if resolved {
                     let mut new_short = short.to_mutable_copy_with_cow();
                     new_short.set_value(&new_child);
@@ -478,17 +443,14 @@ where
                 }
             }
 
-            // Full node - traverse to the appropriate child
             Node::Full(full) => {
                 let nibble = nibbles_key[pos] as usize;
-                // Recursively get from the child node
                 let (value, new_child, resolved) = self.get_internal(
                     full.get_child(nibble),
                     nibbles_key,
                     pos + 1
                 )?;
 
-                // If child was resolved, create a new full node with CoW
                 if resolved {
                     let mut new_full = full.to_mutable_copy_with_cow();
                     new_full.set_child(nibble, &new_child);
@@ -498,10 +460,9 @@ where
                 }
             }
 
-            // Hash node - resolve and continue traversal
             Node::Hash(hash) => {
                 let resolved_node = self.resolve_and_track(
-                    &hash,
+                    hash,
                     &nibbles_key[..pos]
                 )?;
                 let (value, new_node, _) = self.get_internal(resolved_node, nibbles_key, pos)?;
@@ -510,61 +471,53 @@ where
         }
     }
 
-    /// Internal function to insert a value into the trie
-    /// Returns: (dirty, new_node)
-    /// - dirty: Whether the node was modified
-    /// - new_node: The potentially updated node (for CoW)
+    /// Internal function to insert a value into the trie.
+    /// Uses a mutable prefix buffer with push/truncate to avoid cloning at every level.
+    /// Takes nibbles_key as a shared slice to avoid Vec allocation per recursion.
     fn insert_internal(
         &mut self, node: Arc<Node>,
-        prefix: Vec<u8>,
-        nibbles_key: Vec<u8>,
+        prefix: &mut Vec<u8>,
+        nibbles_key: &[u8],
         value: Arc<Node>
     ) -> Result<(bool, Arc<Node>), SecureTrieError> {
         if self.update_stats.enabled {
             self.update_stats.insert_internal_calls += 1;
         }
         // Base case: reached the end of the key
-        if nibbles_key.len() == 0 {
+        if nibbles_key.is_empty() {
             match &*node {
                 Node::Value(existing_value) => {
                     if let Node::Value(new_value) = &*value {
                         if existing_value == new_value {
-                            // No change needed
                             return Ok((false, node));
                         } else {
-                            // Value changed, need update
                             return Ok((true, value));
                         }
                     } else {
-                        // Replace with new value
                         return Ok((true, value));
                     }
                 }
                 _ => {
-                    // Replace with new value
                     return Ok((true, value));
                 }
             }
         }
 
         match &*node {
-            // Short node - handle key matching and splitting
             Node::Short(short) => {
-                let matchlen = common_prefix_length(&nibbles_key, &short.key);
+                let matchlen = common_prefix_length(nibbles_key, &short.key);
 
-                // If the short node's key is a prefix of the insertion key
                 if matchlen == short.key.len() {
-                    self.stats_prefix_clone(prefix.len());
-                    let mut new_prefix = prefix.clone();
-                    new_prefix.extend(&nibbles_key[..matchlen]);
+                    let prefix_len = prefix.len();
+                    prefix.extend_from_slice(&nibbles_key[..matchlen]);
 
-                    self.stats_key_slice_to_vec(nibbles_key.len().saturating_sub(matchlen));
                     let (dirty, new_child) = self.insert_internal(
                         short.val.clone(),
-                        new_prefix,
-                        nibbles_key[matchlen..].to_vec(),
+                        prefix,
+                        &nibbles_key[matchlen..],
                         value
                     )?;
+                    prefix.truncate(prefix_len);
 
                     if !dirty {
                         return Ok((false, node));
@@ -585,38 +538,37 @@ where
                 let mut branch = Box::new(FullNode::new());
 
                 // Insert the short node's remaining key into the branch
-                self.stats_prefix_clone(prefix.len());
-                let mut short_prefix = prefix.clone();
-                short_prefix.extend(&short.key[..matchlen + 1]);
-
-                self.stats_key_slice_to_vec(short.key.len().saturating_sub(matchlen + 1));
-                let (_, new_child1) = self.insert_internal(
-                    Node::empty_root(),
-                    short_prefix,
-                    short.key[matchlen + 1..].to_vec(),
-                    short.val.clone()
-                )?;
-                branch.set_child(short.key[matchlen] as usize, new_child1.as_ref());
+                {
+                    let prefix_len = prefix.len();
+                    prefix.extend_from_slice(&short.key[..matchlen + 1]);
+                    let (_, new_child1) = self.insert_internal(
+                        Node::empty_root(),
+                        prefix,
+                        &short.key[matchlen + 1..],
+                        short.val.clone()
+                    )?;
+                    prefix.truncate(prefix_len);
+                    branch.set_child(short.key[matchlen] as usize, new_child1.as_ref());
+                }
 
                 // Insert the new key into the branch
-                self.stats_prefix_clone(prefix.len());
-                let mut new_prefix = prefix.clone();
-                new_prefix.extend(&nibbles_key[..matchlen + 1]);
-                self.stats_key_slice_to_vec(nibbles_key.len().saturating_sub(matchlen + 1));
-                let (_, new_child2) = self.insert_internal(
-                    Node::empty_root(),
-                    new_prefix,
-                    nibbles_key[matchlen + 1..].to_vec(),
-                    value
-                )?;
-                branch.set_child(nibbles_key[matchlen] as usize, new_child2.as_ref());
+                {
+                    let prefix_len = prefix.len();
+                    prefix.extend_from_slice(&nibbles_key[..matchlen + 1]);
+                    let (_, new_child2) = self.insert_internal(
+                        Node::empty_root(),
+                        prefix,
+                        &nibbles_key[matchlen + 1..],
+                        value
+                    )?;
+                    prefix.truncate(prefix_len);
+                    branch.set_child(nibbles_key[matchlen] as usize, new_child2.as_ref());
+                }
 
-                // If no common prefix, return the branch directly
                 if matchlen == 0 {
                     return Ok((true, Arc::new(Node::Full(Arc::from(branch)))));
                 }
 
-                self.stats_key_slice_to_vec(matchlen);
                 let new_short_arc = Arc::new(Node::Short(Arc::new(ShortNode {
                     key: nibbles_key[..matchlen].to_vec(),
                     val: Arc::new(Node::Full(Arc::from(branch))),
@@ -624,54 +576,49 @@ where
                 })));
 
                 // Trace the insert operation
-                self.stats_prefix_clone(prefix.len());
-                let mut trace_path = prefix.clone();
-                trace_path.extend_from_slice(&nibbles_key[..matchlen]);
-                self.tracer.on_insert(trace_path);
+                if !self.skip_tracer {
+                    let prefix_len = prefix.len();
+                    prefix.extend_from_slice(&nibbles_key[..matchlen]);
+                    self.tracer.on_insert(&prefix[..]);
+                    prefix.truncate(prefix_len);
+                }
 
-                return Ok((true, new_short_arc));
+                Ok((true, new_short_arc))
             }
 
-            // Full node - traverse to appropriate child
             Node::Full(full) => {
-                self.stats_prefix_clone(prefix.len());
-                let mut new_prefix = prefix.clone();
-                new_prefix.extend(&nibbles_key[0..1]);
+                let prefix_len = prefix.len();
+                prefix.push(nibbles_key[0]);
 
                 let child = full.get_child(nibbles_key[0] as usize);
-                self.stats_key_slice_to_vec(nibbles_key.len().saturating_sub(1));
                 let (dirty, new_child) = self.insert_internal(
                     child,
-                    new_prefix,
-                    nibbles_key[1..].to_vec(),
+                    prefix,
+                    &nibbles_key[1..],
                     value
                 )?;
+                prefix.truncate(prefix_len);
 
                 if !dirty {
-                    return Ok((false, node));
+                    Ok((false, node))
                 } else {
                     let mut new_full = full.to_mutable_copy_with_cow();
                     new_full.flags = self.new_flag();
                     new_full.set_child(nibbles_key[0] as usize, &new_child);
 
-                    return Ok((true, Arc::new(Node::Full(Arc::new(new_full)))));
+                    Ok((true, Arc::new(Node::Full(Arc::new(new_full)))))
                 }
             }
 
-            // Empty root - create new short node
             Node::Empty => {
-
-                // Trace the insert operation
-                self.stats_prefix_clone(prefix.len());
-                self.tracer.on_insert(prefix.clone());
-                return Ok((true, Arc::new(Node::Short(Arc::new(ShortNode::new(nibbles_key, value.as_ref()))))));
+                if !self.skip_tracer {
+                    self.tracer.on_insert(&prefix[..]);
+                }
+                Ok((true, Arc::new(Node::Short(Arc::new(ShortNode::new(nibbles_key.to_vec(), value.as_ref()))))))
             }
 
-            // Hash node - resolve and continue insertion
             Node::Hash(hash) => {
-                // `prefix.to_vec()` below clones the prefix buffer.
-                self.stats_prefix_clone(prefix.len());
-                let resolved_node = self.resolve_and_track(hash, &prefix.to_vec())?;
+                let resolved_node = self.resolve_and_track(hash, prefix)?;
                 let (dirty, new_node) = self.insert_internal(
                     resolved_node.clone(),
                     prefix,
@@ -680,76 +627,71 @@ where
                 )?;
 
                 if !dirty {
-                    return Ok((false, resolved_node));
+                    Ok((false, resolved_node))
                 } else {
-                    return Ok((true, new_node));
+                    Ok((true, new_node))
                 }
             }
 
-            // Value node should not be in the trie structure
             Node::Value(_) => {
                 panic!("Value node should not be in the trie");
             }
         }
     }
 
-    /// Internal function to delete a value from the trie
-    /// Returns: (dirty, new_node)
-    /// - dirty: Whether the node was modified
-    /// - new_node: The potentially updated node (for CoW)
+    /// Internal function to delete a value from the trie.
+    /// Uses a mutable prefix buffer with push/truncate to avoid cloning at every level.
+    /// Takes nibbles_key as a shared slice to avoid Vec allocation per recursion.
     pub fn delete_internal(
         &mut self,
         node: Arc<Node>,
-        prefix: Vec<u8>,
-        nibbles_key: Vec<u8>
+        prefix: &mut Vec<u8>,
+        nibbles_key: &[u8]
     ) -> Result<(bool, Arc<Node>), SecureTrieError> {
         if self.update_stats.enabled {
             self.update_stats.delete_internal_calls += 1;
         }
 
         match &*node {
-            // Handle ShortNode deletion
             Node::Short(short) => {
-                let matchlen = common_prefix_length(&nibbles_key, &short.key);
+                let matchlen = common_prefix_length(nibbles_key, &short.key);
 
-                // Key doesn't match this short node - no deletion needed
                 if matchlen < short.key.len() {
                     return Ok((false, node.clone()));
                 }
 
-                // Complete key match - delete this node by returning EmptyRoot
+                // Complete key match - delete this node
                 if matchlen == nibbles_key.len() {
-                    // Trace the delete operation
-                    self.stats_prefix_clone(prefix.len());
-                    self.tracer.on_delete(prefix.clone());
+                    if !self.skip_tracer {
+                        self.tracer.on_delete(&prefix[..]);
+                    }
                     return Ok((true, Node::empty_root()));
                 }
 
                 // Partial match - continue deletion in child node
-                self.stats_prefix_clone(prefix.len());
-                let mut new_prefix = prefix.clone();
-                new_prefix.extend(&nibbles_key[..short.key.len()]);
+                let prefix_len = prefix.len();
+                prefix.extend_from_slice(&nibbles_key[..short.key.len()]);
 
-                self.stats_key_slice_to_vec(nibbles_key.len().saturating_sub(short.key.len()));
                 let (dirty, new_child) = self.delete_internal(
                     short.val.clone(),
-                    new_prefix,
-                    nibbles_key[short.key.len()..].to_vec()
+                    prefix,
+                    &nibbles_key[short.key.len()..]
                 )?;
+                prefix.truncate(prefix_len);
 
-                // Child wasn't modified - return unchanged node
                 if !dirty {
                     return Ok((false, node.clone()));
                 }
 
-                // Child was modified - handle the result
                 match &*new_child {
                     Node::Short(new_child_short) => {
                         // Trace the delete operation
-                        self.stats_prefix_clone(prefix.len());
-                        let mut trace_path = prefix.clone();
-                        trace_path.extend(short.key.clone());
-                        self.tracer.on_delete(trace_path);
+                        if !self.skip_tracer {
+                            let prefix_len = prefix.len();
+                            prefix.extend_from_slice(&short.key);
+                            self.tracer.on_delete(&prefix[..]);
+                            prefix.truncate(prefix_len);
+                        }
 
                         // Merge keys when child is also a ShortNode
                         let mut merged_key = short.key.clone();
@@ -763,7 +705,6 @@ where
                         Ok((true, new_short_arc))
                     }
                     _ => {
-                        // Keep current key, update child
                         let new_short_arc = Arc::new(Node::Short(Arc::new(ShortNode {
                             key: short.key.clone(),
                             val: new_child,
@@ -774,30 +715,23 @@ where
                 }
             }
 
-            // Handle FullNode deletion
             Node::Full(full) => {
-                // Prepare prefix for recursive call
-                self.stats_prefix_clone(prefix.len());
-                let mut new_prefix = prefix.clone();
-                new_prefix.extend(&nibbles_key[0..1]);
-
-                // Get child index from first nibble
                 let child_index = nibbles_key[0] as usize;
 
-                // Recursively delete from child
-                self.stats_key_slice_to_vec(nibbles_key.len().saturating_sub(1));
+                let prefix_len = prefix.len();
+                prefix.push(nibbles_key[0]);
+
                 let (dirty, new_child) = self.delete_internal(
                     full.get_child(child_index),
-                    new_prefix,
-                    nibbles_key[1..].to_vec(),
+                    prefix,
+                    &nibbles_key[1..],
                 )?;
+                prefix.truncate(prefix_len);
 
-                // Child wasn't modified - return unchanged node
                 if !dirty {
                     return Ok((false, node.clone()));
                 }
 
-                // Create modified copy with new child
                 let mut new_full = full.to_mutable_copy_with_cow();
                 new_full.flags = self.new_flag();
                 new_full.set_child(child_index, &new_child);
@@ -805,50 +739,40 @@ where
 
                 match &*new_child {
                     Node::Empty => {
-                        // Child became empty - check if we can collapse the FullNode
                         let mut non_empty_pos = -1i32;
                         let mut non_empty_count = 0;
 
-                        // Count non-empty children and find their position
                         for (i, child) in full_copy.children.iter().enumerate() {
                             if !matches!(&**child, Node::Empty) {
                                 non_empty_count += 1;
                                 if non_empty_pos == -1 {
                                     non_empty_pos = i as i32;
                                 } else {
-                                    non_empty_pos = -2; // Multiple children
+                                    non_empty_pos = -2;
                                     break;
                                 }
                             }
                         }
 
                         if non_empty_pos >= 0 && non_empty_count == 1 {
-                            // Only one non-empty child - collapse to ShortNode
                             if self.update_stats.enabled {
                                 self.update_stats.fullnode_collapse_count += 1;
                             }
-                            let pos_nibbles = vec![non_empty_pos as u8];
 
                             if non_empty_pos != 16 {
-                                // Non-value child - try to merge with ShortNode
-                                self.stats_prefix_clone(prefix.len());
-                                let mut child_prefix = prefix.clone();
-                                child_prefix.extend(&pos_nibbles);
-
-                                self.stats_prefix_clone(child_prefix.len());
+                                let prefix_len = prefix.len();
+                                prefix.push(non_empty_pos as u8);
                                 let resolved_child = self.resolve(
                                     full_copy.get_child(non_empty_pos as usize),
-                                    &child_prefix.to_vec()
+                                    prefix
                                 )?;
 
                                 if let Node::Short(child_short) = &*resolved_child {
-                                    // Trace the delete operation
-                                    self.stats_prefix_clone(prefix.len());
-                                    let mut trace_path = prefix.clone();
-                                    trace_path.extend(&pos_nibbles);
-                                    self.tracer.on_delete(trace_path);
+                                    if !self.skip_tracer {
+                                        self.tracer.on_delete(&prefix[..]);
+                                    }
+                                    prefix.truncate(prefix_len);
 
-                                    // Merge with child ShortNode
                                     let mut merged_key = vec![non_empty_pos as u8];
                                     merged_key.extend(&child_short.key);
 
@@ -859,44 +783,37 @@ where
                                     })));
                                     return Ok((true, new_short_arc));
                                 }
+                                prefix.truncate(prefix_len);
                             }
 
-                            // Create ShortNode with single child
-                            let new_short_arc =Arc::new(Node::Short(Arc::new(ShortNode {
-                                key: pos_nibbles,
+                            let new_short_arc = Arc::new(Node::Short(Arc::new(ShortNode {
+                                key: vec![non_empty_pos as u8],
                                 val: full_copy.get_child(non_empty_pos as usize),
                                 flags: self.new_flag(),
                             })));
                             Ok((true, new_short_arc))
                         } else {
-                            // Multiple children remain - keep as FullNode
                             let new_full_arc = Arc::new(Node::Full(Arc::new(full_copy)));
                             Ok((true, new_full_arc))
                         }
                     }
                     _ => {
-                        // Child is not empty - keep as FullNode
                         let new_full_arc = Arc::new(Node::Full(Arc::new(full_copy)));
                         Ok((true, new_full_arc))
                     }
                 }
             }
 
-            // Handle ValueNode deletion - replace with EmptyRoot
             Node::Value(_) => {
                 Ok((true, Node::empty_root()))
             }
 
-            // Handle EmptyRoot - nothing to delete
             Node::Empty => {
                 Ok((false, Node::empty_root()))
             }
 
-            // Handle HashNode - resolve and recurse
             Node::Hash(hash) => {
-                // `prefix.to_vec()` below clones the prefix buffer.
-                self.stats_prefix_clone(prefix.len());
-                let resolved_node = self.resolve_and_track(hash, &prefix.to_vec())?;
+                let resolved_node = self.resolve_and_track(hash, prefix)?;
                 let resolved_node_backup = resolved_node.clone();
 
                 let (dirty, new_node) = self.delete_internal(
@@ -926,21 +843,23 @@ where
     pub fn resolve(&mut self, node: Arc<Node> , prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
         match &*node {
             Node::Hash(hash) => {
-                return self.resolve_and_track(hash, prefix);
+                self.resolve_and_track(hash, prefix)
             }
             _ => {
-                return Ok(node);
+                Ok(node)
             }
         }
     }
 
-    /// Resolves a hash and tracks it in the difflayer
+    /// Resolves a hash and tracks it in the difflayer.
+    /// Optimized: conditional timing, skip tracer when `skip_tracer` is set.
     pub fn resolve_and_track(&mut self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
         let enabled = self.update_stats.enabled;
         if enabled {
             self.update_stats.resolve_calls += 1;
         }
-        let resolve_start = Instant::now();
+        // Only take a timestamp when stats are actually enabled
+        let resolve_start = if enabled { Some(Instant::now()) } else { None };
 
         let key = if self.owner == B256::ZERO {
             account_trie_node_key(prefix)
@@ -952,26 +871,37 @@ where
             self.update_stats.node_key_alloc_count += 1;
             self.update_stats.node_key_alloc_bytes_total += key.len() as u64;
         }
-        
-        // 1. Check if the hash is in the difflayer
+
+        // 1. Check if the hash is in the difflayer (no key clone needed)
         if let Some(difflayers) = &self.difflayers {
-            if let Some(node) = difflayers.get_trie_nodes(key.clone()) {
+            if let Some(node) = difflayers.get_trie_nodes(&key) {
                 if enabled {
                     self.update_stats.resolve_difflayer_hits += 1;
                 }
-                let blob = node.blob.clone().unwrap();
+                if node.is_deleted() {
+                    if let Some(start) = resolve_start {
+                        self.update_stats.resolve_us += start.elapsed().as_micros() as u64;
+                    }
+                    return Ok(Node::empty_root());
+                }
+                let blob = node.blob.as_ref().unwrap();
                 if enabled {
                     self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
                 }
-                self.tracer.on_read(prefix, blob.clone());
-                let decode_start = Instant::now();
-                let decoded = Node::must_decode_node(Some(*hash), &blob);
-                if enabled {
-                    self.update_stats.resolve_decode_us += decode_start.elapsed().as_micros() as u64;
-                    self.update_stats.resolve_us += resolve_start.elapsed().as_micros() as u64;
+                let decode_start = if enabled { Some(Instant::now()) } else { None };
+                let decoded = Node::must_decode_node(Some(*hash), blob);
+                if let Some(ds) = decode_start {
+                    self.update_stats.resolve_decode_us += ds.elapsed().as_micros() as u64;
+                }
+                // Only track in tracer when not in prefetch mode
+                if !self.skip_tracer {
+                    self.tracer.on_read_ref(prefix, blob);
+                }
+                if let Some(start) = resolve_start {
+                    self.update_stats.resolve_us += start.elapsed().as_micros() as u64;
                 }
                 return Ok(decoded);
-            }           
+            }
         }
 
         // 2. Check if the hash is in the database
@@ -980,23 +910,27 @@ where
                 self.update_stats.resolve_db_hits += 1;
                 self.update_stats.resolve_blob_bytes_total += node_blob.len() as u64;
             }
-            self.tracer.on_read(prefix, node_blob.clone());
-            let decode_start = Instant::now();
+            let decode_start = if enabled { Some(Instant::now()) } else { None };
             let decoded = Node::must_decode_node(Some(*hash), &node_blob);
-            if enabled {
-                self.update_stats.resolve_decode_us += decode_start.elapsed().as_micros() as u64;
-                self.update_stats.resolve_us += resolve_start.elapsed().as_micros() as u64;
+            if let Some(ds) = decode_start {
+                self.update_stats.resolve_decode_us += ds.elapsed().as_micros() as u64;
+            }
+            if !self.skip_tracer {
+                self.tracer.on_read(prefix, node_blob);
+            }
+            if let Some(start) = resolve_start {
+                self.update_stats.resolve_us += start.elapsed().as_micros() as u64;
             }
             return Ok(decoded);
         }
 
-        if enabled {
-            self.update_stats.resolve_us += resolve_start.elapsed().as_micros() as u64;
+        if let Some(start) = resolve_start {
+            self.update_stats.resolve_us += start.elapsed().as_micros() as u64;
         }
         let owner_hex = format!("0x{:x}", self.owner);
         let prefix_hex = prefix.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        return Err(SecureTrieError::Database(format!("missing trie node: owner: {}, prefix: 0x{}, key: 0x{}", owner_hex, prefix_hex, key_hex)));
+        Err(SecureTrieError::Database(format!("missing trie node: owner: {}, prefix: 0x{}, key: 0x{}", owner_hex, prefix_hex, key_hex)))
     }
 
 }
@@ -1039,7 +973,7 @@ where
 
                 // Print non-empty children
                 let mut non_empty_count = 0;
-                for (_i, child) in full.children.iter().enumerate() {
+                for child in full.children.iter() {
                     if !matches!(&**child, Node::Empty) {
                         non_empty_count += 1;
                     }

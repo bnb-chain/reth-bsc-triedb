@@ -12,7 +12,7 @@ pub const TRIE_STATE_ROOT_KEY: &[u8] = b"state_root";
 pub const TRIE_STATE_BLOCK_NUMBER_KEY: &[u8] = b"block_number";
 
 /// Represents a trie node with its hash and encoded data
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrieNode {
     /// Node hash, empty for deleted node
     pub hash: Option<B256>,
@@ -24,11 +24,6 @@ impl TrieNode {
     /// Creates a new trie node
     pub fn new(hash: Option<B256>, blob: Option<Vec<u8>>) -> Self {
         Self { hash, blob }
-    }
-
-    /// Creates a default trie node
-    pub fn default() -> Self {
-        Self { hash: None, blob: None }
     }
 
     /// Returns true if this node is marked as deleted
@@ -98,13 +93,13 @@ impl DiffLayer {
     }
 
     /// Get a trie node by prefix
-    pub fn get_trie_nodes(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
-        self.diff_nodes.get(&prefix).map(|node: &Arc<TrieNode>| node.clone())
+    pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
+        self.diff_nodes.get(prefix).cloned()
     }
 
     /// Get a storage root by hased address
     pub fn get_storage_root(&self, hased_address: B256) -> Option<B256> {
-        self.diff_storage_roots.get(&hased_address).map(|root| *root)
+        self.diff_storage_roots.get(&hased_address).copied()
     }
 
     /// Returns true if the diff layer is empty
@@ -181,9 +176,9 @@ impl DiffLayers {
     }
 
     /// Get a trie node by prefix
-    pub fn get_trie_nodes(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
+    pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
         for difflayer in &self.diff_layers {
-            if let Some(node) = difflayer.get_trie_nodes(prefix.clone()) {
+            if let Some(node) = difflayer.get_trie_nodes(prefix) {
                 return Some(node);
             }
         }
