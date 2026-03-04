@@ -9,8 +9,12 @@ pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 pub const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 64 * 1024 * 1024; // 64MB
 pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
 pub const DEFAULT_CREATE_IF_MISSING: bool = true;
-pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 40_000_000; // 4KW entries
-pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 200_000_000; // 20KW entries
+/// Default byte-weighted capacity for the trie node MokaCache (512MB).
+pub const DEFAULT_TRIE_NODE_CACHE_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
+/// Default byte-weighted capacity for the storage root MokaCache (64MB).
+pub const DEFAULT_STORAGE_ROOT_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
+/// Default number of recently-committed diff layers to pin in memory (128 blocks, matching geth-BSC).
+pub const DEFAULT_MAX_COMMITTED_DIFFLAYERS: usize = 128;
 
 // BlockBasedTable configuration constants (directly impacts random reads)
 //
@@ -77,10 +81,14 @@ pub struct PathProviderConfig {
     pub max_background_jobs: i32,
     /// Whether to create the database if it doesn't exist.
     pub create_if_missing: bool,
-    /// LRU cache size in number of entries (default: 1M entries).
-    pub trie_node_cache_size: u32,
-    /// LRU cache size in number of entries (default: 1M entries).
-    pub storage_root_cache_size: u32,
+    /// Byte-weighted capacity for the trie node cache in bytes.
+    /// Set to 0 to disable caching entirely (e.g. for offline tools).
+    pub trie_node_cache_capacity_bytes: usize,
+    /// Byte-weighted capacity for the storage root cache in bytes.
+    /// Set to 0 to disable caching entirely (e.g. for offline tools).
+    pub storage_root_cache_capacity_bytes: usize,
+    /// Maximum number of recently-committed diff layers to keep pinned in memory.
+    pub max_committed_difflayers: usize,
 
     /// RocksDB BlockBasedTable: block cache size in bytes.
     pub block_cache_size_bytes: usize,
@@ -112,8 +120,9 @@ impl Default for PathProviderConfig {
             target_file_size_base: DEFAULT_TARGET_FILE_SIZE_BASE,
             max_background_jobs: DEFAULT_MAX_BACKGROUND_JOBS,
             create_if_missing: DEFAULT_CREATE_IF_MISSING,
-            trie_node_cache_size: DEFAULT_TRIE_NODECACHE_SIZE,
-            storage_root_cache_size: DEFAULT_STORAGE_ROOT_CACHE_SIZE,
+            trie_node_cache_capacity_bytes: DEFAULT_TRIE_NODE_CACHE_CAPACITY_BYTES,
+            storage_root_cache_capacity_bytes: DEFAULT_STORAGE_ROOT_CACHE_CAPACITY_BYTES,
+            max_committed_difflayers: DEFAULT_MAX_COMMITTED_DIFFLAYERS,
             block_cache_size_bytes: DEFAULT_BLOCK_CACHE_SIZE_BYTES,
             bloom_filter_bits_per_key: DEFAULT_BLOOM_FILTER_BITS_PER_KEY,
             bloom_filter_block_based: DEFAULT_BLOOM_FILTER_BLOCK_BASED,

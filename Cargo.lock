@@ -1958,6 +1958,7 @@ dependencies = [
  "alloy-trie",
  "metrics",
  "mini-moka",
+ "parking_lot",
  "reth-metrics",
  "rocksdb",
  "rust-eth-triedb-common",

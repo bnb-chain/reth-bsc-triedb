@@ -29,6 +29,9 @@ tracing.workspace = true
 schnellru.workspace = true
 mini-moka = { workspace = true, features = ["sync"] }
 
+# Concurrency
+parking_lot.workspace = true
+
 # Testing
 tempfile.workspace = true
 

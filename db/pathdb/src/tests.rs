@@ -1,8 +1,11 @@
 //! Tests for PathDB implementation.
 
+use std::{collections::HashMap, sync::Arc};
+
+use alloy_primitives::B256;
 use tempfile::TempDir;
 use crate::{PathDB, PathProviderConfig};
-use rust_eth_triedb_common::TrieDatabase;
+use rust_eth_triedb_common::{DiffLayer, TrieDatabase, TrieNode};
 
 #[test]
 fn test_basic_operations() {
@@ -60,16 +63,16 @@ fn test_configuration() {
     let db_path = temp_dir.path();
     
     let mut config = PathProviderConfig::default();
-    config.trie_node_cache_size = 1000;
+    config.trie_node_cache_capacity_bytes = 64 * 1024 * 1024; // 64MB
     config.fill_cache = false;
     config.readahead_size = 256 * 1024; // 256KB
     config.async_io = false;
     config.verify_checksums = true;
-    
+
     let db = PathDB::new(db_path.to_str().unwrap(), config.clone()).unwrap();
-    
+
     let retrieved_config = db.config();
-    assert_eq!(retrieved_config.trie_node_cache_size, 1000);
+    assert_eq!(retrieved_config.trie_node_cache_capacity_bytes, 64 * 1024 * 1024);
     assert_eq!(retrieved_config.fill_cache, false);
     assert_eq!(retrieved_config.readahead_size, 256 * 1024);
     assert_eq!(retrieved_config.async_io, false);
@@ -95,7 +98,6 @@ fn test_error_handling() {
 
 #[test]
 fn test_concurrent_access() {
-    use std::sync::Arc;
     use std::thread;
 
     let temp_dir = TempDir::new().unwrap();
@@ -120,4 +122,42 @@ fn test_concurrent_access() {
         let retrieved = db.get_raw_trie_node(&key).unwrap();
         assert_eq!(retrieved, Some(expected_value));
     }
+}
+
+#[test]
+fn test_commit_difflayer_empty_layer_not_pinned() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path();
+    let db = PathDB::new(db_path.to_str().unwrap(), PathProviderConfig::default()).unwrap();
+
+    let mut diff_nodes = HashMap::new();
+    diff_nodes.insert(vec![0x01], Arc::new(TrieNode::new(None, Some(vec![0xAA]))));
+    let non_empty_difflayer = Arc::new(DiffLayer::new(
+        Arc::new(diff_nodes),
+        Arc::new(HashMap::new()),
+    ));
+    db.commit_difflayer(1, B256::ZERO, &Some(non_empty_difflayer)).unwrap();
+    assert_eq!(db.committed_difflayers_depth(), 1);
+
+    let empty_difflayer = Arc::new(DiffLayer::default());
+    db.commit_difflayer(2, B256::ZERO, &Some(empty_difflayer)).unwrap();
+    assert_eq!(db.committed_difflayers_depth(), 1);
+}
+
+#[test]
+fn test_committed_difflayers_disabled_skips_pinning() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path();
+    let mut config = PathProviderConfig::default();
+    config.max_committed_difflayers = 0;
+    let db = PathDB::new(db_path.to_str().unwrap(), config).unwrap();
+
+    let mut diff_nodes = HashMap::new();
+    diff_nodes.insert(vec![0x01], Arc::new(TrieNode::new(None, Some(vec![0xAA]))));
+    let non_empty_difflayer = Arc::new(DiffLayer::new(
+        Arc::new(diff_nodes),
+        Arc::new(HashMap::new()),
+    ));
+    db.commit_difflayer(1, B256::ZERO, &Some(non_empty_difflayer)).unwrap();
+    assert_eq!(db.committed_difflayers_depth(), 0);
 }
