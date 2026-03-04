@@ -11,7 +11,7 @@ use rust_eth_triedb_state_trie::node::{MergedNodeSet, NodeSet, DiffLayer, DiffLa
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
 use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::triedb::{TrieDB, TrieDBError};
 
@@ -142,10 +142,9 @@ where
     pub storage_tries: HashMap<B256, StateTrie<DB>>,
 }
 
-/// When true, run intermediate_inner twice (first on a clone, then on self) and log PathDB
-/// trie-node cache hit ratio for each run. First run is expected to have lower hit ratio,
-/// second run should be mostly cache hits. Set to false to disable the experiment.
-const RUN_TWICE_FOR_CACHE_HIT_RATIO: bool = true;
+// When true, run intermediate_inner twice (first on a clone, then on self) and log PathDB
+// trie-node cache hit ratio for each run. Disabled: only run once.
+// const RUN_TWICE_FOR_CACHE_HIT_RATIO: bool = true;
 
 /// Compatible with Reth client usage scenarios
 impl<DB> TrieDB<DB>
@@ -763,79 +762,27 @@ where
         parent_root: B256, 
         difflayer: Option<&DiffLayers>, 
         hashed_post_state: &TrieDBHashedPostState, 
-        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
+        _prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
         Result<(B256, Arc<DiffLayer>), TrieDBError>
     where
         DB: 'static,
     {
         let call_start = Instant::now();
-        let prefetcher_enabled = prefetcher.is_some();
+        let prefetcher_enabled = false; // not using external prefetch state
         let states_len = hashed_post_state.states.len();
         let storage_states_len = hashed_post_state.storage_states.len();
         let rebuild_len = hashed_post_state.states_rebuild.len();
 
         let state_at_start = Instant::now();
-        let prefetcher_for_clone = prefetcher.as_ref().map(Arc::clone);
-        self.state_at(parent_root, difflayer, prefetcher)?;
+        self.state_at(parent_root, difflayer, None)?;
         let state_at_elapsed = state_at_start.elapsed();
 
         let intermediate_start = Instant::now();
-        if RUN_TWICE_FOR_CACHE_HIT_RATIO {
-            let states_clone = hashed_post_state.states.clone();
-            let storage_states_clone = hashed_post_state.storage_states.clone();
-            let states_rebuild_clone = hashed_post_state.states_rebuild.clone();
-
-            self.path_db.reset_trie_node_cache_counters();
-            let mut clone_triedb = self.clone();
-            clone_triedb.state_at(parent_root, difflayer, prefetcher_for_clone)?;
-            let run1_start = Instant::now();
-            clone_triedb.intermediate_inner(states_clone, storage_states_clone, states_rebuild_clone)?;
-            let run1_elapsed_ms = run1_start.elapsed().as_secs_f64() * 1000.0;
-
-            let (run1_hits, run1_misses) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-            let run1_total = run1_hits + run1_misses;
-            let run1_ratio = if run1_total > 0 {
-                run1_hits as f64 / run1_total as f64
-            } else {
-                0.0
-            };
-            drop(clone_triedb);
-
-            self.path_db.reset_trie_node_cache_counters();
-            let run2_start = Instant::now();
-            self.intermediate_inner(
-                hashed_post_state.states.clone(),
-                hashed_post_state.storage_states.clone(),
-                hashed_post_state.states_rebuild.clone(),
-            )?;
-            let run2_elapsed_ms = run2_start.elapsed().as_secs_f64() * 1000.0;
-
-            let (run2_hits, run2_misses) = self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
-            let run2_total = run2_hits + run2_misses;
-            let run2_ratio = if run2_total > 0 {
-                run2_hits as f64 / run2_total as f64
-            } else {
-                0.0
-            };
-            info!(
-                target: "triedb::intermediate_and_commit_hashed_post_state",
-                run1_ms = run1_elapsed_ms,
-                run1_hits = run1_hits,
-                run1_misses = run1_misses,
-                run1_hit_ratio = %format!("{:.4}", run1_ratio),
-                run2_ms = run2_elapsed_ms,
-                run2_hits = run2_hits,
-                run2_misses = run2_misses,
-                run2_hit_ratio = %format!("{:.4}", run2_ratio),
-                "intermediate_inner run twice: run1 cold / run2 warm (trie node cache)"
-            );
-        } else {
-            self.intermediate_inner(
-                hashed_post_state.states.clone(),
-                hashed_post_state.storage_states.clone(),
-                hashed_post_state.states_rebuild.clone(),
-            )?;
-        }
+        self.intermediate_inner(
+            hashed_post_state.states.clone(),
+            hashed_post_state.storage_states.clone(),
+            hashed_post_state.states_rebuild.clone(),
+        )?;
         let intermediate_elapsed = intermediate_start.elapsed();
 
         let commit_start = Instant::now();
