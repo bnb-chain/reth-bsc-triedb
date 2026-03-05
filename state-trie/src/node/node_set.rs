@@ -228,18 +228,36 @@ impl MergedNodeSet {
         Self::default()
     }
 
-    /// Merge a node set into the merged set
+    /// Merge a node set into the merged set.
+    /// Takes ownership via `Arc::try_unwrap` to move the inner difflayer
+    /// without cloning when this is the last reference.
     #[allow(dead_code)]
     pub fn merge(&mut self, other: Arc<NodeSet>) -> Result<(), String> {
         if self.sets.contains_key(&other.owner) {
             panic!("repeated nodeset to merge, owner: {:?} already exists", other.owner);
         }
-        self.sets.insert(other.owner, other.clone());
-        self.difflayer.extend(other.difflayer.iter().map(|(key, node)| (key.clone(), node.clone())));
+        // Try to unwrap the Arc to get owned data; clone only if shared.
+        let owned = match Arc::try_unwrap(other) {
+            Ok(mut ns) => {
+                let dl = std::mem::take(&mut *ns.difflayer);
+                self.sets.insert(ns.owner, Arc::new(ns));
+                dl
+            }
+            Err(arc) => {
+                self.sets.insert(arc.owner, arc.clone());
+                arc.difflayer.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
+        };
+        self.difflayer.extend(owned);
         Ok(())
     }
 
-    /// Convert the merged node set to a difflayer, consuming self
+    /// Convert the merged node set to a difflayer, consuming self.
+    pub fn into_diff_nodes(self) -> Arc<HashMap<Vec<u8>, Arc<TrieNode>>> {
+        Arc::new(self.difflayer)
+    }
+
+    /// Convert the merged node set to a difflayer (cloning).
     pub fn to_diff_nodes(&self) -> Arc<HashMap<Vec<u8>, Arc<TrieNode>>> {
         Arc::new(self.difflayer.clone())
     }

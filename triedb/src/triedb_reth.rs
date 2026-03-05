@@ -390,15 +390,10 @@ where
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                let _ = trie.trie_mut().eager_resolve_root_children();
-                                // Pre-warm trie paths for all keys we're about to insert/delete.
-                                // This resolves Hash nodes via CoW so insert_internal finds
-                                // in-memory nodes instead of triggering DB reads.
-                                // Note: tracer must remain enabled so access_list is populated
-                                // correctly for the commit phase (Committer::store checks it).
-                                for hashed_key in kvs.keys() {
-                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
-                                }
+                                // Batch-resolve Hash nodes along the actual key paths.
+                                // Single batched DB read per depth level instead of per-key walks.
+                                let key_refs: Vec<&[u8]> = kvs.keys().map(|k| k.as_slice()).collect();
+                                let _ = trie.trie_mut().eager_resolve_paths(&key_refs);
                                 (trie, false, src)
                             }
                         };
@@ -687,7 +682,7 @@ where
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
         let diff_roots_start = Instant::now();
-        let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
+        let diff_storage_roots = Arc::new(*std::mem::take(&mut self.updated_storage_roots));
         let diff_roots_elapsed = diff_roots_start.elapsed();
 
         let clean_start = Instant::now();
@@ -730,6 +725,11 @@ where
         let (root_hash, account_node_set) = account_commit_result?;
 
         let merge_start = Instant::now();
+        // Pre-allocate the merged difflayer to avoid rehashing.
+        let total_entries: usize = account_node_set.as_ref().map_or(0, |ns| ns.difflayer.len())
+            + storage_commit_results.iter().map(|(_, ns)| ns.as_ref().map_or(0, |ns| ns.difflayer.len())).sum::<usize>();
+        merged_node_set.difflayer.reserve(total_entries);
+
         if let Some(node_set) = account_node_set {
             merged_node_set.merge(node_set)
                 .map_err(TrieDBError::Database)?;
@@ -755,11 +755,11 @@ where
     }
 
     pub fn intermediate_and_commit_hashed_post_state(
-        &mut self, 
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
-        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
+        &mut self,
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: TrieDBHashedPostState,
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) ->
         Result<(B256, Arc<DiffLayer>), TrieDBError>
     where
         DB: 'static,
@@ -777,9 +777,9 @@ where
         let intermediate_start = Instant::now();
         self.path_db.reset_trie_node_cache_counters();
         self.intermediate_inner(
-            hashed_post_state.states.clone(),
-            hashed_post_state.storage_states.clone(),
-            hashed_post_state.states_rebuild.clone(),
+            hashed_post_state.states,
+            hashed_post_state.storage_states,
+            hashed_post_state.states_rebuild,
         )?;
         let intermediate_elapsed = intermediate_start.elapsed();
 
@@ -818,9 +818,9 @@ where
 
     pub fn intermediate_hashed_post_state(
         &mut self,
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: TrieDBHashedPostState,
         prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>
     ) -> Result<B256, TrieDBError>
     where
@@ -828,9 +828,9 @@ where
     {
         self.state_at(parent_root, difflayer, prefetcher)?;
         self.intermediate_inner(
-            hashed_post_state.states.clone(), 
-            hashed_post_state.storage_states.clone(), 
-            hashed_post_state.states_rebuild.clone())
+            hashed_post_state.states,
+            hashed_post_state.storage_states,
+            hashed_post_state.states_rebuild)
     }
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError> 
@@ -838,28 +838,36 @@ where
         DB: 'static,
     {
         let (root_hash, node_set, diff_storage_roots) = self.commit_inner(true)?;
-        let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
-        Ok((root_hash, difflayer)) 
+        // Avoid cloning the entire difflayer HashMap: try_unwrap succeeds when
+        // refcount == 1 (always true here since commit_inner just created the Arc).
+        let diff_nodes = match Arc::try_unwrap(node_set) {
+            Ok(ns) => ns.into_diff_nodes(),
+            Err(ns) => ns.to_diff_nodes(),
+        };
+        let difflayer = Arc::new(DiffLayer::new(diff_nodes, diff_storage_roots));
+        Ok((root_hash, difflayer))
     }
 
     pub fn intermediate_and_commit_hashed_post_state_v2(
-        &mut self, 
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
-        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
+        &mut self,
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: TrieDBHashedPostState,
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) ->
         Result<(B256, Arc<DiffLayer>), TrieDBError>
     where
         DB: 'static,
     {
         self.state_at(parent_root, difflayer, prefetcher)?;
 
+        // Destructure to avoid cloning — move owned data directly into parallel tasks.
+        let TrieDBHashedPostState { states: accounts_clone, storage_states, states_rebuild } = hashed_post_state;
+
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
         let difflayer_clone = self.difflayer.clone();
-        let accounts_clone = hashed_post_state.states.clone();
-        let storages_keys: HashSet<B256> = hashed_post_state.storage_states.keys().cloned().collect();
-        let storages_for_task2 = hashed_post_state.storage_states.clone();
+        let storages_keys: HashSet<B256> = storage_states.keys().cloned().collect();
+        let storages_for_task2 = storage_states;
         let metrics_clone = self.metrics.clone();
         // Extract storage tries from prefetcher for zero-copy transfer to parallel tasks.
         // NOTE: This take is intentional and one-shot. Each prefetcher instance is consumed by
@@ -871,7 +879,7 @@ where
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
-            if hashed_post_state.states_rebuild.contains(&hashed_address) {
+            if states_rebuild.contains(&hashed_address) {
                 return Ok(alloy_trie::EMPTY_ROOT_HASH);
             }
 
@@ -950,11 +958,9 @@ where
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                let _ = trie.trie_mut().eager_resolve_root_children();
-                                // Pre-warm trie paths for all keys we're about to insert/delete.
-                                for hashed_key in kvs.keys() {
-                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
-                                }
+                                // Batch-resolve Hash nodes along the actual key paths.
+                                let key_refs: Vec<&[u8]> = kvs.keys().map(|k| k.as_slice()).collect();
+                                let _ = trie.trie_mut().eager_resolve_paths(&key_refs);
                                 trie
                             }
                         };
@@ -1002,7 +1008,7 @@ where
         accounts_no_storage.extend(accounts_with_storage);
         roots_no_storage.extend(*roots_with_storage);
 
-        for hashed_address in hashed_post_state.states_rebuild.clone() {
+        for hashed_address in states_rebuild {
             self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
         }
@@ -1022,7 +1028,7 @@ where
             merged_node_set.merge(node_set).unwrap();
         }
 
-        let difflayer = Arc::new(DiffLayer::new(merged_node_set.to_diff_nodes(), Arc::from(*roots_no_storage)));
+        let difflayer = Arc::new(DiffLayer::new((*merged_node_set).into_diff_nodes(), Arc::from(*roots_no_storage)));
         self.clean();
         Ok((root_hash, difflayer))
     }

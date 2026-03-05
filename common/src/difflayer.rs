@@ -89,7 +89,7 @@ pub struct DiffLayer {
 impl DiffLayer {
     /// Create a new diff layer
     pub fn new(diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>, diff_storage_roots: Arc<HashMap<B256, B256>>) -> Self {
-        Self { diff_nodes: diff_nodes.clone(), diff_storage_roots: diff_storage_roots.clone() }
+        Self { diff_nodes, diff_storage_roots }
     }
 
     /// Get a trie node by prefix
@@ -118,57 +118,98 @@ impl DiffLayer {
 
 /// A collection of diff layers for uncommitted blocks in the trie state.
 ///
-/// All inserted layers are merged into flat `Arc<HashMap>`s so that lookups
-/// are O(1) and cloning is O(1) (just Arc ref-count bumps).  `Arc::make_mut`
-/// gives COW semantics: the inner maps are only deep-copied when a mutating
-/// `insert_difflayer` is called while other clones still exist.
-///
-/// **Precedence**: for a given key the *first* inserted layer wins (via
-/// `or_insert`).  This matches the old `Vec`-based linear scan which
-/// iterated front-to-back and returned the first hit.
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+/// Layers are inserted via `insert_difflayer` (O(1) push). On first lookup the
+/// layers are merged into flat `HashMap`s (one-time O(total_entries) cost) that
+/// are shared across all clones via `Arc<OnceLock>`, so subsequent lookups and
+/// clones are both O(1). First-inserted layer wins for duplicate keys.
 pub struct DiffLayers {
-    /// Flattened view of all diff_nodes across layers (newest wins).
-    merged_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>,
-    /// Flattened view of all diff_storage_roots across layers (newest wins).
-    merged_storage_roots: Arc<HashMap<B256, B256>>,
-    /// Number of layers that have been merged.
-    len: usize,
+    diff_layers: Vec<Arc<DiffLayer>>,
+    /// Lazily built flattened node map shared across clones.
+    flat_nodes: Arc<std::sync::OnceLock<Arc<HashMap<Vec<u8>, Arc<TrieNode>>>>>,
+    /// Lazily built flattened storage-root map shared across clones.
+    flat_storage_roots: Arc<std::sync::OnceLock<Arc<HashMap<B256, B256>>>>,
 }
 
+impl Clone for DiffLayers {
+    fn clone(&self) -> Self {
+        Self {
+            diff_layers: self.diff_layers.clone(),
+            flat_nodes: self.flat_nodes.clone(),
+            flat_storage_roots: self.flat_storage_roots.clone(),
+        }
+    }
+}
+
+impl Default for DiffLayers {
+    fn default() -> Self {
+        Self {
+            diff_layers: Vec::new(),
+            flat_nodes: Arc::new(std::sync::OnceLock::new()),
+            flat_storage_roots: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for DiffLayers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiffLayers")
+            .field("layers", &self.diff_layers.len())
+            .field("flat_nodes_ready", &self.flat_nodes.get().is_some())
+            .field("flat_storage_roots_ready", &self.flat_storage_roots.get().is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for DiffLayers {
+    fn eq(&self, other: &Self) -> bool {
+        self.diff_layers == other.diff_layers
+    }
+}
+
+impl Eq for DiffLayers {}
+
 impl DiffLayers {
-    /// Insert a diff layer and incrementally merge it into the flat maps.
-    ///
-    /// Uses `or_insert` so the first-inserted layer's value wins for each key,
-    /// matching the old `Vec`-based linear-scan (front-to-back, first hit returned).
-    ///
-    /// Uses `Arc::make_mut` for COW: if this is the only live reference the
-    /// maps are mutated in-place; otherwise a single deep-copy is made first.
+    /// Insert a diff layer into the collection.
     pub fn insert_difflayer(&mut self, difflayer: Arc<DiffLayer>) {
-        let nodes = Arc::make_mut(&mut self.merged_nodes);
-        for (k, v) in difflayer.diff_nodes.iter() {
-            nodes.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        let roots = Arc::make_mut(&mut self.merged_storage_roots);
-        for (k, v) in difflayer.diff_storage_roots.iter() {
-            roots.entry(*k).or_insert(*v);
-        }
-        self.len += 1;
+        self.diff_layers.push(difflayer);
+        // Invalidate caches — new OnceLocks since OnceLock cannot be reset.
+        self.flat_nodes = Arc::new(std::sync::OnceLock::new());
+        self.flat_storage_roots = Arc::new(std::sync::OnceLock::new());
     }
 
-    /// Get a trie node by prefix — single HashMap probe.
+    /// Get a trie node by prefix — O(1) after first call.
     pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
-        self.merged_nodes.get(prefix).cloned()
+        let flat = self.flat_nodes.get_or_init(|| {
+            let total: usize = self.diff_layers.iter().map(|l| l.diff_nodes.len()).sum();
+            let mut nodes = HashMap::with_capacity(total);
+            for layer in &self.diff_layers {
+                for (k, v) in layer.diff_nodes.iter() {
+                    nodes.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            Arc::new(nodes)
+        });
+        flat.get(prefix).cloned()
     }
 
-    /// Get a storage root by hashed address — single HashMap probe.
+    /// Get a storage root by hashed address — O(1) after first call.
     pub fn get_storage_root(&self, hased_address: B256) -> Option<B256> {
-        self.merged_storage_roots.get(&hased_address).copied()
+        let flat = self.flat_storage_roots.get_or_init(|| {
+            let total: usize = self.diff_layers.iter().map(|l| l.diff_storage_roots.len()).sum();
+            let mut roots = HashMap::with_capacity(total);
+            for layer in &self.diff_layers {
+                for (k, v) in layer.diff_storage_roots.iter() {
+                    roots.entry(*k).or_insert(*v);
+                }
+            }
+            Arc::new(roots)
+        });
+        flat.get(&hased_address).copied()
     }
 
-    /// Returns true if no layers have been merged.
+    /// Returns true if the diff layers are empty.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.diff_layers.is_empty()
     }
 }
 

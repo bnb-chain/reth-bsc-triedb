@@ -1204,6 +1204,250 @@ where
         }
     }
 
+    /// Eagerly resolves Hash nodes along the specific key paths that will be
+    /// accessed during subsequent insert/delete operations. Instead of resolving
+    /// all children at a given depth (like `eager_resolve_to_depth`), this only
+    /// resolves Hash nodes that lie on the actual paths to the given keys.
+    ///
+    /// The algorithm works in depth passes:
+    /// 1. Walk all key paths from root, collecting Hash nodes encountered
+    /// 2. Batch-resolve all collected Hashes (difflayer first, then DB)
+    /// 3. Apply resolved nodes to the trie via CoW
+    /// 4. Continue walking from resolved nodes for remaining key depth
+    ///
+    /// This is more efficient than per-key `touch_storage_with_hash_state` because
+    /// Hash nodes shared by multiple keys are resolved only once, and all DB reads
+    /// at each depth level are batched into a single `get_trie_nodes_batch` call.
+    pub fn eager_resolve_paths(&mut self, keys: &[&[u8]]) -> Result<(), SecureTrieError> {
+        use super::encoding::key_to_nibbles;
+
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let enabled = self.update_stats.enabled;
+
+        // Convert all keys to nibbles once.
+        let nibble_keys: Vec<Vec<u8>> = keys.iter().map(|k| key_to_nibbles(k)).collect();
+
+        struct PendingResolve {
+            prefix: Vec<u8>,
+            hash: B256,
+            db_key: Vec<u8>,
+        }
+
+        // Track progress: for each key, current position in its nibble path.
+        let mut positions: Vec<usize> = vec![0; nibble_keys.len()];
+        // Which keys are still active (haven't finished or hit an unresolvable node).
+        let mut active: Vec<bool> = vec![true; nibble_keys.len()];
+
+        // Iterate depth passes. key_to_nibbles produces 2*len+1 nibbles (terminator included),
+        // so a 32-byte key has 65 nibbles and may need up to 65 resolution passes.
+        for _pass in 0..65 {
+            // Walk the trie from root for each active key to find Hash nodes.
+            let mut pending: Vec<PendingResolve> = Vec::new();
+            let mut resolved: Vec<(Vec<u8>, Arc<Node>)> = Vec::new();
+            // Track which prefixes we've already queued to avoid duplicates.
+            let mut seen_prefixes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+            for (ki, nk) in nibble_keys.iter().enumerate() {
+                if !active[ki] {
+                    continue;
+                }
+
+                let pos = positions[ki];
+                // Walk from root to current position, then check what's next.
+                let mut current = self.root.clone();
+                let mut cur_pos = 0;
+                let mut prefix: Vec<u8> = Vec::new();
+                let mut hit_hash = false;
+
+                while cur_pos < nk.len() {
+                    match &*current {
+                        Node::Full(full) => {
+                            if cur_pos < pos {
+                                // Already resolved past here.
+                                let child = full.get_child(nk[cur_pos] as usize);
+                                prefix.push(nk[cur_pos]);
+                                cur_pos += 1;
+                                current = child;
+                            } else {
+                                // At or beyond our frontier — check child.
+                                let child = full.get_child(nk[cur_pos] as usize);
+                                let child_prefix = {
+                                    let mut p = prefix.clone();
+                                    p.push(nk[cur_pos]);
+                                    p
+                                };
+                                if let Node::Hash(hash) = &*child {
+                                    if seen_prefixes.insert(child_prefix.clone()) {
+                                        let key_buf = if self.owner == B256::ZERO {
+                                            TrieNodeKeyBuf::account(&child_prefix)
+                                        } else {
+                                            TrieNodeKeyBuf::storage(self.owner.as_slice(), &child_prefix)
+                                        };
+
+                                        // Difflayer check first.
+                                        if let Some(difflayers) = &self.difflayers {
+                                            if let Some(trie_node) = difflayers.get_trie_nodes(key_buf.as_slice()) {
+                                                if enabled {
+                                                    self.update_stats.resolve_calls += 1;
+                                                    self.update_stats.resolve_difflayer_hits += 1;
+                                                }
+                                                let decoded = if trie_node.is_deleted() {
+                                                    Node::empty_root()
+                                                } else {
+                                                    let blob = trie_node.blob.as_ref().unwrap();
+                                                    if enabled {
+                                                        self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                                                    }
+                                                    let d = Node::must_decode_node(Some(*hash), blob);
+                                                    if !self.skip_tracer {
+                                                        self.tracer.on_read_ref(&child_prefix, blob);
+                                                    }
+                                                    d
+                                                };
+                                                resolved.push((child_prefix, decoded));
+                                                // Don't add to pending, already resolved.
+                                                hit_hash = true;
+                                                break;
+                                            }
+                                        }
+
+                                        pending.push(PendingResolve {
+                                            prefix: child_prefix,
+                                            hash: *hash,
+                                            db_key: key_buf.as_slice().to_vec(),
+                                        });
+                                    }
+                                    hit_hash = true;
+                                    break;
+                                }
+                                prefix.push(nk[cur_pos]);
+                                cur_pos += 1;
+                                current = child;
+                            }
+                        }
+                        Node::Short(short) => {
+                            let remaining = &nk[cur_pos..];
+                            if remaining.starts_with(&short.key) {
+                                prefix.extend_from_slice(&short.key);
+                                cur_pos += short.key.len();
+                                current = short.val.clone();
+                            } else if short.key.starts_with(remaining) {
+                                // Key is a prefix of Short key — no deeper to go.
+                                active[ki] = false;
+                                break;
+                            } else {
+                                // Diverges — no deeper to go.
+                                active[ki] = false;
+                                break;
+                            }
+                        }
+                        Node::Hash(hash) => {
+                            // Hash node encountered as value of a Short node or
+                            // at an unexpected position. Resolve it the same way
+                            // we resolve Full-node children.
+                            if seen_prefixes.insert(prefix.clone()) {
+                                let key_buf = if self.owner == B256::ZERO {
+                                    TrieNodeKeyBuf::account(&prefix)
+                                } else {
+                                    TrieNodeKeyBuf::storage(self.owner.as_slice(), &prefix)
+                                };
+
+                                if let Some(difflayers) = &self.difflayers {
+                                    if let Some(trie_node) = difflayers.get_trie_nodes(key_buf.as_slice()) {
+                                        if enabled {
+                                            self.update_stats.resolve_calls += 1;
+                                            self.update_stats.resolve_difflayer_hits += 1;
+                                        }
+                                        let decoded = if trie_node.is_deleted() {
+                                            Node::empty_root()
+                                        } else {
+                                            let blob = trie_node.blob.as_ref().unwrap();
+                                            if enabled {
+                                                self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                                            }
+                                            let d = Node::must_decode_node(Some(*hash), blob);
+                                            if !self.skip_tracer {
+                                                self.tracer.on_read_ref(&prefix, blob);
+                                            }
+                                            d
+                                        };
+                                        resolved.push((prefix.clone(), decoded));
+                                        hit_hash = true;
+                                        break;
+                                    }
+                                }
+
+                                pending.push(PendingResolve {
+                                    prefix: prefix.clone(),
+                                    hash: *hash,
+                                    db_key: key_buf.as_slice().to_vec(),
+                                });
+                            }
+                            hit_hash = true;
+                            break;
+                        }
+                        _ => {
+                            // Value or Empty — path ends here.
+                            active[ki] = false;
+                            break;
+                        }
+                    }
+                }
+
+                if !hit_hash && cur_pos >= nk.len() {
+                    active[ki] = false; // Reached end of key.
+                } else if hit_hash {
+                    positions[ki] = cur_pos; // Will retry from here after resolution.
+                }
+            }
+
+            // Nothing to resolve — all keys fully walked.
+            if pending.is_empty() && resolved.is_empty() {
+                break;
+            }
+
+            // Batch-fetch remaining from DB.
+            if !pending.is_empty() {
+                let db_keys: Vec<&[u8]> = pending.iter().map(|p| p.db_key.as_slice()).collect();
+                let batch_results = self.database.get_trie_nodes_batch(&db_keys);
+
+                for (p, result) in pending.into_iter().zip(batch_results.into_iter()) {
+                    if let Ok(Some(blob)) = result {
+                        if enabled {
+                            self.update_stats.resolve_calls += 1;
+                            self.update_stats.resolve_db_hits += 1;
+                            self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                        }
+                        let decoded = Node::must_decode_node(Some(p.hash), &blob);
+                        if !self.skip_tracer {
+                            self.tracer.on_read_ref(&p.prefix, &blob);
+                        }
+                        resolved.push((p.prefix, decoded));
+                    }
+                }
+            }
+
+            if resolved.is_empty() {
+                break;
+            }
+
+            // Apply resolved nodes to the trie.
+            for (prefix, node) in &resolved {
+                self.set_at_path(prefix, node);
+            }
+
+            // Check if any keys are still active.
+            if !active.iter().any(|&a| a) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
 }
 // Debug implementation for Trie
 impl<DB> Trie<DB>
