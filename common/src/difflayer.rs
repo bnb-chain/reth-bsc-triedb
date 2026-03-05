@@ -118,86 +118,57 @@ impl DiffLayer {
 
 /// A collection of diff layers for uncommitted blocks in the trie state.
 ///
-/// `DiffLayers` maintains a stack of `DiffLayer` instances, where each layer
-/// represents the state changes for a specific block. This structure is used
-/// to track incremental modifications to the trie before they are committed
-/// to persistent storage.
+/// All inserted layers are merged into flat `Arc<HashMap>`s so that lookups
+/// are O(1) and cloning is O(1) (just Arc ref-count bumps).  `Arc::make_mut`
+/// gives COW semantics: the inner maps are only deep-copied when a mutating
+/// `insert_difflayer` is called while other clones still exist.
 ///
-/// The layers are ordered chronologically, with the most recent block's
-/// diff layer at the front of the vector (index 0). When querying for nodes
-/// or storage roots, the search proceeds from the front (most recent) to the
-/// back (oldest), ensuring that the latest state takes precedence over older layers.
-///
-/// # Usage
-///
-/// This structure is typically used during block processing to accumulate
-/// state changes across multiple blocks before committing them to disk.
-/// Each block adds a new `DiffLayer` to the front of the collection, and when
-/// blocks are finalized, the layers can be merged and persisted.
-///
-/// # Thread Safety
-///
-/// The use of `Arc<DiffLayer>` allows for efficient sharing of diff layers
-/// across multiple readers without cloning the entire layer data. However,
-/// this structure itself is not thread-safe and should be protected by
-/// appropriate synchronization primitives if used in concurrent contexts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// **Insertion order contract**: callers must insert layers newest-first.
+/// The first write for a given key is kept (`or_insert`), so the newest
+/// layer's value wins — matching the old linear-scan semantics.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct DiffLayers {
-    /// An ordered collection of diff layers, one per uncommitted block.
-    ///
-    /// The vector maintains diff layers in reverse chronological order, with the
-    /// most recent block's diff layer at index 0 and the oldest block's
-    /// diff layer at the end of the vector.
-    ///
-    /// Each `DiffLayer` is wrapped in an `Arc` to enable efficient sharing
-    /// and cloning without deep copying the underlying data structures.
-    /// This is particularly important for performance when dealing with
-    /// large state changes across multiple blocks.
-    ///
-    /// # Lookup Behavior
-    ///
-    /// When searching for a trie node or storage root, the lookup starts
-    /// from the front of the vector (most recent layer at index 0) and proceeds
-    /// forward. This ensures that newer state changes override older ones,
-    /// maintaining the correct view of the current state.
-    ///
-    /// # Example
-    /// ```
-    /// // Layers are ordered: [block_102, block_101, block_100]
-    /// // Querying for a node will check block_102 first, then block_101, then block_100
-    /// ```
-    pub diff_layers: Vec<Arc<DiffLayer>>,
+    /// Flattened view of all diff_nodes across layers (newest wins).
+    merged_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>,
+    /// Flattened view of all diff_storage_roots across layers (newest wins).
+    merged_storage_roots: Arc<HashMap<B256, B256>>,
+    /// Number of layers that have been merged.
+    len: usize,
 }
 
 impl DiffLayers {
-    /// Insert a diff layer into the collection
+    /// Insert a diff layer and incrementally merge it into the flat maps.
+    ///
+    /// Callers insert newest-first, so we use `or_insert` to keep the first
+    /// (= newest) write for each key, matching the old linear-scan semantics.
+    ///
+    /// Uses `Arc::make_mut` for COW: if this is the only live reference the
+    /// maps are mutated in-place; otherwise a single deep-copy is made first.
     pub fn insert_difflayer(&mut self, difflayer: Arc<DiffLayer>) {
-        self.diff_layers.push(difflayer);
+        let nodes = Arc::make_mut(&mut self.merged_nodes);
+        for (k, v) in difflayer.diff_nodes.iter() {
+            nodes.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        let roots = Arc::make_mut(&mut self.merged_storage_roots);
+        for (k, v) in difflayer.diff_storage_roots.iter() {
+            roots.entry(*k).or_insert(*v);
+        }
+        self.len += 1;
     }
 
-    /// Get a trie node by prefix
+    /// Get a trie node by prefix — single HashMap probe.
     pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
-        for difflayer in &self.diff_layers {
-            if let Some(node) = difflayer.get_trie_nodes(prefix) {
-                return Some(node);
-            }
-        }
-        None
+        self.merged_nodes.get(prefix).cloned()
     }
 
-    /// Get a storage root by hased address
+    /// Get a storage root by hashed address — single HashMap probe.
     pub fn get_storage_root(&self, hased_address: B256) -> Option<B256> {
-        for difflayer in &self.diff_layers {
-            if let Some(root) = difflayer.get_storage_root(hased_address) {
-                return Some(root);
-            }
-        }
-        None
+        self.merged_storage_roots.get(&hased_address).copied()
     }
 
-    /// Returns true if the diff layers are empty
+    /// Returns true if no layers have been merged.
     pub fn is_empty(&self) -> bool {
-        self.diff_layers.is_empty()
+        self.len == 0
     }
 }
 

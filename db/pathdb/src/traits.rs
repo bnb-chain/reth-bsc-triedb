@@ -9,9 +9,9 @@ pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 pub const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 64 * 1024 * 1024; // 64MB
 pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
 pub const DEFAULT_CREATE_IF_MISSING: bool = true;
-/// Default byte-weighted capacity for the trie node MokaCache (512MB).
+/// Default byte-weighted capacity for the trie node cache (512MB).
 pub const DEFAULT_TRIE_NODE_CACHE_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
-/// Default byte-weighted capacity for the storage root MokaCache (64MB).
+/// Default byte-weighted capacity for the storage root cache (64MB).
 pub const DEFAULT_STORAGE_ROOT_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 /// Default number of recently-committed diff layers to pin in memory (128 blocks, matching geth-BSC).
 pub const DEFAULT_MAX_COMMITTED_DIFFLAYERS: usize = 128;
