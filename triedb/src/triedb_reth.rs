@@ -160,7 +160,6 @@ where
     where
         DB: 'static,
     {
-        
         self.state_at(parent_root, difflayer, prefetcher)?;
         self.intermediate_inner(states, storage_states, states_rebuild)?;
         self.commit_inner(true)
@@ -769,6 +768,7 @@ where
         let state_at_elapsed = state_at_start.elapsed();
 
         let intermediate_start = Instant::now();
+        self.path_db.reset_trie_node_cache_counters();
         self.intermediate_inner(
             hashed_post_state.states.clone(),
             hashed_post_state.storage_states.clone(),
@@ -779,6 +779,15 @@ where
         let commit_start = Instant::now();
         let out = self.commit(true)?;
         let commit_elapsed = commit_start.elapsed();
+
+        let (trie_node_cache_hits, trie_node_cache_misses) =
+            self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
+        let trie_node_cache_total = trie_node_cache_hits + trie_node_cache_misses;
+        let trie_node_cache_hit_ratio = if trie_node_cache_total > 0 {
+            trie_node_cache_hits as f64 / trie_node_cache_total as f64
+        } else {
+            0.0
+        };
 
         debug!(
             target: "triedb::intermediate_and_commit_hashed_post_state",
@@ -791,6 +800,9 @@ where
             intermediate_ms = intermediate_elapsed.as_secs_f64() * 1000.0,
             commit_ms = commit_elapsed.as_secs_f64() * 1000.0,
             total_ms = call_start.elapsed().as_secs_f64() * 1000.0,
+            trie_node_cache_hits,
+            trie_node_cache_misses,
+            trie_node_cache_hit_ratio = %format!("{:.4}", trie_node_cache_hit_ratio),
             "intermediate_and_commit_hashed_post_state timing"
         );
 

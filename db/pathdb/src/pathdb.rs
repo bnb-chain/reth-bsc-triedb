@@ -675,6 +675,11 @@ impl TrieDatabase for PathDB {
         Some((moka_hits + difflayer_hits, misses))
     }
 
+    fn reset_trie_node_cache_counters(&self) {
+        self.trie_node_cache_counters.hits.store(0, Ordering::Relaxed);
+        self.trie_node_cache_counters.misses.store(0, Ordering::Relaxed);
+    }
+
     fn trie_node_rocksdb_counters(&self) -> Option<(u64, u64, u64, u64, u64)> {
         Some((
             self.trie_node_cache_counters.rocksdb_get_calls.load(Ordering::Relaxed),
