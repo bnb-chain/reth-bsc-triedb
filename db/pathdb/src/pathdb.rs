@@ -761,10 +761,8 @@ impl TrieDatabase for PathDB {
 
         // 1. Check cache + committed difflayers for each key; collect misses.
         for (i, key) in keys.iter().enumerate() {
-            let key_vec = key.to_vec();
-
-            // cache fast path
-            if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            // cache fast path — borrowed key lookup, no allocation on hit.
+            if let Some(cached_value) = self.trie_node_cache.get(*key) {
                 self.trie_node_cache_counters.hits.fetch_add(1, Ordering::Relaxed);
                 results[i] = Some(Ok(cached_value));
                 continue;
@@ -779,12 +777,13 @@ impl TrieDatabase for PathDB {
                         self.trie_node_cache_counters
                             .committed_difflayer_hits
                             .fetch_add(1, Ordering::Relaxed);
+                        let key_vec = key.to_vec();
                         if node.is_deleted() {
-                            self.trie_node_cache.insert(key_vec.clone(), None);
+                            self.trie_node_cache.insert(key_vec, None);
                             results[i] = Some(Ok(None));
                         } else {
                             let blob = node.blob.clone();
-                            self.trie_node_cache.insert(key_vec.clone(), blob.clone());
+                            self.trie_node_cache.insert(key_vec, blob.clone());
                             results[i] = Some(Ok(blob));
                         }
                         found_in_layers = true;
@@ -799,7 +798,7 @@ impl TrieDatabase for PathDB {
             // True miss — need RocksDB lookup
             self.trie_node_cache_counters.misses.fetch_add(1, Ordering::Relaxed);
             miss_indices.push(i);
-            miss_key_vecs.push(key_vec);
+            miss_key_vecs.push(key.to_vec());
         }
 
         // 2. Batch fetch all misses from RocksDB in one call.

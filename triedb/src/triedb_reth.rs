@@ -390,8 +390,15 @@ where
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                let resolve_depth = if kvs_len >= 4 { 4 } else { 1 };
-                                let _ = trie.trie_mut().eager_resolve_to_depth(resolve_depth);
+                                let _ = trie.trie_mut().eager_resolve_root_children();
+                                // Pre-warm trie paths for all keys we're about to insert/delete.
+                                // This resolves Hash nodes via CoW so insert_internal finds
+                                // in-memory nodes instead of triggering DB reads.
+                                // Note: tracer must remain enabled so access_list is populated
+                                // correctly for the commit phase (Committer::store checks it).
+                                for hashed_key in kvs.keys() {
+                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
+                                }
                                 (trie, false, src)
                             }
                         };
@@ -943,8 +950,11 @@ where
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                let resolve_depth = if kvs.len() >= 4 { 4 } else { 1 };
-                                let _ = trie.trie_mut().eager_resolve_to_depth(resolve_depth);
+                                let _ = trie.trie_mut().eager_resolve_root_children();
+                                // Pre-warm trie paths for all keys we're about to insert/delete.
+                                for hashed_key in kvs.keys() {
+                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
+                                }
                                 trie
                             }
                         };
