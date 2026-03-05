@@ -298,4 +298,15 @@ pub trait TrieDatabase {
     /// implementation-dependent, and some implementations may be no-ops if
     /// they don't maintain caches.
     fn clear_cache(&self);
+
+    /// Retrieves multiple trie nodes from the database in a single batch operation.
+    ///
+    /// This is an optimization over calling `get_trie_node` in a loop.
+    /// Backends that support batched I/O (e.g., RocksDB's `batched_multi_get_cf`)
+    /// can override this for better throughput.
+    ///
+    /// Default implementation falls back to individual `get_trie_node` calls.
+    fn get_trie_nodes_batch(&self, keys: &[&[u8]]) -> Vec<Result<Option<Vec<u8>>, Self::Error>> {
+        keys.iter().map(|k| self.get_trie_node(k)).collect()
+    }
 }

@@ -169,7 +169,7 @@ where
     /// The prefetch state of the trie db
     ///
     /// This is used to store the prefetched state of the trie db.
-    pub(crate) prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>,
+    pub(crate) prefetcher: Option<TrieDBPrefetchState<DB>>,
     
     /// Metrics for monitoring trie database operations and performance.
     pub(crate) metrics: TrieDBMetrics,
@@ -198,7 +198,12 @@ where
 
     /// Reset the state of the trie db to the given root hash and difflayer
     pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
-        self.prefetcher = prefetcher;
+        // Unwrap the Arc to take ownership; fall back to clone if other references exist.
+        // In practice, the prefetcher Arc has refcount=1 here (miner is sole consumer),
+        // so try_unwrap succeeds. The clone fallback exists for safety only.
+        self.prefetcher = prefetcher.map(|arc| {
+            Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())
+        });
         if let Some(prefetcher) = &self.prefetcher {
             self.account_trie = Some(prefetcher.account_trie.clone());
         } else {

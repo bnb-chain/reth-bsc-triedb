@@ -279,7 +279,14 @@ where
         let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
         let storages_for_task2 = storages;
         let metrics_clone = self.metrics.clone();
-        let prefetcher_clone = self.prefetcher.clone();
+        // Extract storage tries from prefetcher for zero-copy transfer to parallel tasks.
+        // Each par_iter thread takes ownership via Mutex::lock().remove() instead of cloning.
+        // NOTE: This take is intentional and one-shot. Each prefetcher instance is consumed by
+        // exactly one commit_hashed_post_state call. The taken storage tries are distributed to
+        // parallel tasks via Mutex::lock().remove() for zero-copy ownership transfer.
+        // storage_roots (used for root lookups above) remain accessible on self.prefetcher.
+        let prefetcher_storage_tries = self.prefetcher.as_mut()
+            .map(|p| std::sync::Mutex::new(std::mem::take(&mut p.storage_tries)));
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root_with_source =
@@ -368,10 +375,10 @@ where
                         let item_start = Instant::now();
                         let kvs_len = kvs.len();
 
-                        // Try to get storage_trie from prefetcher, otherwise create a new one
-                        let (mut storage_trie, prefetch_storage_trie_hit, storage_root_source) = match prefetcher_clone.as_ref()
-                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                            .cloned()
+                        // Try to take storage_trie from prefetcher (zero-copy), otherwise create a new one
+                        let (mut storage_trie, prefetch_storage_trie_hit, storage_root_source) = match prefetcher_storage_tries
+                            .as_ref()
+                            .and_then(|m| m.lock().ok()?.remove(&hashed_address))
                         {
                             Some(trie) => (trie, true, "prefetcher-storage-trie"),
                             None => {
@@ -379,10 +386,19 @@ where
                                 let (storage_root, src) = get_storage_root_with_source(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
-                                let trie = SecureTrieBuilder::new(path_db_clone.clone())
+                                let mut trie = SecureTrieBuilder::new(path_db_clone.clone())
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+                                let _ = trie.trie_mut().eager_resolve_root_children();
+                                // Pre-warm trie paths for all keys we're about to insert/delete.
+                                // This resolves Hash nodes via CoW so insert_internal finds
+                                // in-memory nodes instead of triggering DB reads.
+                                // Note: tracer must remain enabled so access_list is populated
+                                // correctly for the commit phase (Committer::store checks it).
+                                for hashed_key in kvs.keys() {
+                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
+                                }
                                 (trie, false, src)
                             }
                         };
@@ -854,7 +870,13 @@ where
         let storages_keys: HashSet<B256> = hashed_post_state.storage_states.keys().cloned().collect();
         let storages_for_task2 = hashed_post_state.storage_states.clone();
         let metrics_clone = self.metrics.clone();
-        let prefetcher_clone = self.prefetcher.clone();
+        // Extract storage tries from prefetcher for zero-copy transfer to parallel tasks.
+        // NOTE: This take is intentional and one-shot. Each prefetcher instance is consumed by
+        // exactly one intermediate_and_commit call. The taken storage tries are distributed to
+        // parallel tasks via Mutex::lock().remove() for zero-copy ownership transfer.
+        // storage_roots (used for root lookups above) remain accessible on self.prefetcher.
+        let prefetcher_storage_tries = self.prefetcher.as_mut()
+            .map(|p| std::sync::Mutex::new(std::mem::take(&mut p.storage_tries)));
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
@@ -922,10 +944,10 @@ where
                     .into_par_iter()
                     .map(|(hashed_address, kvs)| {
 
-                        // Try to get storage_trie from prefetcher, otherwise create a new one
-                        let mut storage_trie = match prefetcher_clone.as_ref()
-                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                            .cloned()
+                        // Try to take storage_trie from prefetcher (zero-copy), otherwise create a new one
+                        let mut storage_trie = match prefetcher_storage_tries
+                            .as_ref()
+                            .and_then(|m| m.lock().ok()?.remove(&hashed_address))
                         {
                             Some(trie) => trie,
                             None => {
@@ -933,10 +955,16 @@ where
                                 let storage_root = get_storage_root(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
-                                SecureTrieBuilder::new(path_db_clone.clone())
+                                let mut trie = SecureTrieBuilder::new(path_db_clone.clone())
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
-                                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?
+                                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+                                let _ = trie.trie_mut().eager_resolve_root_children();
+                                // Pre-warm trie paths for all keys we're about to insert/delete.
+                                for hashed_key in kvs.keys() {
+                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
+                                }
+                                trie
                             }
                         };
 

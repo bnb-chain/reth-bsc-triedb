@@ -933,6 +933,96 @@ where
         Err(SecureTrieError::Database(format!("missing trie node: owner: {}, prefix: 0x{}, key: 0x{}", owner_hex, prefix_hex, key_hex)))
     }
 
+    /// Batch-resolves Hash children of the root node using `get_trie_nodes_batch`.
+    ///
+    /// For Full (branch) roots, resolves up to 16 Hash children in one batched DB
+    /// call instead of one-by-one during individual `get()` traversals.
+    /// Most beneficial before a batch of `get()`/`touch()` calls on the same trie.
+    ///
+    /// Checks difflayers first (matching `resolve_and_track` behaviour) so that
+    /// pending in-memory updates are not shadowed by stale on-disk data.
+    pub fn eager_resolve_root_children(&mut self) -> Result<(), SecureTrieError> {
+        let root = self.root.clone();
+        let full = match &*root {
+            Node::Full(full) => full,
+            _ => return Ok(()),
+        };
+
+        // CoW: create mutable copy of root, set resolved children
+        let mut new_full = full.to_mutable_copy_with_cow();
+        let mut resolved_count = 0u32;
+        let enabled = self.update_stats.enabled;
+
+        // Collect Hash children, resolve from difflayer first, batch the rest from DB
+        let mut db_entries: Vec<(usize, B256, Vec<u8>)> = Vec::new();
+        for i in 0..16 {
+            if let Node::Hash(hash) = &*full.get_child(i) {
+                let prefix = [i as u8];
+                let key = if self.owner == B256::ZERO {
+                    account_trie_node_key(&prefix)
+                } else {
+                    storage_trie_node_key(self.owner.as_slice(), &prefix)
+                };
+
+                // Check difflayer first (mirrors resolve_and_track)
+                if let Some(difflayers) = &self.difflayers {
+                    if let Some(node) = difflayers.get_trie_nodes(&key) {
+                        if enabled {
+                            self.update_stats.resolve_calls += 1;
+                            self.update_stats.resolve_difflayer_hits += 1;
+                        }
+                        if node.is_deleted() {
+                            new_full.set_child(i, &Node::empty_root());
+                        } else {
+                            let blob = node.blob.as_ref().unwrap();
+                            if enabled {
+                                self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                            }
+                            let decoded = Node::must_decode_node(Some(*hash), blob);
+                            if !self.skip_tracer {
+                                self.tracer.on_read_ref(&prefix, blob);
+                            }
+                            new_full.set_child(i, &decoded);
+                        }
+                        resolved_count += 1;
+                        continue;
+                    }
+                }
+
+                db_entries.push((i, *hash, key));
+            }
+        }
+
+        // Batch-fetch remaining from database (uses batched_multi_get_cf in PathDB)
+        if !db_entries.is_empty() {
+            let db_keys: Vec<&[u8]> = db_entries.iter().map(|(_, _, k)| k.as_slice()).collect();
+            let batch_results = self.database.get_trie_nodes_batch(&db_keys);
+
+            for ((i, hash, _), result) in db_entries.iter().zip(batch_results.into_iter()) {
+                if let Ok(Some(blob)) = result {
+                    if enabled {
+                        self.update_stats.resolve_calls += 1;
+                        self.update_stats.resolve_db_hits += 1;
+                        self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                    }
+                    let decoded = Node::must_decode_node(Some(*hash), &blob);
+                    if !self.skip_tracer {
+                        let prefix = [*i as u8];
+                        self.tracer.on_read(&prefix, blob);
+                    }
+                    new_full.set_child(*i, &decoded);
+                    resolved_count += 1;
+                }
+                // Ok(None) or Err: leave as Hash, resolve_and_track handles it later
+            }
+        }
+
+        if resolved_count > 0 {
+            self.root = Arc::new(Node::Full(Arc::new(new_full)));
+        }
+        Ok(())
+    }
+
 }
 // Debug implementation for Trie
 impl<DB> Trie<DB>
