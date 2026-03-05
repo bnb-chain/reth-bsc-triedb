@@ -8,7 +8,7 @@ use alloy_trie::EMPTY_ROOT_HASH;
 use rust_eth_triedb_common::TrieDatabase;
 use tracing::Level;
 use crate::trie_committer::Committer;
-use super::encoding::{common_prefix_length, key_to_nibbles, account_trie_node_key, storage_trie_node_key};
+use super::encoding::{common_prefix_length, key_to_nibbles, TrieNodeKeyBuf};
 use super::node::{Node, NodeFlag, FullNode, ShortNode, NodeSet, TrieNode, DiffLayers};
 use super::secure_trie::{SecureTrieId, SecureTrieError};
 use super::trie_hasher::Hasher;
@@ -861,11 +861,12 @@ where
         // Only take a timestamp when stats are actually enabled
         let resolve_start = if enabled { Some(Instant::now()) } else { None };
 
-        let key = if self.owner == B256::ZERO {
-            account_trie_node_key(prefix)
+        let key_buf = if self.owner == B256::ZERO {
+            TrieNodeKeyBuf::account(prefix)
         } else {
-            storage_trie_node_key(self.owner.as_slice(), prefix)
+            TrieNodeKeyBuf::storage(self.owner.as_slice(), prefix)
         };
+        let key = key_buf.as_slice();
 
         if enabled {
             self.update_stats.node_key_alloc_count += 1;
@@ -874,7 +875,7 @@ where
 
         // 1. Check if the hash is in the difflayer (no key clone needed)
         if let Some(difflayers) = &self.difflayers {
-            if let Some(node) = difflayers.get_trie_nodes(&key) {
+            if let Some(node) = difflayers.get_trie_nodes(key) {
                 if enabled {
                     self.update_stats.resolve_difflayer_hits += 1;
                 }
@@ -905,7 +906,7 @@ where
         }
 
         // 2. Check if the hash is in the database
-        if let Some(node_blob) = self.database.get_trie_node(&key).map_err(|e| SecureTrieError::Database(format!("{:?}", e)))? {
+        if let Some(node_blob) = self.database.get_trie_node(key).map_err(|e| SecureTrieError::Database(format!("{:?}", e)))? {
             if enabled {
                 self.update_stats.resolve_db_hits += 1;
                 self.update_stats.resolve_blob_bytes_total += node_blob.len() as u64;
@@ -942,85 +943,265 @@ where
     /// Checks difflayers first (matching `resolve_and_track` behaviour) so that
     /// pending in-memory updates are not shadowed by stale on-disk data.
     pub fn eager_resolve_root_children(&mut self) -> Result<(), SecureTrieError> {
-        let root = self.root.clone();
-        let full = match &*root {
-            Node::Full(full) => full,
-            _ => return Ok(()),
-        };
+        self.eager_resolve_to_depth(1)
+    }
 
-        // CoW: create mutable copy of root, set resolved children
-        let mut new_full = full.to_mutable_copy_with_cow();
-        let mut resolved_count = 0u32;
+    /// Eagerly resolves Hash nodes in the trie down to `max_depth` levels using
+    /// batched DB reads. Processes one depth level at a time (BFS), so each level
+    /// is a single batch call instead of N individual `resolve_and_track` calls.
+    ///
+    /// All resolved nodes (from both difflayers and DB) are applied to `self.root`
+    /// via CoW `set_at_path`, ensuring the trie is consistent for subsequent
+    /// operations. The next BFS frontier is read back from the updated root.
+    ///
+    /// `max_depth = 1` resolves root's 16 Full-node children (same as the old
+    /// `eager_resolve_root_children`). `max_depth = 4` resolves ~4 levels deep,
+    /// covering the vast majority of branch fan-out in BSC tries.
+    pub fn eager_resolve_to_depth(&mut self, max_depth: usize) -> Result<(), SecureTrieError> {
+        if max_depth == 0 {
+            return Ok(());
+        }
+
+        struct PendingResolve {
+            prefix: Vec<u8>,
+            hash: B256,
+            db_key: Vec<u8>,
+        }
+
         let enabled = self.update_stats.enabled;
 
-        // Collect Hash children, resolve from difflayer first, batch the rest from DB
-        let mut db_entries: Vec<(usize, B256, Vec<u8>)> = Vec::new();
-        for i in 0..16 {
-            if let Node::Hash(hash) = &*full.get_child(i) {
-                let prefix = [i as u8];
-                let key = if self.owner == B256::ZERO {
-                    account_trie_node_key(&prefix)
-                } else {
-                    storage_trie_node_key(self.owner.as_slice(), &prefix)
+        // BFS frontier: nibble prefixes of Full nodes whose Hash children we
+        // should resolve at this depth. We start with the root's prefix (empty).
+        let mut frontier_prefixes: Vec<Vec<u8>> = vec![Vec::new()];
+
+        for _depth in 0..max_depth {
+            // Collect Hash children from all Full nodes at the frontier.
+            let mut pending: Vec<PendingResolve> = Vec::new();
+            // (prefix, resolved_node) pairs to apply to self.root.
+            let mut resolved: Vec<(Vec<u8>, Arc<Node>)> = Vec::new();
+
+            for parent_prefix in &frontier_prefixes {
+                // Walk self.root to find the node at parent_prefix.
+                let parent_node = Self::node_at_path(&self.root, parent_prefix);
+                let full = match parent_node.as_deref() {
+                    Some(Node::Full(f)) => f,
+                    _ => continue,
                 };
 
-                // Check difflayer first (mirrors resolve_and_track)
-                if let Some(difflayers) = &self.difflayers {
-                    if let Some(node) = difflayers.get_trie_nodes(&key) {
+                for i in 0..16 {
+                    if let Node::Hash(hash) = &*full.get_child(i) {
+                        let mut child_prefix = parent_prefix.clone();
+                        child_prefix.push(i as u8);
+                        let key_buf = if self.owner == B256::ZERO {
+                            TrieNodeKeyBuf::account(&child_prefix)
+                        } else {
+                            TrieNodeKeyBuf::storage(self.owner.as_slice(), &child_prefix)
+                        };
+
+                        // Difflayer check first
+                        if let Some(difflayers) = &self.difflayers {
+                            if let Some(trie_node) = difflayers.get_trie_nodes(key_buf.as_slice()) {
+                                if enabled {
+                                    self.update_stats.resolve_calls += 1;
+                                    self.update_stats.resolve_difflayer_hits += 1;
+                                }
+                                let decoded = if trie_node.is_deleted() {
+                                    Node::empty_root()
+                                } else {
+                                    let blob = trie_node.blob.as_ref().unwrap();
+                                    if enabled {
+                                        self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                                    }
+                                    let d = Node::must_decode_node(Some(*hash), blob);
+                                    if !self.skip_tracer {
+                                        self.tracer.on_read_ref(&child_prefix, blob);
+                                    }
+                                    d
+                                };
+                                resolved.push((child_prefix, decoded));
+                                continue;
+                            }
+                        }
+
+                        pending.push(PendingResolve {
+                            prefix: child_prefix,
+                            hash: *hash,
+                            db_key: key_buf.as_slice().to_vec(),
+                        });
+                    }
+                }
+            }
+
+            // Batch-fetch remaining from DB
+            if !pending.is_empty() {
+                let db_keys: Vec<&[u8]> = pending.iter().map(|p| p.db_key.as_slice()).collect();
+                let batch_results = self.database.get_trie_nodes_batch(&db_keys);
+
+                for (p, result) in pending.into_iter().zip(batch_results.into_iter()) {
+                    if let Ok(Some(blob)) = result {
                         if enabled {
                             self.update_stats.resolve_calls += 1;
-                            self.update_stats.resolve_difflayer_hits += 1;
+                            self.update_stats.resolve_db_hits += 1;
+                            self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
                         }
-                        if node.is_deleted() {
-                            new_full.set_child(i, &Node::empty_root());
+                        let decoded = Node::must_decode_node(Some(p.hash), &blob);
+                        if !self.skip_tracer {
+                            self.tracer.on_read_ref(&p.prefix, &blob);
+                        }
+                        resolved.push((p.prefix, decoded));
+                    }
+                }
+            }
+
+            if resolved.is_empty() {
+                break;
+            }
+
+            // Group resolved siblings by parent prefix so we CoW-copy each
+            // parent Full node once and set all its children in one pass,
+            // instead of N separate set_at_path walks.
+            //
+            // Sort by prefix so siblings (same parent) are adjacent.
+            resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+            let mut next_frontier: Vec<Vec<u8>> = Vec::new();
+            let mut i = 0;
+            while i < resolved.len() {
+                let prefix = &resolved[i].0;
+                // Parent prefix = prefix minus last nibble.
+                let parent_prefix = &prefix[..prefix.len() - 1];
+
+                // Collect all siblings sharing this parent.
+                let group_start = i;
+                while i < resolved.len() && resolved[i].0.len() == prefix.len()
+                    && resolved[i].0[..prefix.len() - 1] == *parent_prefix
+                {
+                    i += 1;
+                }
+
+                if group_start + 1 == i {
+                    // Single child — just set_at_path directly.
+                    let (ref p, ref node) = resolved[group_start];
+                    if matches!(&**node, Node::Full(_)) {
+                        next_frontier.push(p.clone());
+                    }
+                    self.set_at_path(p, node);
+                } else {
+                    // Multiple siblings — walk to parent, CoW once, set all children.
+                    let parent_node = Self::node_at_path(&self.root, parent_prefix);
+                    if let Some(parent_arc) = parent_node {
+                        if let Node::Full(full) = &*parent_arc {
+                            let mut new_full = full.to_mutable_copy_with_cow();
+                            for (p, node) in &resolved[group_start..i] {
+                                let child_nibble = *p.last().unwrap() as usize;
+                                new_full.set_child(child_nibble, node);
+                                if matches!(&**node, Node::Full(_)) {
+                                    next_frontier.push(p.clone());
+                                }
+                            }
+                            let new_parent = Arc::new(Node::Full(Arc::new(new_full)));
+                            if parent_prefix.is_empty() {
+                                self.root = new_parent;
+                            } else {
+                                self.set_at_path(parent_prefix, &new_parent);
+                            }
                         } else {
-                            let blob = node.blob.as_ref().unwrap();
-                            if enabled {
-                                self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
+                            // Parent isn't a Full node (shouldn't happen), fall back.
+                            for (p, node) in &resolved[group_start..i] {
+                                if matches!(&**node, Node::Full(_)) {
+                                    next_frontier.push(p.clone());
+                                }
+                                self.set_at_path(p, node);
                             }
-                            let decoded = Node::must_decode_node(Some(*hash), blob);
-                            if !self.skip_tracer {
-                                self.tracer.on_read_ref(&prefix, blob);
-                            }
-                            new_full.set_child(i, &decoded);
                         }
-                        resolved_count += 1;
-                        continue;
+                    } else {
+                        // Can't find parent (unresolved Hash above), fall back.
+                        for (p, node) in &resolved[group_start..i] {
+                            if matches!(&**node, Node::Full(_)) {
+                                next_frontier.push(p.clone());
+                            }
+                            self.set_at_path(p, node);
+                        }
                     }
                 }
-
-                db_entries.push((i, *hash, key));
             }
-        }
 
-        // Batch-fetch remaining from database (uses batched_multi_get_cf in PathDB)
-        if !db_entries.is_empty() {
-            let db_keys: Vec<&[u8]> = db_entries.iter().map(|(_, _, k)| k.as_slice()).collect();
-            let batch_results = self.database.get_trie_nodes_batch(&db_keys);
-
-            for ((i, hash, _), result) in db_entries.iter().zip(batch_results.into_iter()) {
-                if let Ok(Some(blob)) = result {
-                    if enabled {
-                        self.update_stats.resolve_calls += 1;
-                        self.update_stats.resolve_db_hits += 1;
-                        self.update_stats.resolve_blob_bytes_total += blob.len() as u64;
-                    }
-                    let decoded = Node::must_decode_node(Some(*hash), &blob);
-                    if !self.skip_tracer {
-                        let prefix = [*i as u8];
-                        self.tracer.on_read(&prefix, blob);
-                    }
-                    new_full.set_child(*i, &decoded);
-                    resolved_count += 1;
-                }
-                // Ok(None) or Err: leave as Hash, resolve_and_track handles it later
+            if next_frontier.is_empty() {
+                break;
             }
+            frontier_prefixes = next_frontier;
         }
 
-        if resolved_count > 0 {
-            self.root = Arc::new(Node::Full(Arc::new(new_full)));
-        }
         Ok(())
+    }
+
+    /// Returns the node at the given nibble path from root, or None if the path
+    /// hits a Hash node or doesn't match.
+    fn node_at_path(root: &Arc<Node>, path: &[u8]) -> Option<Arc<Node>> {
+        let mut current = root.clone();
+        let mut pos = 0;
+        while pos < path.len() {
+            let next = match &*current {
+                Node::Full(full) => {
+                    let child = full.get_child(path[pos] as usize);
+                    pos += 1;
+                    child
+                }
+                Node::Short(short) => {
+                    let remaining = &path[pos..];
+                    if remaining.starts_with(&short.key) {
+                        pos += short.key.len();
+                        short.val.clone()
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            };
+            current = next;
+        }
+        Some(current)
+    }
+
+    /// Sets a resolved node at the given nibble path, walking from root via CoW.
+    /// Used by eager_resolve_to_depth to patch resolved Hash nodes into the trie.
+    fn set_at_path(&mut self, path: &[u8], resolved_node: &Arc<Node>) {
+        if path.is_empty() {
+            return;
+        }
+        self.root = Self::set_at_path_inner(&self.root, path, 0, resolved_node);
+    }
+
+    fn set_at_path_inner(node: &Arc<Node>, path: &[u8], pos: usize, resolved: &Arc<Node>) -> Arc<Node> {
+        if pos == path.len() {
+            return resolved.clone();
+        }
+
+        match &**node {
+            Node::Full(full) => {
+                let nibble = path[pos] as usize;
+                let child = full.get_child(nibble);
+                let new_child = Self::set_at_path_inner(&child, path, pos + 1, resolved);
+                let mut new_full = full.to_mutable_copy_with_cow();
+                new_full.set_child(nibble, &new_child);
+                Arc::new(Node::Full(Arc::new(new_full)))
+            }
+            Node::Short(short) => {
+                let remaining = &path[pos..];
+                if remaining.starts_with(&short.key) {
+                    let new_val = Self::set_at_path_inner(&short.val, path, pos + short.key.len(), resolved);
+                    Arc::new(Node::Short(Arc::new(ShortNode {
+                        key: short.key.clone(),
+                        val: new_val,
+                        flags: short.flags.clone(),
+                    })))
+                } else {
+                    node.clone()
+                }
+            }
+            // Can't descend through Hash — leave as-is, resolve_and_track handles later.
+            _ => node.clone(),
+        }
     }
 
 }

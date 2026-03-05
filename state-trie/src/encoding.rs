@@ -168,11 +168,11 @@ pub fn storage_trie_node_key(account_hash: &[u8], path: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
         TRIE_NODE_STORAGE_PREFIX.len() + account_hash.len() + path.len()
     );
-    
+
     buf.extend_from_slice(TRIE_NODE_STORAGE_PREFIX);
     buf.extend_from_slice(account_hash);
     buf.extend_from_slice(path);
-    
+
     buf
 }
 
@@ -180,11 +180,54 @@ pub fn storage_trie_node_key(account_hash: &[u8], path: &[u8]) -> Vec<u8> {
 /// Equivalent to BSC's accountTrieNodeKey function
 pub fn account_trie_node_key(path: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(TRIE_NODE_ACCOUNT_PREFIX.len() + path.len());
-    
+
     buf.extend_from_slice(TRIE_NODE_ACCOUNT_PREFIX);
     buf.extend_from_slice(path);
-    
+
     buf
+}
+
+/// Max key size: "O" (1) + account_hash (32) + nibble path (64) = 97 bytes.
+/// Account keys are smaller: "A" (1) + nibble path (64) = 65 bytes.
+pub const MAX_TRIE_NODE_KEY_LEN: usize = 97;
+
+/// Stack-allocated buffer for trie node keys.
+/// Avoids heap allocation on every `resolve_and_track` call.
+pub struct TrieNodeKeyBuf {
+    buf: [u8; MAX_TRIE_NODE_KEY_LEN],
+    len: usize,
+}
+
+impl TrieNodeKeyBuf {
+    /// Build an account trie node key into a stack buffer.
+    #[inline]
+    pub fn account(path: &[u8]) -> Self {
+        let len = TRIE_NODE_ACCOUNT_PREFIX.len() + path.len();
+        debug_assert!(len <= MAX_TRIE_NODE_KEY_LEN);
+        let mut buf = [0u8; MAX_TRIE_NODE_KEY_LEN];
+        buf[..TRIE_NODE_ACCOUNT_PREFIX.len()].copy_from_slice(TRIE_NODE_ACCOUNT_PREFIX);
+        buf[TRIE_NODE_ACCOUNT_PREFIX.len()..len].copy_from_slice(path);
+        Self { buf, len }
+    }
+
+    /// Build a storage trie node key into a stack buffer.
+    #[inline]
+    pub fn storage(account_hash: &[u8], path: &[u8]) -> Self {
+        let prefix_len = TRIE_NODE_STORAGE_PREFIX.len();
+        let len = prefix_len + account_hash.len() + path.len();
+        debug_assert!(len <= MAX_TRIE_NODE_KEY_LEN);
+        let mut buf = [0u8; MAX_TRIE_NODE_KEY_LEN];
+        buf[..prefix_len].copy_from_slice(TRIE_NODE_STORAGE_PREFIX);
+        buf[prefix_len..prefix_len + account_hash.len()].copy_from_slice(account_hash);
+        buf[prefix_len + account_hash.len()..len].copy_from_slice(path);
+        Self { buf, len }
+    }
+
+    /// Return the key as a byte slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
 }
 
 

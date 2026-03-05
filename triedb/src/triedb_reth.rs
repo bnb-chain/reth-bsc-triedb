@@ -390,27 +390,11 @@ where
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                let _ = trie.trie_mut().eager_resolve_root_children();
-                                // Pre-warm trie paths for all keys we're about to insert/delete.
-                                // This resolves Hash nodes via CoW so insert_internal finds
-                                // in-memory nodes instead of triggering DB reads.
-                                // Note: tracer must remain enabled so access_list is populated
-                                // correctly for the commit phase (Committer::store checks it).
-                                for hashed_key in kvs.keys() {
-                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
-                                }
+                                let resolve_depth = if kvs_len >= 4 { 4 } else { 1 };
+                                let _ = trie.trie_mut().eager_resolve_to_depth(resolve_depth);
                                 (trie, false, src)
                             }
                         };
-                        
-                        // Get storage root from path_db or difflayer (same logic as task 1)
-                        // let storage_root = get_storage_root(hashed_address)?;
-                        // let id = SecureTrieId::new(storage_root)
-                        //     .with_owner(hashed_address);
-                        // let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
-                        //     .with_id(id)
-                        //     .build_with_difflayer(difflayer_clone.as_ref())
-                        //     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
 
                         // Apply updates before deletes (Geth-style). This reduces structural churn
                         // (collapse/split) during a batch of writes.
@@ -959,11 +943,8 @@ where
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                let _ = trie.trie_mut().eager_resolve_root_children();
-                                // Pre-warm trie paths for all keys we're about to insert/delete.
-                                for hashed_key in kvs.keys() {
-                                    let _ = trie.touch_storage_with_hash_state(*hashed_key);
-                                }
+                                let resolve_depth = if kvs.len() >= 4 { 4 } else { 1 };
+                                let _ = trie.trie_mut().eager_resolve_to_depth(resolve_depth);
                                 trie
                             }
                         };

@@ -277,7 +277,12 @@ impl PathDB {
         // The weigher estimates the heap cost of each entry (key + value + per-entry overhead).
         // weight_capacity is set to the byte budget so eviction is driven by memory, not entry count.
         // estimated_items_capacity is a rough guess assuming ~200 bytes per entry on average.
-        let trie_node_estimated_items = (config.trie_node_cache_capacity_bytes / 200).max(1024);
+        // When capacity is 0 (cache disabled), estimated_items is also 0 to avoid allocating shards.
+        let trie_node_estimated_items = if config.trie_node_cache_capacity_bytes == 0 {
+            0
+        } else {
+            (config.trie_node_cache_capacity_bytes / 200).max(1024)
+        };
         let trie_node_cache = Arc::new(
             QuickCache::with_weighter(
                 trie_node_estimated_items,
@@ -285,7 +290,11 @@ impl PathDB {
                 ByteWeighter,
             )
         );
-        let storage_root_estimated_items = (config.storage_root_cache_capacity_bytes / 200).max(1024);
+        let storage_root_estimated_items = if config.storage_root_cache_capacity_bytes == 0 {
+            0
+        } else {
+            (config.storage_root_cache_capacity_bytes / 200).max(1024)
+        };
         let storage_root_cache = Arc::new(
             QuickCache::with_weighter(
                 storage_root_estimated_items,
@@ -362,16 +371,16 @@ impl PathDB {
     pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
-        // Allocate key_vec once — needed by cache (Arc<K> doesn't impl Borrow<[u8]>)
-        // and reused for the insert path on miss.
-        let key_vec = key.to_vec();
-
-        // 1. Check cache first — this is the common-case fast path.
-        //    Most reads (~90%+) hit here, so we avoid the 128-layer committed scan.
-        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+        // 1. Check cache first with borrowed key — no allocation on hit.
+        //    quick_cache supports Q: Equivalent<Key> lookups; [u8]: Equivalent<Vec<u8>>
+        //    via the Borrow blanket impl.
+        if let Some(cached_value) = self.trie_node_cache.get(key) {
             self.trie_node_cache_counters.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached_value);
         }
+
+        // Only allocate owned key after cache miss — needed for cache insert.
+        let key_vec = key.to_vec();
 
         // 2. Check committed diff layers (pinned, zero-alloc via Borrow<[u8]>).
         //    Catches recently-committed nodes that were evicted from cache.
@@ -520,12 +529,13 @@ impl PathDB {
     pub fn get_raw_storage_root(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
-        let key_vec = key.to_vec();
-
-        // 1. Check cache first — common-case fast path
-        if let Some(cached_value) = self.storage_root_cache.get(&key_vec) {
+        // 1. Check cache first with borrowed key — no allocation on hit.
+        if let Some(cached_value) = self.storage_root_cache.get(key) {
             return Ok(cached_value);
         }
+
+        // Only allocate owned key after cache miss.
+        let key_vec = key.to_vec();
 
         // 2. Check committed diff layers for storage roots before RocksDB
         if self.config.max_committed_difflayers > 0 && key.len() == 32 {

@@ -123,9 +123,9 @@ impl DiffLayer {
 /// gives COW semantics: the inner maps are only deep-copied when a mutating
 /// `insert_difflayer` is called while other clones still exist.
 ///
-/// **Insertion order contract**: callers must insert layers newest-first.
-/// The first write for a given key is kept (`or_insert`), so the newest
-/// layer's value wins — matching the old linear-scan semantics.
+/// **Precedence**: for a given key the *first* inserted layer wins (via
+/// `or_insert`).  This matches the old `Vec`-based linear scan which
+/// iterated front-to-back and returned the first hit.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct DiffLayers {
     /// Flattened view of all diff_nodes across layers (newest wins).
@@ -139,8 +139,8 @@ pub struct DiffLayers {
 impl DiffLayers {
     /// Insert a diff layer and incrementally merge it into the flat maps.
     ///
-    /// Callers insert newest-first, so we use `or_insert` to keep the first
-    /// (= newest) write for each key, matching the old linear-scan semantics.
+    /// Uses `or_insert` so the first-inserted layer's value wins for each key,
+    /// matching the old `Vec`-based linear-scan (front-to-back, first hit returned).
     ///
     /// Uses `Arc::make_mut` for COW: if this is the only live reference the
     /// maps are mutated in-place; otherwise a single deep-copy is made first.
