@@ -959,10 +959,17 @@ where
                         }
 
                         let (new_storage_root, node_set) = storage_trie.commit(false)?;
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
-                        new_account.storage_root = new_storage_root;
+                        // If account is None (e.g. delete account with storage cleared), we still
+                        // record (None, new_storage_root, node_set) so the diff and apply phase are correct.
+                        let new_account = accounts_clone
+                            .get(&hashed_address)
+                            .and_then(|o| o.as_ref().cloned())
+                            .map(|mut a| {
+                                a.storage_root = new_storage_root;
+                                a
+                            });
 
-                        Ok((hashed_address, (Some(new_account), new_storage_root, node_set)))
+                        Ok((hashed_address, (new_account, new_storage_root, node_set)))
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map(|vec| {
