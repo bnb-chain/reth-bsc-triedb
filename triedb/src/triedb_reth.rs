@@ -386,14 +386,10 @@ where
                                 let (storage_root, src) = get_storage_root_with_source(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
-                                let mut trie = SecureTrieBuilder::new(path_db_clone.clone())
+                                let trie = SecureTrieBuilder::new(path_db_clone.clone())
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                // Batch-resolve Hash nodes along the actual key paths.
-                                // Single batched DB read per depth level instead of per-key walks.
-                                let key_refs: Vec<&[u8]> = kvs.keys().map(|k| k.as_slice()).collect();
-                                let _ = trie.trie_mut().eager_resolve_paths(&key_refs);
                                 (trie, false, src)
                             }
                         };
@@ -954,13 +950,10 @@ where
                                 let storage_root = get_storage_root(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
-                                let mut trie = SecureTrieBuilder::new(path_db_clone.clone())
+                                let trie = SecureTrieBuilder::new(path_db_clone.clone())
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-                                // Batch-resolve Hash nodes along the actual key paths.
-                                let key_refs: Vec<&[u8]> = kvs.keys().map(|k| k.as_slice()).collect();
-                                let _ = trie.trie_mut().eager_resolve_paths(&key_refs);
                                 trie
                             }
                         };

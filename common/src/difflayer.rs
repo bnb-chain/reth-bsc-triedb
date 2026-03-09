@@ -56,33 +56,9 @@ pub struct Leaf {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiffLayer {
     /// A map of trie node path prefixes to their corresponding trie nodes.
-    ///
-    /// The key is the path prefix (as a byte vector) that uniquely identifies
-    /// the location of the node in the trie structure. The value is an `Arc<TrieNode>`
-    /// containing the node's hash and encoded data.
-    ///
-    /// This map tracks all trie nodes that have been modified, inserted, or deleted
-    /// in the current block. Nodes marked as deleted will have `None` for both
-    /// hash and blob fields in the `TrieNode`.
-    ///
-    /// # Example
-    /// ```
-    /// // A path prefix might represent: [0x01, 0x23, 0x45] for a node at depth 3
-    /// ```
     pub diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>,
-    
+
     /// A map of account address hashes to their corresponding storage trie roots.
-    ///
-    /// The key is the Keccak-256 hash of an account address (`B256`), and the value
-    /// is the root hash of that account's storage trie (`B256`).
-    ///
-    /// This map tracks all storage trie roots that have been modified in the current
-    /// block. When an account's storage is updated, its storage root changes, and
-    /// this change is recorded here.
-    ///
-    /// # Note
-    /// Only accounts whose storage has been modified in this block will have entries
-    /// in this map. Unmodified accounts are not included.
     pub diff_storage_roots: Arc<HashMap<B256, B256>>,
 }
 
@@ -118,93 +94,40 @@ impl DiffLayer {
 
 /// A collection of diff layers for uncommitted blocks in the trie state.
 ///
-/// Layers are inserted via `insert_difflayer` (O(1) push). On first lookup the
-/// layers are merged into flat `HashMap`s (one-time O(total_entries) cost) that
-/// are shared across all clones via `Arc<OnceLock>`, so subsequent lookups and
-/// clones are both O(1). First-inserted layer wins for duplicate keys.
+/// `DiffLayers` maintains a stack of `DiffLayer` instances, where each layer
+/// represents the state changes for a specific block. Lookups scan from front
+/// to back (newest first), so the latest state takes precedence.
+///
+/// Uses `&[u8]` parameters to avoid per-call Vec allocations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiffLayers {
-    diff_layers: Vec<Arc<DiffLayer>>,
-    /// Lazily built flattened node map shared across clones.
-    flat_nodes: Arc<std::sync::OnceLock<Arc<HashMap<Vec<u8>, Arc<TrieNode>>>>>,
-    /// Lazily built flattened storage-root map shared across clones.
-    flat_storage_roots: Arc<std::sync::OnceLock<Arc<HashMap<B256, B256>>>>,
+    pub diff_layers: Vec<Arc<DiffLayer>>,
 }
-
-impl Clone for DiffLayers {
-    fn clone(&self) -> Self {
-        Self {
-            diff_layers: self.diff_layers.clone(),
-            flat_nodes: self.flat_nodes.clone(),
-            flat_storage_roots: self.flat_storage_roots.clone(),
-        }
-    }
-}
-
-impl Default for DiffLayers {
-    fn default() -> Self {
-        Self {
-            diff_layers: Vec::new(),
-            flat_nodes: Arc::new(std::sync::OnceLock::new()),
-            flat_storage_roots: Arc::new(std::sync::OnceLock::new()),
-        }
-    }
-}
-
-impl std::fmt::Debug for DiffLayers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DiffLayers")
-            .field("layers", &self.diff_layers.len())
-            .field("flat_nodes_ready", &self.flat_nodes.get().is_some())
-            .field("flat_storage_roots_ready", &self.flat_storage_roots.get().is_some())
-            .finish()
-    }
-}
-
-impl PartialEq for DiffLayers {
-    fn eq(&self, other: &Self) -> bool {
-        self.diff_layers == other.diff_layers
-    }
-}
-
-impl Eq for DiffLayers {}
 
 impl DiffLayers {
     /// Insert a diff layer into the collection.
     pub fn insert_difflayer(&mut self, difflayer: Arc<DiffLayer>) {
         self.diff_layers.push(difflayer);
-        // Invalidate caches — new OnceLocks since OnceLock cannot be reset.
-        self.flat_nodes = Arc::new(std::sync::OnceLock::new());
-        self.flat_storage_roots = Arc::new(std::sync::OnceLock::new());
     }
 
-    /// Get a trie node by prefix — O(1) after first call.
+    /// Get a trie node by prefix — scans layers newest-first, O(layers) per call.
     pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
-        let flat = self.flat_nodes.get_or_init(|| {
-            let total: usize = self.diff_layers.iter().map(|l| l.diff_nodes.len()).sum();
-            let mut nodes = HashMap::with_capacity(total);
-            for layer in &self.diff_layers {
-                for (k, v) in layer.diff_nodes.iter() {
-                    nodes.entry(k.clone()).or_insert_with(|| v.clone());
-                }
+        for difflayer in &self.diff_layers {
+            if let Some(node) = difflayer.get_trie_nodes(prefix) {
+                return Some(node);
             }
-            Arc::new(nodes)
-        });
-        flat.get(prefix).cloned()
+        }
+        None
     }
 
-    /// Get a storage root by hashed address — O(1) after first call.
+    /// Get a storage root by hashed address — scans layers newest-first.
     pub fn get_storage_root(&self, hased_address: B256) -> Option<B256> {
-        let flat = self.flat_storage_roots.get_or_init(|| {
-            let total: usize = self.diff_layers.iter().map(|l| l.diff_storage_roots.len()).sum();
-            let mut roots = HashMap::with_capacity(total);
-            for layer in &self.diff_layers {
-                for (k, v) in layer.diff_storage_roots.iter() {
-                    roots.entry(*k).or_insert(*v);
-                }
+        for difflayer in &self.diff_layers {
+            if let Some(root) = difflayer.get_storage_root(hased_address) {
+                return Some(root);
             }
-            Arc::new(roots)
-        });
-        flat.get(&hased_address).copied()
+        }
+        None
     }
 
     /// Returns true if the diff layers are empty.
@@ -212,4 +135,3 @@ impl DiffLayers {
         self.diff_layers.is_empty()
     }
 }
-
