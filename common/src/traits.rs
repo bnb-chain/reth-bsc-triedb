@@ -250,6 +250,22 @@ pub trait TrieDatabase {
     /// for maintaining database consistency.
     fn commit_difflayer(&self, block_number: u64, state_root: B256, difflayer: &Option<Arc<DiffLayer>>) -> Result<(), Self::Error>;
 
+    /// Commits multiple diff layers to the database in order.
+    ///
+    /// The default implementation preserves the existing behavior by applying
+    /// each layer sequentially via [`commit_difflayer`](Self::commit_difflayer).
+    /// Backends can override this to batch the whole range into a single
+    /// storage-level write.
+    fn commit_difflayers(
+        &self,
+        difflayers: &[(u64, B256, Option<Arc<DiffLayer>>)],
+    ) -> Result<(), Self::Error> {
+        for (block_number, state_root, difflayer) in difflayers {
+            self.commit_difflayer(*block_number, *state_root, difflayer)?;
+        }
+        Ok(())
+    }
+
     /// Retrieves the latest persisted state information from the database.
     ///
     /// This method returns the block number and state root of the most recent

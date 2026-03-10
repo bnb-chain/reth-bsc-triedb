@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
 
 use rocksdb::{
-    BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
-    WriteBatch, WriteOptions,
+    AsColumnFamilyRef, BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB,
+    Options, ReadOptions, WriteBatch, WriteOptions,
 };
 // use schnellru::{ByLength, LruMap};
 use quick_cache::sync::Cache as QuickCache;
@@ -359,6 +359,76 @@ impl PathDB {
     /// Returns the cumulative number of committed-difflayer hits.
     pub fn committed_difflayer_hit_count(&self) -> u64 {
         self.trie_node_cache_counters.committed_difflayer_hits.load(Ordering::Relaxed)
+    }
+
+    fn apply_difflayer_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        default_cf: &impl AsColumnFamilyRef,
+        meta_cf: &impl AsColumnFamilyRef,
+        storage_root_cf: &impl AsColumnFamilyRef,
+        block_number: u64,
+        state_root: B256,
+        difflayer: &Option<Arc<DiffLayer>>,
+    ) -> (usize, usize) {
+        batch.put_cf(default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
+        batch.put_cf(default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, block_number.to_le_bytes());
+
+        // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
+        batch.put_cf(meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
+        batch.put_cf(meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, block_number.to_le_bytes());
+
+        self.trie_node_cache
+            .insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
+        self.trie_node_cache
+            .insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+
+        let mut diff_nodes_len = 0;
+        let mut diff_storage_roots_len = 0;
+
+        if let Some(difflayer) = difflayer {
+            diff_nodes_len = difflayer.diff_nodes.len();
+            diff_storage_roots_len = difflayer.diff_storage_roots.len();
+
+            for (key, node) in difflayer.diff_nodes.iter() {
+                if node.is_deleted() {
+                    self.trie_node_cache.remove(key);
+                    batch.delete_cf(default_cf, key);
+                } else if let Some(blob) = &node.blob {
+                    self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                    batch.put_cf(default_cf, key, blob);
+                }
+            }
+
+            for (key, value) in difflayer.diff_storage_roots.iter() {
+                self.storage_root_cache
+                    .insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
+                batch.put_cf(storage_root_cf, key.as_slice(), value.as_slice());
+            }
+        }
+
+        (diff_nodes_len, diff_storage_roots_len)
+    }
+
+    fn pin_committed_difflayers<I>(&self, difflayers: I)
+    where
+        I: IntoIterator<Item = Arc<DiffLayer>>,
+    {
+        let max = self.config.max_committed_difflayers;
+        if max == 0 {
+            return;
+        }
+
+        let mut layers = self.committed_difflayers.write();
+        for difflayer in difflayers {
+            if difflayer.is_empty() {
+                continue;
+            }
+            layers.push_front(difflayer);
+        }
+        while layers.len() > max {
+            layers.pop_back();
+        }
     }
 
     // /// Create a new metrics instance for the PathDB.
@@ -764,7 +834,6 @@ impl TrieDatabase for PathDB {
     }
 
     fn commit_difflayer(&self, block_number: u64, state_root: B256, difflayer: &Option<Arc<DiffLayer>>) -> Result<(), Self::Error> {
-        // Get Column Family handle for default CF
         let default_cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
@@ -777,58 +846,22 @@ impl TrieDatabase for PathDB {
             PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
         })?;
 
-        let mut diff_nodes_len = 0;
-        let mut diff_storage_roots_len = 0;
-
         let mut batch = WriteBatch::default();
-        {
-            batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, block_number.to_le_bytes());
+        let (diff_nodes_len, diff_storage_roots_len) = self.apply_difflayer_to_batch(
+            &mut batch,
+            &default_cf,
+            &meta_cf,
+            &storage_root_cf,
+            block_number,
+            state_root,
+            difflayer,
+        );
 
-            // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
-            batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, block_number.to_le_bytes());
-        
-            self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
-            self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
-
-            if let Some(difflayer) = difflayer {
-                diff_nodes_len = difflayer.diff_nodes.len();
-                diff_storage_roots_len = difflayer.diff_storage_roots.len();
-
-                for (key, node) in difflayer.diff_nodes.iter() {
-                    if node.is_deleted() {
-                        self.trie_node_cache.remove(key);
-                        batch.delete_cf(&default_cf, key);
-                    } else if let Some(blob) = &node.blob {
-                        self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
-                        batch.put_cf(&default_cf, key, blob);
-                    }
-                }
-
-                for (key, value) in difflayer.diff_storage_roots.iter() {
-                    self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
-                    batch.put_cf(&storage_root_cf, key.as_slice(), value.as_slice());
-                }
-            }
-        }
-
-        // Write batch and update caches after successful write - quick_cache is thread-safe
         match self.db.write_opt(batch, &self.write_options) {
             Ok(()) => {
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
-
-                // Pin the committed diff layer for fast subsequent reads
                 if let Some(difflayer) = difflayer {
-                    if difflayer.is_empty() {
-                        return Ok(());
-                    }
-                    let max = self.config.max_committed_difflayers;
-                    if max > 0 {
-                        let mut layers = self.committed_difflayers.write();
-                        layers.push_front(difflayer.clone());
-                        while layers.len() > max { layers.pop_back(); }
-                    }
+                    self.pin_committed_difflayers([difflayer.clone()]);
                 }
 
                 Ok(())
@@ -838,6 +871,80 @@ impl TrieDatabase for PathDB {
                 Err(PathProviderError::Database(format!("Batch commit error: {}", e)))
             }
 
+        }
+    }
+
+    fn commit_difflayers(
+        &self,
+        difflayers: &[(u64, B256, Option<Arc<DiffLayer>>)],
+    ) -> Result<(), Self::Error> {
+        if difflayers.is_empty() {
+            return Ok(());
+        }
+
+        let default_cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
+            PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
+        })?;
+
+        let meta_cf = self.db.cf_handle(META_COLUMN_FAMILY_NAME).ok_or_else(|| {
+            PathProviderError::Database(format!("Column Family '{}' handle not found", META_COLUMN_FAMILY_NAME))
+        })?;
+
+        let storage_root_cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
+            PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
+        })?;
+
+        let mut batch = WriteBatch::default();
+        let mut total_diff_nodes_len = 0usize;
+        let mut total_diff_storage_roots_len = 0usize;
+        let mut pinned_difflayers = Vec::new();
+
+        for (block_number, state_root, difflayer) in difflayers {
+            let (diff_nodes_len, diff_storage_roots_len) = self.apply_difflayer_to_batch(
+                &mut batch,
+                &default_cf,
+                &meta_cf,
+                &storage_root_cf,
+                *block_number,
+                *state_root,
+                difflayer,
+            );
+            total_diff_nodes_len += diff_nodes_len;
+            total_diff_storage_roots_len += diff_storage_roots_len;
+
+            if let Some(difflayer) = difflayer {
+                if !difflayer.is_empty() {
+                    pinned_difflayers.push(difflayer.clone());
+                }
+            }
+        }
+
+        let (last_block_number, last_state_root, _) = difflayers.last().unwrap();
+        match self.db.write_opt(batch, &self.write_options) {
+            Ok(()) => {
+                trace!(
+                    target: "pathdb::batch",
+                    blocks = difflayers.len(),
+                    last_block_number,
+                    last_state_root = ?last_state_root,
+                    total_diff_nodes_len,
+                    total_diff_storage_roots_len,
+                    "Successfully committed diff layer range to database"
+                );
+                self.pin_committed_difflayers(pinned_difflayers);
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    target: "pathdb::batch",
+                    blocks = difflayers.len(),
+                    last_block_number,
+                    last_state_root = ?last_state_root,
+                    error = %e,
+                    "Error committing diff layer range"
+                );
+                Err(PathProviderError::Database(format!("Batch commit error: {}", e)))
+            }
         }
     }
 }

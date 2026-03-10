@@ -42,8 +42,32 @@ where
         Ok(())
     }
 
+    pub fn flush_many(
+        &mut self,
+        difflayers: &[(u64, B256, Option<Arc<DiffLayer>>)],
+    ) -> Result<(), TrieDBError> {
+        if difflayers.is_empty() {
+            return Ok(());
+        }
+
+        let flush_start = Instant::now();
+        self.path_db
+            .commit_difflayers(difflayers)
+            .map_err(|e| TrieDBError::Database(format!("Failed to commit difflayer range: {:?}", e)))?;
+
+        self.metrics.record_flush_duration(flush_start.elapsed().as_secs_f64());
+        debug!(
+            target: "triedb::flush",
+            blocks = difflayers.len(),
+            first_block = difflayers.first().map(|(block_number, _, _)| *block_number),
+            last_block = difflayers.last().map(|(block_number, _, _)| *block_number),
+            duration = ?flush_start.elapsed(),
+            "Persisted block range"
+        );
+        Ok(())
+    }
+
     pub fn clear_cache(&mut self) {
         self.path_db.clear_cache();
     }
 }
-

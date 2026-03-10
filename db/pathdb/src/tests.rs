@@ -161,3 +161,48 @@ fn test_committed_difflayers_disabled_skips_pinning() {
     db.commit_difflayer(1, B256::ZERO, &Some(non_empty_difflayer)).unwrap();
     assert_eq!(db.committed_difflayers_depth(), 0);
 }
+
+#[test]
+fn test_commit_difflayers_batches_range() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path();
+    let db = PathDB::new(db_path.to_str().unwrap(), PathProviderConfig::default()).unwrap();
+
+    let mut first_nodes = HashMap::new();
+    first_nodes.insert(vec![0x01], Arc::new(TrieNode::new(None, Some(vec![0xAA]))));
+    let mut first_storage_roots = HashMap::new();
+    first_storage_roots.insert(B256::from([0x11; 32]), B256::from([0x22; 32]));
+
+    let mut second_nodes = HashMap::new();
+    second_nodes.insert(vec![0x02], Arc::new(TrieNode::new(None, Some(vec![0xBB]))));
+    let mut second_storage_roots = HashMap::new();
+    second_storage_roots.insert(B256::from([0x33; 32]), B256::from([0x44; 32]));
+
+    let commits = vec![
+        (
+            1,
+            B256::from([0x01; 32]),
+            Some(Arc::new(DiffLayer::new(Arc::new(first_nodes), Arc::new(first_storage_roots)))),
+        ),
+        (
+            2,
+            B256::from([0x02; 32]),
+            Some(Arc::new(DiffLayer::new(Arc::new(second_nodes), Arc::new(second_storage_roots)))),
+        ),
+    ];
+
+    db.commit_difflayers(&commits).unwrap();
+
+    assert_eq!(db.latest_persist_state().unwrap(), (2, B256::from([0x02; 32])));
+    assert_eq!(db.get_raw_trie_node(&[0x01]).unwrap(), Some(vec![0xAA]));
+    assert_eq!(db.get_raw_trie_node(&[0x02]).unwrap(), Some(vec![0xBB]));
+    assert_eq!(
+        db.get_storage_root(B256::from([0x11; 32])).unwrap(),
+        Some(B256::from([0x22; 32]))
+    );
+    assert_eq!(
+        db.get_storage_root(B256::from([0x33; 32])).unwrap(),
+        Some(B256::from([0x44; 32]))
+    );
+    assert_eq!(db.committed_difflayers_depth(), 2);
+}

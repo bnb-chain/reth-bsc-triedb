@@ -20,12 +20,15 @@ use crate::triedb::{TrieDB, TrieDBError};
 /// We intentionally avoid Rayon global pool to prevent interference with other subsystems that
 /// also use rayon. This makes triedb's parallel sections more predictable under load.
 ///
-/// Thread count is fixed to 48 to avoid interference with other rayon users.
+/// Thread count is capped so triedb does not oversubscribe the machine when the
+/// engine tree and Tokio blocking pools are also active.
 static TRIEDB_RAYON_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 #[inline]
 fn triedb_rayon_num_threads() -> usize {
-    48
+    std::thread::available_parallelism()
+        .map(|num| ((num.get().saturating_add(1)) / 2).clamp(1, 24))
+        .unwrap_or(8)
 }
 
 #[inline]
@@ -702,28 +705,73 @@ where
     fn commit_state_objects(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
         let mut merged_node_set = Box::new(MergedNodeSet::new());
 
-        // Start both tasks in parallel using rayon
-        let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
+        // Keep the single account trie clone for failure isolation, but move the storage tries
+        // out so we stop cloning every storage trie before commit.
+        let mut account_trie_clone = self
+            .account_trie
+            .as_mut()
+            .expect("account trie must be initialized")
+            .clone();
+        let storage_tries = std::mem::take(&mut self.storage_tries);
+
         let join_start = Instant::now();
-        let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) =
+        let (account_commit_result, storage_commit_results): (
+            Result<(B256, Option<Arc<NodeSet>>), TrieDBError>,
+            Vec<(B256, StateTrie<DB>, Result<Option<Arc<NodeSet>>, TrieDBError>)>,
+        ) =
             triedb_rayon_pool().install(|| rayon::join(
-            || account_trie_clone.commit(true),
-            || self.storage_tries
-                .par_iter()
-                .map(|(hashed_address, trie)| {
-                    let (_, node_set) = trie.clone().commit(false).unwrap();
-                    (*hashed_address, node_set)
+            || account_trie_clone.commit(true).map_err(TrieDBError::from),
+            || storage_tries
+                .into_par_iter()
+                .map(|(hashed_address, mut trie)| {
+                    let result = trie
+                        .commit(false)
+                        .map(|(_, node_set)| node_set)
+                        .map_err(TrieDBError::from);
+                    (hashed_address, trie, result)
                 })
                 .collect()
         ));
         let join_elapsed = join_start.elapsed();
 
-        let (root_hash, account_node_set) = account_commit_result?;
+        let (root_hash, account_node_set) = match account_commit_result {
+            Ok(result) => result,
+            Err(err) => {
+                self.storage_tries = storage_commit_results
+                    .into_iter()
+                    .map(|(hashed_address, trie, _)| (hashed_address, trie))
+                    .collect();
+                return Err(err);
+            }
+        };
+
+        let mut storage_node_sets = Vec::with_capacity(storage_commit_results.len());
+        let mut storage_tries_to_restore = HashMap::with_capacity(storage_commit_results.len());
+        let mut storage_commit_error = None;
+        for (hashed_address, trie, node_set_result) in storage_commit_results {
+            match node_set_result {
+                Ok(node_set) => storage_node_sets.push((hashed_address, node_set)),
+                Err(err) => {
+                    if storage_commit_error.is_none() {
+                        storage_commit_error = Some(err);
+                    }
+                }
+            }
+            storage_tries_to_restore.insert(hashed_address, trie);
+        }
+
+        if let Some(err) = storage_commit_error {
+            self.storage_tries = storage_tries_to_restore;
+            return Err(err);
+        }
 
         let merge_start = Instant::now();
         // Pre-allocate the merged difflayer to avoid rehashing.
         let total_entries: usize = account_node_set.as_ref().map_or(0, |ns| ns.difflayer.len())
-            + storage_commit_results.iter().map(|(_, ns)| ns.as_ref().map_or(0, |ns| ns.difflayer.len())).sum::<usize>();
+            + storage_node_sets
+                .iter()
+                .map(|(_, ns)| ns.as_ref().map_or(0, |ns| ns.difflayer.len()))
+                .sum::<usize>();
         merged_node_set.difflayer.reserve(total_entries);
 
         if let Some(node_set) = account_node_set {
@@ -731,7 +779,7 @@ where
                 .map_err(TrieDBError::Database)?;
         }
 
-        for (_, node_set) in storage_commit_results {
+        for (_, node_set) in storage_node_sets {
             if let Some(node_set) = node_set {
                 merged_node_set.merge(node_set)
                     .map_err(TrieDBError::Database)?;
@@ -1026,4 +1074,3 @@ where
         Ok((root_hash, difflayer))
     }
 }
-
