@@ -19,13 +19,19 @@ pub struct FullNode {
     pub flags: NodeFlag,
 }
 
-impl FullNode {
-    /// Creates a new empty full node
-    pub fn new() -> Self {
+impl Default for FullNode {
+    fn default() -> Self {
         Self {
             children: std::array::from_fn(|_| Node::empty_root()),
             flags: NodeFlag::default(),
         }
+    }
+}
+
+impl FullNode {
+    /// Creates a new empty full node
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Get the cached hash and dirty state
@@ -72,7 +78,7 @@ impl FullNode {
     pub fn to_rlp(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.encode(&mut buf);
-        return buf;
+        buf
     }
 
     /// Decode the node from RLP bytes
@@ -97,7 +103,7 @@ impl Encodable for FullNode {
         let mut temp_buf = Vec::new();
 
         // Encode all children nodes (0-16)
-        for (_, child) in self.children.iter().enumerate() {
+        for child in self.children.iter() {
             match child.as_ref() {
                 Node::Empty => {
                     // Empty root encoded as empty string [0x80]
@@ -113,11 +119,11 @@ impl Encodable for FullNode {
                 }
                 Node::Hash(hash_node) => {
                     // Hash nodes encoded as byte strings
-                    write_bytes(&mut temp_buf, &hash_node.as_slice());
+                    write_bytes(&mut temp_buf, hash_node.as_slice());
                 }
                 Node::Value(value_node) => {
                     // Value nodes encoded as byte strings
-                    write_bytes(&mut temp_buf, &value_node.as_slice());
+                    write_bytes(&mut temp_buf, value_node.as_slice());
                 }
             }
         }

@@ -90,7 +90,7 @@ where
     /// Gets the storage trie for an account
     fn get_storage_trie(&mut self, address: Address) -> Result<StateTrie<DB>, TrieDBError> {
         let hashed_address = keccak256(address.as_slice());
-        return Ok(self.get_storage_trie_with_hash_state(hashed_address)?);
+        self.get_storage_trie_with_hash_state(hashed_address)
     }
 
     /// Gets the storage trie for an hash address

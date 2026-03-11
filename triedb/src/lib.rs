@@ -3,6 +3,8 @@
 // Note: Global allocator is configured by the parent project (reth-bsc)
 // This crate supports jemalloc feature for dependency resolution but doesn't define global allocator
 
+#![allow(clippy::type_complexity, clippy::box_collection)]
+
 pub mod triedb;
 pub mod triedb_basic;
 pub mod triedb_manager;

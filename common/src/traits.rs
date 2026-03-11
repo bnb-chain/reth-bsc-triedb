@@ -80,6 +80,13 @@ pub trait TrieDatabase {
         None
     }
 
+    /// Resets trie-node cache hit/miss counters to zero, if the backend supports it.
+    ///
+    /// After reset, the next read of `trie_node_cache_counters()` reflects only activity
+    /// since this call. Default is a no-op.
+    #[inline]
+    fn reset_trie_node_cache_counters(&self) {}
+
     /// Returns counters for RocksDB reads of trie nodes, if available.
     ///
     /// Return value is:
@@ -242,6 +249,22 @@ pub trait TrieDatabase {
     /// changes in the diff layer are persisted, or none are. This is critical
     /// for maintaining database consistency.
     fn commit_difflayer(&self, block_number: u64, state_root: B256, difflayer: &Option<Arc<DiffLayer>>) -> Result<(), Self::Error>;
+
+    /// Commits multiple diff layers to the database in order.
+    ///
+    /// The default implementation preserves the existing behavior by applying
+    /// each layer sequentially via [`commit_difflayer`](Self::commit_difflayer).
+    /// Backends can override this to batch the whole range into a single
+    /// storage-level write.
+    fn commit_difflayers(
+        &self,
+        difflayers: &[(u64, B256, Option<Arc<DiffLayer>>)],
+    ) -> Result<(), Self::Error> {
+        for (block_number, state_root, difflayer) in difflayers {
+            self.commit_difflayer(*block_number, *state_root, difflayer)?;
+        }
+        Ok(())
+    }
 
     /// Retrieves the latest persisted state information from the database.
     ///

@@ -20,12 +20,15 @@ use crate::triedb::{TrieDB, TrieDBError};
 /// We intentionally avoid Rayon global pool to prevent interference with other subsystems that
 /// also use rayon. This makes triedb's parallel sections more predictable under load.
 ///
-/// Thread count is fixed to 48 to avoid interference with other rayon users.
+/// Thread count is capped so triedb does not oversubscribe the machine when the
+/// engine tree and Tokio blocking pools are also active.
 static TRIEDB_RAYON_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 #[inline]
 fn triedb_rayon_num_threads() -> usize {
-    48
+    std::thread::available_parallelism()
+        .map(|num| ((num.get().saturating_add(1)) / 2).clamp(1, 24))
+        .unwrap_or(8)
 }
 
 #[inline]
@@ -160,10 +163,9 @@ where
     where
         DB: 'static,
     {
-        
         self.state_at(parent_root, difflayer, prefetcher)?;
         self.intermediate_inner(states, storage_states, states_rebuild)?;
-        return self.commit_inner(true)
+        self.commit_inner(true)
     }
 
     fn intermediate_inner(
@@ -221,7 +223,7 @@ where
             "intermediate_inner timing"
         );
 
-        return Ok(root_hash);
+        Ok(root_hash)
     }
 
     fn update_state_objects (
@@ -275,12 +277,19 @@ where
 
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
-        let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
+        let difflayer_clone = self.difflayer.clone();
         let accounts_clone = accounts.clone();
         let storages_keys: HashSet<B256> = storages.keys().cloned().collect();
         let storages_for_task2 = storages;
         let metrics_clone = self.metrics.clone();
-        let prefetcher_clone = self.prefetcher.clone();
+        // Extract storage tries from prefetcher for zero-copy transfer to parallel tasks.
+        // Each par_iter thread takes ownership via Mutex::lock().remove() instead of cloning.
+        // NOTE: This take is intentional and one-shot. Each prefetcher instance is consumed by
+        // exactly one commit_hashed_post_state call. The taken storage tries are distributed to
+        // parallel tasks via Mutex::lock().remove() for zero-copy ownership transfer.
+        // storage_roots (used for root lookups above) remain accessible on self.prefetcher.
+        let prefetcher_storage_tries = self.prefetcher.as_mut()
+            .map(|p| std::sync::Mutex::new(std::mem::take(&mut p.storage_tries)));
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root_with_source =
@@ -328,7 +337,7 @@ where
                     .map(|(hashed_address, account)| {
                         match account {
                             Some(account) => {
-                                let mut new_account = account.clone();
+                                let mut new_account = *account;
                                 let (storage_root, _src) = get_storage_root_with_source(*hashed_address)?;
                                 new_account.storage_root = storage_root;
                                 Ok((*hashed_address, (Some(new_account), storage_root)))
@@ -369,10 +378,10 @@ where
                         let item_start = Instant::now();
                         let kvs_len = kvs.len();
 
-                        // Try to get storage_trie from prefetcher, otherwise create a new one
-                        let (mut storage_trie, prefetch_storage_trie_hit, storage_root_source) = match prefetcher_clone.as_ref()
-                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                            .cloned()
+                        // Try to take storage_trie from prefetcher (zero-copy), otherwise create a new one
+                        let (mut storage_trie, prefetch_storage_trie_hit, storage_root_source) = match prefetcher_storage_tries
+                            .as_ref()
+                            .and_then(|m| m.lock().ok()?.remove(&hashed_address))
                         {
                             Some(trie) => (trie, true, "prefetcher-storage-trie"),
                             None => {
@@ -387,15 +396,6 @@ where
                                 (trie, false, src)
                             }
                         };
-                        
-                        // Get storage root from path_db or difflayer (same logic as task 1)
-                        // let storage_root = get_storage_root(hashed_address)?;
-                        // let id = SecureTrieId::new(storage_root)
-                        //     .with_owner(hashed_address);
-                        // let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
-                        //     .with_id(id)
-                        //     .build_with_difflayer(difflayer_clone.as_ref())
-                        //     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
 
                         // Apply updates before deletes (Geth-style). This reduces structural churn
                         // (collapse/split) during a batch of writes.
@@ -441,7 +441,7 @@ where
                         let hash_start = Instant::now();
                         let new_storage_root = storage_trie.hash();
                         let hash_duration = hash_start.elapsed();
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
+                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap();
                         new_account.storage_root = new_storage_root;
 
                         let duration = item_start.elapsed();
@@ -500,7 +500,7 @@ where
         let (accounts_with_storage, roots_with_storage, storage_tries, slowest_storage) = storage_result?;
 
         accounts_no_storage.extend(accounts_with_storage);
-        roots_no_storage.extend(roots_with_storage.into_iter());
+        roots_no_storage.extend(*roots_with_storage);
 
         self.storage_tries = storage_tries;
         self.updated_storage_roots = roots_no_storage;
@@ -549,8 +549,6 @@ where
                 slowest_trie_value_alloc_bytes_total,
                 slowest_trie_insert_internal_calls,
                 slowest_trie_delete_internal_calls,
-                slowest_trie_prefix_clone_bytes_total,
-                slowest_trie_key_slice_to_vec_bytes_total,
                 slowest_trie_shortnode_split_count,
                 slowest_trie_fullnode_collapse_count,
                 slowest_trie_resolve_calls,
@@ -572,8 +570,6 @@ where
                         s.value_alloc_bytes_total,
                         s.insert_internal_calls,
                         s.delete_internal_calls,
-                        s.prefix_clone_bytes_total,
-                        s.key_slice_to_vec_bytes_total,
                         s.shortnode_split_count,
                         s.fullnode_collapse_count,
                         s.resolve_calls,
@@ -586,7 +582,7 @@ where
                     )
                 })
                 .unwrap_or((
-                    false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ));
             debug!(
                 target: "triedb::update_state_objects",
@@ -627,8 +623,6 @@ where
                 slowest_trie_value_alloc_bytes_total,
                 slowest_trie_insert_internal_calls,
                 slowest_trie_delete_internal_calls,
-                slowest_trie_prefix_clone_bytes_total,
-                slowest_trie_key_slice_to_vec_bytes_total,
                 slowest_trie_shortnode_split_count,
                 slowest_trie_fullnode_collapse_count,
                 slowest_trie_resolve_calls,
@@ -687,7 +681,7 @@ where
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
         let diff_roots_start = Instant::now();
-        let diff_storage_roots = Arc::from(*self.updated_storage_roots.clone());
+        let diff_storage_roots = Arc::new(*std::mem::take(&mut self.updated_storage_roots));
         let diff_roots_elapsed = diff_roots_start.elapsed();
 
         let clean_start = Instant::now();
@@ -711,34 +705,84 @@ where
     fn commit_state_objects(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {        
         let mut merged_node_set = Box::new(MergedNodeSet::new());
 
-        // Start both tasks in parallel using rayon
-        let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
+        // Keep the single account trie clone for failure isolation, but move the storage tries
+        // out so we stop cloning every storage trie before commit.
+        let mut account_trie_clone = self
+            .account_trie
+            .as_mut()
+            .expect("account trie must be initialized")
+            .clone();
+        let storage_tries = std::mem::take(&mut self.storage_tries);
+
         let join_start = Instant::now();
-        let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) =
+        let (account_commit_result, storage_commit_results): (
+            Result<(B256, Option<Arc<NodeSet>>), TrieDBError>,
+            Vec<(B256, StateTrie<DB>, Result<Option<Arc<NodeSet>>, TrieDBError>)>,
+        ) =
             triedb_rayon_pool().install(|| rayon::join(
-            || account_trie_clone.commit(true),
-            || self.storage_tries
-                .par_iter()
-                .map(|(hashed_address, trie)| {
-                    let (_, node_set) = trie.clone().commit(false).unwrap();
-                    (*hashed_address, node_set)
+            || account_trie_clone.commit(true).map_err(TrieDBError::from),
+            || storage_tries
+                .into_par_iter()
+                .map(|(hashed_address, mut trie)| {
+                    let result = trie
+                        .commit(false)
+                        .map(|(_, node_set)| node_set)
+                        .map_err(TrieDBError::from);
+                    (hashed_address, trie, result)
                 })
                 .collect()
         ));
         let join_elapsed = join_start.elapsed();
 
-        let (root_hash, account_node_set) = account_commit_result?;
+        let (root_hash, account_node_set) = match account_commit_result {
+            Ok(result) => result,
+            Err(err) => {
+                self.storage_tries = storage_commit_results
+                    .into_iter()
+                    .map(|(hashed_address, trie, _)| (hashed_address, trie))
+                    .collect();
+                return Err(err);
+            }
+        };
 
-        let merge_start = Instant::now();
-        if let Some(node_set) = account_node_set {
-            merged_node_set.merge(node_set)
-                .map_err(|e| TrieDBError::Database(e))?;
+        let mut storage_node_sets = Vec::with_capacity(storage_commit_results.len());
+        let mut storage_tries_to_restore = HashMap::with_capacity(storage_commit_results.len());
+        let mut storage_commit_error = None;
+        for (hashed_address, trie, node_set_result) in storage_commit_results {
+            match node_set_result {
+                Ok(node_set) => storage_node_sets.push((hashed_address, node_set)),
+                Err(err) => {
+                    if storage_commit_error.is_none() {
+                        storage_commit_error = Some(err);
+                    }
+                }
+            }
+            storage_tries_to_restore.insert(hashed_address, trie);
         }
 
-        for (_, node_set) in storage_commit_results {
+        if let Some(err) = storage_commit_error {
+            self.storage_tries = storage_tries_to_restore;
+            return Err(err);
+        }
+
+        let merge_start = Instant::now();
+        // Pre-allocate the merged difflayer to avoid rehashing.
+        let total_entries: usize = account_node_set.as_ref().map_or(0, |ns| ns.difflayer.len())
+            + storage_node_sets
+                .iter()
+                .map(|(_, ns)| ns.as_ref().map_or(0, |ns| ns.difflayer.len()))
+                .sum::<usize>();
+        merged_node_set.difflayer.reserve(total_entries);
+
+        if let Some(node_set) = account_node_set {
+            merged_node_set.merge(node_set)
+                .map_err(TrieDBError::Database)?;
+        }
+
+        for (_, node_set) in storage_node_sets {
             if let Some(node_set) = node_set {
                 merged_node_set.merge(node_set)
-                    .map_err(|e| TrieDBError::Database(e))?;
+                    .map_err(TrieDBError::Database)?;
             }
         }
         let merge_elapsed = merge_start.elapsed();
@@ -755,11 +799,11 @@ where
     }
 
     pub fn intermediate_and_commit_hashed_post_state(
-        &mut self, 
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
-        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
+        &mut self,
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: TrieDBHashedPostState,
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) ->
         Result<(B256, Arc<DiffLayer>), TrieDBError>
     where
         DB: 'static,
@@ -775,16 +819,26 @@ where
         let state_at_elapsed = state_at_start.elapsed();
 
         let intermediate_start = Instant::now();
+        self.path_db.reset_trie_node_cache_counters();
         self.intermediate_inner(
-            hashed_post_state.states.clone(),
-            hashed_post_state.storage_states.clone(),
-            hashed_post_state.states_rebuild.clone(),
+            hashed_post_state.states,
+            hashed_post_state.storage_states,
+            hashed_post_state.states_rebuild,
         )?;
         let intermediate_elapsed = intermediate_start.elapsed();
 
         let commit_start = Instant::now();
         let out = self.commit(true)?;
         let commit_elapsed = commit_start.elapsed();
+
+        let (trie_node_cache_hits, trie_node_cache_misses) =
+            self.path_db.trie_node_cache_counters().unwrap_or((0, 0));
+        let trie_node_cache_total = trie_node_cache_hits + trie_node_cache_misses;
+        let trie_node_cache_hit_ratio = if trie_node_cache_total > 0 {
+            trie_node_cache_hits as f64 / trie_node_cache_total as f64
+        } else {
+            0.0
+        };
 
         debug!(
             target: "triedb::intermediate_and_commit_hashed_post_state",
@@ -797,6 +851,9 @@ where
             intermediate_ms = intermediate_elapsed.as_secs_f64() * 1000.0,
             commit_ms = commit_elapsed.as_secs_f64() * 1000.0,
             total_ms = call_start.elapsed().as_secs_f64() * 1000.0,
+            trie_node_cache_hits,
+            trie_node_cache_misses,
+            trie_node_cache_hit_ratio = %format!("{:.4}", trie_node_cache_hit_ratio),
             "intermediate_and_commit_hashed_post_state timing"
         );
 
@@ -805,19 +862,19 @@ where
 
     pub fn intermediate_hashed_post_state(
         &mut self,
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: TrieDBHashedPostState,
         prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>
     ) -> Result<B256, TrieDBError>
     where
         DB: 'static,
     {
         self.state_at(parent_root, difflayer, prefetcher)?;
-        return self.intermediate_inner(
-            hashed_post_state.states.clone(), 
-            hashed_post_state.storage_states.clone(), 
-            hashed_post_state.states_rebuild.clone());
+        self.intermediate_inner(
+            hashed_post_state.states,
+            hashed_post_state.storage_states,
+            hashed_post_state.states_rebuild)
     }
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError> 
@@ -825,34 +882,48 @@ where
         DB: 'static,
     {
         let (root_hash, node_set, diff_storage_roots) = self.commit_inner(true)?;
-        let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
-        Ok((root_hash, difflayer)) 
+        // Avoid cloning the entire difflayer HashMap: try_unwrap succeeds when
+        // refcount == 1 (always true here since commit_inner just created the Arc).
+        let diff_nodes = match Arc::try_unwrap(node_set) {
+            Ok(ns) => ns.into_diff_nodes(),
+            Err(ns) => ns.to_diff_nodes(),
+        };
+        let difflayer = Arc::new(DiffLayer::new(diff_nodes, diff_storage_roots));
+        Ok((root_hash, difflayer))
     }
 
     pub fn intermediate_and_commit_hashed_post_state_v2(
-        &mut self, 
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
-        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> 
+        &mut self,
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: TrieDBHashedPostState,
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) ->
         Result<(B256, Arc<DiffLayer>), TrieDBError>
     where
         DB: 'static,
     {
         self.state_at(parent_root, difflayer, prefetcher)?;
 
+        // Destructure to avoid cloning — move owned data directly into parallel tasks.
+        let TrieDBHashedPostState { states: accounts_clone, storage_states, states_rebuild } = hashed_post_state;
+
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
-        let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
-        let accounts_clone = hashed_post_state.states.clone();
-        let storages_keys: HashSet<B256> = hashed_post_state.storage_states.keys().cloned().collect();
-        let storages_for_task2 = hashed_post_state.storage_states.clone();
+        let difflayer_clone = self.difflayer.clone();
+        let storages_keys: HashSet<B256> = storage_states.keys().cloned().collect();
+        let storages_for_task2 = storage_states;
         let metrics_clone = self.metrics.clone();
-        let prefetcher_clone = self.prefetcher.clone();
+        // Extract storage tries from prefetcher for zero-copy transfer to parallel tasks.
+        // NOTE: This take is intentional and one-shot. Each prefetcher instance is consumed by
+        // exactly one intermediate_and_commit call. The taken storage tries are distributed to
+        // parallel tasks via Mutex::lock().remove() for zero-copy ownership transfer.
+        // storage_roots (used for root lookups above) remain accessible on self.prefetcher.
+        let prefetcher_storage_tries = self.prefetcher.as_mut()
+            .map(|p| std::sync::Mutex::new(std::mem::take(&mut p.storage_tries)));
 
         // Closure to get storage root from difflayer or path_db
         let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
-            if hashed_post_state.states_rebuild.contains(&hashed_address) {
+            if states_rebuild.contains(&hashed_address) {
                 return Ok(alloy_trie::EMPTY_ROOT_HASH);
             }
 
@@ -886,7 +957,7 @@ where
                     .map(|(hashed_address, account)| {
                         match account {
                             Some(account) => {
-                                let mut new_account = account.clone();
+                                let mut new_account = *account;
                                 let storage_root = get_storage_root(*hashed_address)?;
                                 new_account.storage_root = storage_root;
                                 Ok((*hashed_address, (Some(new_account), storage_root)))
@@ -916,10 +987,10 @@ where
                     .into_par_iter()
                     .map(|(hashed_address, kvs)| {
 
-                        // Try to get storage_trie from prefetcher, otherwise create a new one
-                        let mut storage_trie = match prefetcher_clone.as_ref()
-                            .and_then(|p| p.storage_tries.get(&hashed_address))
-                            .cloned()
+                        // Try to take storage_trie from prefetcher (zero-copy), otherwise create a new one
+                        let mut storage_trie = match prefetcher_storage_tries
+                            .as_ref()
+                            .and_then(|m| m.lock().ok()?.remove(&hashed_address))
                         {
                             Some(trie) => trie,
                             None => {
@@ -927,10 +998,11 @@ where
                                 let storage_root = get_storage_root(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
-                                SecureTrieBuilder::new(path_db_clone.clone())
+                                let trie = SecureTrieBuilder::new(path_db_clone.clone())
                                     .with_id(id)
                                     .build_with_difflayer(difflayer_clone.as_ref())
-                                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?
+                                    .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+                                trie
                             }
                         };
 
@@ -947,7 +1019,7 @@ where
                         }
 
                         let (new_storage_root, node_set) = storage_trie.commit(false)?;
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
+                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap();
                         new_account.storage_root = new_storage_root;
 
                         Ok((hashed_address, (Some(new_account), new_storage_root, node_set)))
@@ -975,9 +1047,9 @@ where
         let (accounts_with_storage, roots_with_storage, mut merged_node_set) = storage_result?;
 
         accounts_no_storage.extend(accounts_with_storage);
-        roots_no_storage.extend(roots_with_storage.into_iter());
+        roots_no_storage.extend(*roots_with_storage);
 
-        for hashed_address in hashed_post_state.states_rebuild.clone() {
+        for hashed_address in states_rebuild {
             self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
         }
@@ -997,10 +1069,8 @@ where
             merged_node_set.merge(node_set).unwrap();
         }
 
-        let difflayer = Arc::new(DiffLayer::new(merged_node_set.to_diff_nodes(), Arc::from(*roots_no_storage)));
+        let difflayer = Arc::new(DiffLayer::new((*merged_node_set).into_diff_nodes(), Arc::from(*roots_no_storage)));
         self.clean();
         Ok((root_hash, difflayer))
     }
 }
-
-

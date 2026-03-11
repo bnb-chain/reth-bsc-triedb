@@ -27,15 +27,23 @@ impl<'a> Committer<'a> {
         Self { nodes: nodeset, tracer, collect_leaf }
     }
 
+    /// Extracts the committed nodeset, moving it out without cloning on the hot path.
+    pub fn into_nodeset(self) -> NodeSet {
+        match Arc::try_unwrap(self.nodes) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(nodes) => nodes.lock().unwrap().clone(),
+        }
+    }
+
     /// Commit a node and return the hash of the committed node.
     pub fn commit(&mut self, node: Arc<Node>, parallel: bool) -> Arc<Node> {
         let node = self.commit_internal(vec![], node, parallel);
         match node.as_ref() {
             Node::Hash(_) => {
-                return node;
+                node
             }
             _ => panic!("Node is not a hash"),
-        };
+        }
     }
 }
 
@@ -78,7 +86,7 @@ impl<'a> Committer<'a> {
                     return committed_node;
                 }
 
-                return Arc::new(Node::Short(Arc::new(collapsed)));
+                Arc::new(Node::Short(Arc::new(collapsed)))
             }
             Node::Full(full) => {
                 let hashed_children = self.commit_children(
@@ -97,10 +105,10 @@ impl<'a> Committer<'a> {
                     return Arc::new(Node::Hash(*hash));
                 }
 
-                return Arc::new(Node::Full(Arc::new(collapsed)));
+                Arc::new(Node::Full(Arc::new(collapsed)))
             }
             Node::Hash(_) => {
-                return node;
+                node
             }
             _ => {
                 panic!("Node is not a short or full node to commit");
@@ -118,7 +126,15 @@ impl<'a> Committer<'a> {
     ) -> [Arc<Node>; 17] {
         let mut children: [Arc<Node>; 17] = std::array::from_fn(|_| Node::empty_root());
 
-        if parallel {
+        // Only use parallel commit when there are enough non-empty children
+        // to justify the rayon task scheduling overhead.
+        let non_empty_count = if parallel {
+            full.children.iter().take(16).filter(|c| !matches!(c.as_ref(), Node::Empty)).count()
+        } else {
+            0
+        };
+
+        if parallel && non_empty_count >= 2 {
             use rayon::prelude::*;
 
             let collect_leaf = self.collect_leaf;
@@ -153,12 +169,11 @@ impl<'a> Committer<'a> {
                             child, 
                             false);
                     
-                    {
-                        let nodeset = child_committer.nodes.lock().unwrap();
-                        let mut nodeset_parent = self.nodes.lock().unwrap();
-                        nodeset_parent.merge_set(&nodeset)
-                            .expect("owner mismatch while merging nodesets");
-                    }
+                    let child_nodeset = child_committer.into_nodeset();
+                    let mut nodeset_parent = self.nodes.lock().unwrap();
+                    nodeset_parent
+                        .merge_owned(child_nodeset)
+                        .expect("owner mismatch while merging nodesets");
                     Some((i, committed_child))
                 })
                 .collect();
@@ -167,8 +182,8 @@ impl<'a> Committer<'a> {
                 children[i] = committed_child;
             }
         } else {
-            for i in 0..16 {
-                if let Node::Empty = full.children[i].as_ref() {
+            for (i, child) in full.children.iter().enumerate().take(16) {
+                if let Node::Empty = child.as_ref() {
                     continue;
                 }
 
@@ -176,8 +191,8 @@ impl<'a> Committer<'a> {
                 path_child.push(i as u8); // i is a hex digit, so it's 1 byte
 
                 children[i] = self.commit_internal(
-                    path_child, 
-                    full.children[i].clone(), 
+                    path_child,
+                    child.clone(),
                     false);
             }
         }
@@ -220,7 +235,6 @@ impl<'a> Committer<'a> {
             }
         }
         
-        return Arc::new(Node::Hash(hash.unwrap()));
+        Arc::new(Node::Hash(hash.unwrap()))
     }
 }
-

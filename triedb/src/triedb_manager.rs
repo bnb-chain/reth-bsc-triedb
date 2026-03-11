@@ -39,7 +39,7 @@ pub fn disable_triedb() {
 
 // Check if the active_triedb flag is enabled
 pub fn is_triedb_active() -> bool {
-    ACTIVE_TRIEDB.get().map_or(false, |&b| b)
+    ACTIVE_TRIEDB.get().is_some_and(|&b| b)
 }
 
 /// Global TrieDB Manager

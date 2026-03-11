@@ -9,9 +9,9 @@ pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 pub const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 64 * 1024 * 1024; // 64MB
 pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
 pub const DEFAULT_CREATE_IF_MISSING: bool = true;
-/// Default byte-weighted capacity for the trie node MokaCache (512MB).
+/// Default byte-weighted capacity for the trie node cache (512MB).
 pub const DEFAULT_TRIE_NODE_CACHE_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
-/// Default byte-weighted capacity for the storage root MokaCache (64MB).
+/// Default byte-weighted capacity for the storage root cache (64MB).
 pub const DEFAULT_STORAGE_ROOT_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 /// Default number of recently-committed diff layers to pin in memory (128 blocks, matching geth-BSC).
 pub const DEFAULT_MAX_COMMITTED_DIFFLAYERS: usize = 128;
@@ -23,7 +23,10 @@ pub const DEFAULT_MAX_COMMITTED_DIFFLAYERS: usize = 128;
 // based on machine memory and workload.
 pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8GB
 pub const DEFAULT_BLOOM_FILTER_BITS_PER_KEY: f64 = 10.0;
-pub const DEFAULT_BLOOM_FILTER_BLOCK_BASED: bool = true;
+/// Full bloom filters (false = full filter per SST) are faster for point lookups
+/// than block-based bloom filters. Only block-based saves memory at the cost of
+/// extra I/O per lookup.
+pub const DEFAULT_BLOOM_FILTER_BLOCK_BASED: bool = false;
 pub const DEFAULT_CACHE_INDEX_AND_FILTER_BLOCKS: bool = true;
 pub const DEFAULT_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE: bool = true;
 
