@@ -27,6 +27,14 @@ impl<'a> Committer<'a> {
         Self { nodes: nodeset, tracer, collect_leaf }
     }
 
+    /// Extracts the committed nodeset, moving it out without cloning on the hot path.
+    pub fn into_nodeset(self) -> NodeSet {
+        match Arc::try_unwrap(self.nodes) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(nodes) => nodes.lock().unwrap().clone(),
+        }
+    }
+
     /// Commit a node and return the hash of the committed node.
     pub fn commit(&mut self, node: Arc<Node>, parallel: bool) -> Arc<Node> {
         let node = self.commit_internal(vec![], node, parallel);
@@ -161,12 +169,11 @@ impl<'a> Committer<'a> {
                             child, 
                             false);
                     
-                    {
-                        let nodeset = child_committer.nodes.lock().unwrap();
-                        let mut nodeset_parent = self.nodes.lock().unwrap();
-                        nodeset_parent.merge_set(&nodeset)
-                            .expect("owner mismatch while merging nodesets");
-                    }
+                    let child_nodeset = child_committer.into_nodeset();
+                    let mut nodeset_parent = self.nodes.lock().unwrap();
+                    nodeset_parent
+                        .merge_owned(child_nodeset)
+                        .expect("owner mismatch while merging nodesets");
                     Some((i, committed_child))
                 })
                 .collect();
@@ -231,4 +238,3 @@ impl<'a> Committer<'a> {
         Arc::new(Node::Hash(hash.unwrap()))
     }
 }
-

@@ -248,19 +248,12 @@ where
             }
         }
 
-        {
-            self.root = Committer::new(nodes.clone(), &self.tracer, collect_leaf)
-                .commit(
-                    self.root.clone(), 
-                    self.unhashed > 100
-                );
-        }
-
-        // Extract the final NodeSet for returning
-        let nodeset = {
-            let guard = nodes.lock().unwrap();
-            Arc::new(guard.clone())
-        };
+        let mut committer = Committer::new(nodes, &self.tracer, collect_leaf);
+        self.root = committer.commit(
+            self.root.clone(),
+            self.unhashed > 100
+        );
+        let nodeset = Arc::new(committer.into_nodeset());
         self.uncommitted = 0;
         self.committed = true;
 
@@ -340,7 +333,7 @@ where
         };
 
         // Handle empty value (delete) vs non-empty (insert)
-        let mut prefix = Vec::new();
+        let mut prefix = Vec::with_capacity(66);
         if let Some(vn) = value_node {
             let (_, new_root) = self.insert_internal(
                 self.root.clone(),
@@ -388,7 +381,7 @@ where
         };
 
         // Delete the value from the trie
-        let mut prefix = Vec::new();
+        let mut prefix = Vec::with_capacity(66);
         let (_, new_root) = self.delete_internal(
             self.root.clone(),
             &mut prefix,

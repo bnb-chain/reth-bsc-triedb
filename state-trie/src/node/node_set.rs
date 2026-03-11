@@ -19,7 +19,7 @@ pub struct NodeSet {
     /// Leaf nodes
     leaves: Vec<Arc<Leaf>>,
     /// Node map keyed by path
-    pub nodes: HashMap<String, Arc<TrieNode>>,
+    pub nodes: HashMap<Vec<u8>, Arc<TrieNode>>,
     /// Count of updated and inserted nodes
     pub updates: usize,
     /// Count of deleted nodes
@@ -43,8 +43,6 @@ impl NodeSet {
 
     /// Adds a node to the set
     pub fn add_node(&mut self, path: &[u8], node: Arc<TrieNode>) {
-        let path_str = String::from_utf8_lossy(path).to_string();
-
         // Add the new node
         if node.is_deleted() {
             self.deletes += 1;
@@ -57,7 +55,7 @@ impl NodeSet {
         } else {
             self.difflayer.insert(encoding::storage_trie_node_key(self.owner.as_slice(), path), node.clone());
         }
-        self.nodes.insert(path_str, node);
+        self.nodes.insert(path.to_vec(), node);
     }
 
     /// Adds a leaf node to the set
@@ -76,7 +74,7 @@ impl NodeSet {
     }
 
     /// Returns a reference to the nodes map
-    pub fn nodes(&self) -> &HashMap<String, Arc<TrieNode>> {
+    pub fn nodes(&self) -> &HashMap<Vec<u8>, Arc<TrieNode>> {
         &self.nodes
     }
 
@@ -98,6 +96,24 @@ impl NodeSet {
         for (key, node) in other.difflayer.iter() {
             self.difflayer.insert(key.clone(), node.clone());
         }
+
+        Ok(())
+    }
+
+    /// Merges `other` into `self`, consuming `other` to avoid cloning on hot paths.
+    pub fn merge_owned(&mut self, mut other: NodeSet) -> Result<(), String> {
+        if self.owner != other.owner {
+            return Err(format!(
+                "nodesets belong to different owner are not mergeable {:?}-{:?}",
+                self.owner, other.owner
+            ));
+        }
+
+        self.nodes.extend(other.nodes.drain());
+        self.leaves.append(&mut other.leaves);
+        self.updates += other.updates;
+        self.deletes += other.deletes;
+        self.difflayer.extend(std::mem::take(&mut *other.difflayer));
 
         Ok(())
     }
@@ -144,13 +160,11 @@ impl NodeSet {
         }
 
         // 3. nodes (sorted by key)
-        let mut nodes_sorted: Vec<(&String, &Arc<TrieNode>)> = self.nodes.iter().collect();
+        let mut nodes_sorted: Vec<(&Vec<u8>, &Arc<TrieNode>)> = self.nodes.iter().collect();
         nodes_sorted.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
 
         for (key, node) in nodes_sorted {
-            // key length and bytes
-            let key_bytes = key.as_bytes();
-            buf.extend_from_slice(key_bytes);
+            buf.extend_from_slice(key);
 
             // hash field
             if let Some(h) = node.hash {
@@ -195,7 +209,7 @@ impl std::fmt::Debug for NodeSet {
             for path in paths {
                 if let Some(node) = self.nodes.get(path) {
                     if node.is_deleted() {
-                        writeln!(f, "  Path: {:x?} -> DELETED", path.as_bytes())?;
+                        writeln!(f, "  Path: {:x?} -> DELETED", path)?;
                     } else {
                         let hash_str = match node.hash {
                             Some(h) => format!("{:?}", h),
@@ -203,7 +217,7 @@ impl std::fmt::Debug for NodeSet {
                         };
                         let blob_size = node.blob.as_ref().map(|b| b.len()).unwrap_or(0);
                         writeln!(f, "  Path: {:x?} -> Hash: {}, Blob size: {}", 
-                            path.as_bytes(), hash_str, blob_size)?;
+                            path, hash_str, blob_size)?;
                     }
                 }
             }
