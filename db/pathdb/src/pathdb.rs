@@ -247,13 +247,13 @@ impl PathDB {
         let trie_node_cache = Arc::new(
             CacheBuilder::new(trie_node_cache_size as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
-                .max_capacity(trie_node_cache_size as u64 * 2) // Allow many entries
+                .max_capacity(trie_node_cache_size as u64)
                 .build()
         );
         let storage_root_cache = Arc::new(
             CacheBuilder::new(storage_root_cache_size as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
-                .max_capacity(storage_root_cache_size as u64 * 2) // Allow many entries
+                .max_capacity(storage_root_cache_size as u64)
                 .build()
         );
 

@@ -9,17 +9,19 @@ pub const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 pub const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 64 * 1024 * 1024; // 64MB
 pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
 pub const DEFAULT_CREATE_IF_MISSING: bool = true;
-pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 20_000_000; // 2KW entries
-pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 200_000_000; // 20KW entries
+// ~400B/entry (key ~75B + value ~150B + Moka overhead ~175B) → 9M × 400B ≈ 3.5GiB
+pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 9_000_000;
+// ~230B/entry (key 32B + value 32B + Moka overhead ~166B) → 2M × 230B ≈ 0.5GiB
+pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 2_000_000;
 
 // BlockBasedTable configuration constants (directly impacts random reads)
 //
 // NOTE: RocksDB's default block cache is ~8MB if unset, which is far too small
 // for trie node random reads. We expose these explicitly so callers can tune
 // based on machine memory and workload.
-pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8GB
+pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16GB
 pub const DEFAULT_BLOOM_FILTER_BITS_PER_KEY: f64 = 10.0;
-pub const DEFAULT_BLOOM_FILTER_BLOCK_BASED: bool = true;
+pub const DEFAULT_BLOOM_FILTER_BLOCK_BASED: bool = false;
 pub const DEFAULT_CACHE_INDEX_AND_FILTER_BLOCKS: bool = true;
 pub const DEFAULT_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE: bool = true;
 
