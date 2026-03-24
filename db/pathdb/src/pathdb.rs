@@ -239,21 +239,19 @@ impl PathDB {
         let trie_node_cache_size = config.trie_node_cache_size;
         let storage_root_cache_size = config.storage_root_cache_size;
 
-        // Create thread-safe LRU caches using mini_moka for high-concurrency performance
-        // CacheBuilder::new() takes initial capacity estimate
-        // We need to set max_capacity to limit entries, using a weigher that counts each entry as 1
-        // For simplicity, we'll use a very large max_capacity and rely on the initial capacity estimate
-        // to control the actual number of entries (though this is not ideal, it should work for now)
+        // Create thread-safe LRU caches using mini_moka.
+        // max_capacity is the hard entry limit (weigher returns 1 per entry).
+        // CacheBuilder::new(max_capacity) also serves as the initial capacity hint.
         let trie_node_cache = Arc::new(
             CacheBuilder::new(trie_node_cache_size as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
-                .max_capacity(trie_node_cache_size as u64 * 2) // Allow many entries
+                .max_capacity(trie_node_cache_size as u64)
                 .build()
         );
         let storage_root_cache = Arc::new(
             CacheBuilder::new(storage_root_cache_size as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
-                .max_capacity(storage_root_cache_size as u64 * 2) // Allow many entries
+                .max_capacity(storage_root_cache_size as u64)
                 .build()
         );
 
@@ -392,20 +390,30 @@ impl PathDB {
     pub fn exists_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<bool> {
         trace!(target: "pathdb::rocksdb", "Checking existence of key: {:?}", key);
 
+        // Check cache first - cached None means absent, cached Some(_) means present
+        let key_vec = key.to_vec();
+        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            self.metrics.trie_node_cache_hits.increment(1);
+            trace!(target: "pathdb::rocksdb", "Cache hit for exists check, key: {:?}", key);
+            return Ok(cached_value.is_some());
+        }
+        self.metrics.trie_node_cache_misses.increment(1);
+
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
-            
+
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-        // Cache miss, check DB
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
-            Ok(Some(_)) => {
+            Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Key exists in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
+                self.trie_node_cache.insert(key_vec, Some(value));
                 Ok(true)
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key does not exist in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
+                self.trie_node_cache.insert(key_vec, None);
                 Ok(false)
             }
             Err(e) => {
@@ -502,8 +510,8 @@ impl PathDB {
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
-                // Cache None values to avoid repeated DB lookups
-                self.trie_node_cache.invalidate(&key_vec);
+                // Cache the absence to avoid repeated DB lookups
+                self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
@@ -634,43 +642,50 @@ impl TrieDatabase for PathDB {
         let mut diff_storage_roots_len = 0;
 
         let mut batch = WriteBatch::default();
-        {
-            batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
 
-            // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
-            batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
-        
-            self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
-            self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+        batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
+        batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
 
-            if let Some(difflayer) = difflayer {
-                diff_nodes_len = difflayer.diff_nodes.len();
-                diff_storage_roots_len = difflayer.diff_storage_roots.len();
+        // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
+        batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
+        batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
 
-                for (key, node) in difflayer.diff_nodes.iter() {
-                    if node.is_deleted() {
-                        self.trie_node_cache.invalidate(key);
-                        batch.delete_cf(&default_cf, key);
-                    } else {
-                        if let Some(blob) = &node.blob {
-                            self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
-                            batch.put_cf(&default_cf, key, blob);
-                        }
-                    }
+        if let Some(difflayer) = difflayer {
+            diff_nodes_len = difflayer.diff_nodes.len();
+            diff_storage_roots_len = difflayer.diff_storage_roots.len();
+
+            for (key, node) in difflayer.diff_nodes.iter() {
+                if node.is_deleted() {
+                    batch.delete_cf(&default_cf, key);
+                } else if let Some(blob) = &node.blob {
+                    batch.put_cf(&default_cf, key, blob);
                 }
+            }
 
-                for (key, value) in difflayer.diff_storage_roots.iter() {
-                    self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
-                    batch.put_cf(&storage_root_cf, key.as_slice(), value.as_slice());
-                }
+            for (key, value) in difflayer.diff_storage_roots.iter() {
+                batch.put_cf(&storage_root_cf, key.as_slice(), value.as_slice());
             }
         }
 
-        // Write batch and update caches after successful write - mini_moka is thread-safe
+        // Write batch first; only update caches on success to keep them consistent with DB.
         match self.db.write_opt(batch, &self.write_options) {
             Ok(()) => {
+                self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
+                self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+
+                if let Some(difflayer) = difflayer {
+                    for (key, node) in difflayer.diff_nodes.iter() {
+                        if node.is_deleted() {
+                            self.trie_node_cache.invalidate(key);
+                        } else if let Some(blob) = &node.blob {
+                            self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                        }
+                    }
+                    for (key, value) in difflayer.diff_storage_roots.iter() {
+                        self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
+                    }
+                }
+
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())
             }
@@ -678,7 +693,6 @@ impl TrieDatabase for PathDB {
                 error!(target: "pathdb::batch", "Error committing batch: block_number: {}, state_root: {:?}, error: {}", block_number, state_root, e);
                 Err(PathProviderError::Database(format!("Batch commit error: {}", e)))
             }
-
         }
     }
 }

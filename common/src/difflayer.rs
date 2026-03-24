@@ -94,7 +94,7 @@ pub struct DiffLayer {
 impl DiffLayer {
     /// Create a new diff layer
     pub fn new(diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>, diff_storage_roots: Arc<HashMap<B256, B256>>) -> Self {
-        Self { diff_nodes: diff_nodes.clone(), diff_storage_roots: diff_storage_roots.clone() }
+        Self { diff_nodes, diff_storage_roots }
     }
 
     /// Get a trie node by prefix
