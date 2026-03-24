@@ -168,8 +168,10 @@ where
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             }
         }
+        let hash_start = Instant::now();
         let root_hash = self.account_trie.as_mut().unwrap().hash();
-        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());     
+        self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
+        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
         return Ok(root_hash);
     }
 
@@ -197,15 +199,18 @@ where
 
             if let Some(prefetcher) = &self.prefetcher {
                 if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
+                    metrics_clone.increment_storage_root_from_prefetcher_counter();
                     return Ok(*root);
                 }
             }
 
             if let Some(dl) = difflayer_clone.as_ref() {
                 if let Some(root) = dl.get_storage_root(hashed_address) {
+                    metrics_clone.increment_storage_root_from_difflayer_counter();
                     return Ok(root);
                 }
             }
+            metrics_clone.increment_storage_root_from_pathdb_counter();
             path_db_clone.get_storage_root(hashed_address)
                 .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))
                 .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
@@ -273,15 +278,6 @@ where
                             }
                         };
                         
-                        // Get storage root from path_db or difflayer (same logic as task 1)
-                        // let storage_root = get_storage_root(hashed_address)?;
-                        // let id = SecureTrieId::new(storage_root)
-                        //     .with_owner(hashed_address);
-                        // let mut storage_trie = SecureTrieBuilder::new(path_db_clone.clone())
-                        //     .with_id(id)
-                        //     .build_with_difflayer(difflayer_clone.as_ref())
-                        //     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
-
                         // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();
                         for (hashed_key, new_value) in kvs_vec {
@@ -432,6 +428,8 @@ where
     {
         self.state_at(parent_root, difflayer, prefetcher)?;
 
+        let intermediate_root_start = Instant::now();
+
         // Prepare data for parallel execution
         let path_db_clone = self.path_db.clone();
         let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
@@ -449,15 +447,18 @@ where
 
             if let Some(prefetcher) = &self.prefetcher {
                 if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
+                    metrics_clone.increment_storage_root_from_prefetcher_counter();
                     return Ok(*root);
                 }
             }
 
             if let Some(dl) = difflayer_clone.as_ref() {
                 if let Some(root) = dl.get_storage_root(hashed_address) {
+                    metrics_clone.increment_storage_root_from_difflayer_counter();
                     return Ok(root);
                 }
             }
+            metrics_clone.increment_storage_root_from_pathdb_counter();
             path_db_clone.get_storage_root(hashed_address)
                 .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))
                 .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
@@ -583,10 +584,16 @@ where
             }
         }
 
+        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
+
+        let commit_start = Instant::now();
+        let hash_start = Instant::now();
         let (root_hash, node_set) = self.account_trie.as_mut().unwrap().commit(true)?;
+        self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
         if let Some(node_set) = node_set {
             merged_node_set.merge(node_set).unwrap();
         }
+        self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
         let difflayer = Arc::new(DiffLayer::new(merged_node_set.to_diff_nodes(), Arc::from(*roots_no_storage)));
         self.clean();

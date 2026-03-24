@@ -18,10 +18,10 @@ use alloy_trie::EMPTY_ROOT_HASH;
 use crate::traits::*;
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
 
-// use reth_metrics::{
-//     metrics::{Counter},
-//     Metrics,
-// };
+use reth_metrics::{
+    metrics::{Counter},
+    Metrics,
+};
 
 /// The default column family name used for storing trie nodes.
 ///
@@ -87,18 +87,18 @@ pub const STORAGE_ROOT_COLUMN_FAMILY_NAME: &str = "storage_root";
 const COLUMN_FAMILY_NAMES: [&str; 4] = [DEFAULT_COLUMN_FAMILY_NAME, META_COLUMN_FAMILY_NAME, STORAGE_ROOT_COLUMN_FAMILY_NAME, TRIE_NODE_COLUMN_FAMILY_NAME];
 
 /// Metrics for the `PathDB`.
-// #[derive(Metrics, Clone)]
-// #[metrics(scope = "rust.eth.triedb.pathdb")]
-// pub(crate) struct PathDBMetrics {
-//     /// Counter of cache hits
-//     pub(crate) trie_node_cache_hits: Counter,
-//     /// Counter of cache misses
-//     pub(crate) trie_node_cache_misses: Counter,
-//     /// Counter of storage root cache hits
-//     pub(crate) storage_root_cache_hits: Counter,
-//     /// Counter of storage root cache misses
-//     pub(crate) storage_root_cache_misses: Counter,
-// }
+#[derive(Metrics, Clone)]
+#[metrics(scope = "rust.eth.triedb.pathdb")]
+pub(crate) struct PathDBMetrics {
+    /// Counter of trie node cache hits
+    pub(crate) trie_node_cache_hits: Counter,
+    /// Counter of trie node cache misses
+    pub(crate) trie_node_cache_misses: Counter,
+    /// Counter of storage root cache hits
+    pub(crate) storage_root_cache_hits: Counter,
+    /// Counter of storage root cache misses
+    pub(crate) storage_root_cache_misses: Counter,
+}
 
 /// PathDB implementation using RocksDB.
 pub struct PathDB {
@@ -118,8 +118,8 @@ pub struct PathDB {
     /// Thread-safe LRU cache for storage root key-value pairs.
     /// Uses mini_moka for high-concurrency performance with sharded locks.
     pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
-    // /// Metrics for the PathDB.
-    // metrics: PathDBMetrics,
+    /// Metrics for the PathDB.
+    metrics: PathDBMetrics,
 }
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
@@ -164,7 +164,7 @@ impl Clone for PathDB {
             read_options,
             trie_node_cache: self.trie_node_cache.clone(),
             storage_root_cache: self.storage_root_cache.clone(),
-            // metrics: self.metrics.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -265,7 +265,7 @@ impl PathDB {
             read_options,
             trie_node_cache,
             storage_root_cache,
-            // metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
+            metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
         })
     }
 
@@ -295,10 +295,10 @@ impl PathDB {
         )
     }
 
-    // /// Create a new metrics instance for the PathDB.
-    // pub fn with_new_metrics(&mut self, instance_name: &str) {
-    //     self.metrics = PathDBMetrics::new_with_labels(&[("instance", instance_name.to_string())]);
-    // }
+    /// Create a new metrics instance for the PathDB.
+    pub fn with_new_metrics(&mut self, instance_name: &str) {
+        self.metrics = PathDBMetrics::new_with_labels(&[("instance", instance_name.to_string())]);
+    }
 }
 
 impl PathDB {
@@ -308,11 +308,11 @@ impl PathDB {
         // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
-            // self.metrics.trie_node_cache_hits.increment(1);
+            self.metrics.trie_node_cache_hits.increment(1);
             trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
             return Ok(cached_value);
         }
-        // self.metrics.trie_node_cache_misses.increment(1);
+        self.metrics.trie_node_cache_misses.increment(1);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -421,11 +421,11 @@ impl PathDB {
         // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.storage_root_cache.get(&key_vec) {
-            // self.metrics.storage_root_cache_hits.increment(1);
+            self.metrics.storage_root_cache_hits.increment(1);
             trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
             return Ok(cached_value);
         }
-        // self.metrics.storage_root_cache_misses.increment(1);
+        self.metrics.storage_root_cache_misses.increment(1);
 
         let cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
