@@ -124,8 +124,11 @@ pub struct PathDB {
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
 ///
-/// Returns the cache object alongside the options to ensure the cache stays alive while the
-/// options are being installed into DB/CF options.
+/// Returns the `(Cache, BlockBasedOptions)` pair. After `set_block_cache` is called,
+/// `BlockBasedOptions` already holds its own `Arc<CacheWrapper>` clone (via `outlive`),
+/// so the returned `Cache` is a redundant extra reference. It is safe to bind it to `_`
+/// and let it drop at end of scope — the C++ `shared_ptr<Cache>` inside RocksDB keeps
+/// the underlying cache alive for the lifetime of the DB.
 fn build_block_based_options(config: &PathProviderConfig) -> (RocksCache, BlockBasedOptions) {
     let rocks_block_cache = RocksCache::new_lru_cache(config.block_cache_size_bytes);
     let mut block_based = BlockBasedOptions::default();
@@ -240,18 +243,16 @@ impl PathDB {
         let storage_root_cache_size = config.storage_root_cache_size;
 
         // Create thread-safe LRU caches using mini_moka.
-        // max_capacity is the hard entry limit (weigher returns 1 per entry).
-        // CacheBuilder::new(max_capacity) also serves as the initial capacity hint.
+        // CacheBuilder::new(n) sets max_capacity = n; the weigher returns 1 per entry
+        // so capacity is measured in number of entries.
         let trie_node_cache = Arc::new(
             CacheBuilder::new(trie_node_cache_size as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
-                .max_capacity(trie_node_cache_size as u64)
                 .build()
         );
         let storage_root_cache = Arc::new(
             CacheBuilder::new(storage_root_cache_size as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
-                .max_capacity(storage_root_cache_size as u64)
                 .build()
         );
 
@@ -489,9 +490,11 @@ impl PathDB {
         // Check cache first - metadata uses trie_node_cache
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            self.metrics.trie_node_cache_hits.increment(1);
             trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
             return Ok(cached_value);
         }
+        self.metrics.trie_node_cache_misses.increment(1);
 
         // TODO:: change to META_COLUMN_FAMILY_NAME from default CF in the future.
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {

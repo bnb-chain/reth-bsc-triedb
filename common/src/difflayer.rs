@@ -175,7 +175,12 @@ pub struct DiffLayers {
 }
 
 impl DiffLayers {
-    /// Insert a diff layer into the collection
+    /// Insert a diff layer into the collection.
+    ///
+    /// **Callers must insert layers in reverse chronological order** (newest block first),
+    /// so that `diff_layers[0]` always holds the most recent layer.
+    /// The engine tree achieves this by walking from the parent block backwards through
+    /// its ancestors, inserting each layer via this method in that order.
     pub fn insert_difflayer(&mut self, difflayer: Arc<DiffLayer>) {
         self.diff_layers.push(difflayer);
     }
