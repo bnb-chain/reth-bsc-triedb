@@ -19,7 +19,7 @@ pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 2_000_000;
 // NOTE: RocksDB's default block cache is ~8MB if unset, which is far too small
 // for trie node random reads. We expose these explicitly so callers can tune
 // based on machine memory and workload.
-pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16GB
+pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 32 * 1024 * 1024 * 1024; // 32GB
 pub const DEFAULT_BLOOM_FILTER_BITS_PER_KEY: f64 = 10.0;
 pub const DEFAULT_BLOOM_FILTER_BLOCK_BASED: bool = false;
 pub const DEFAULT_CACHE_INDEX_AND_FILTER_BLOCKS: bool = true;
@@ -31,6 +31,15 @@ pub const DEFAULT_FILL_CACHE: bool = true;
 pub const DEFAULT_READAHEAD_SIZE: usize = 4 * 1024; // 4KB
 pub const DEFAULT_ASYNC_IO: bool = true;
 pub const DEFAULT_VERIFY_CHECKSUMS: bool = false;
+
+// Direct I/O — only applied to RocksDB when the `io-uring` cargo feature is enabled.
+// Requires block cache large enough to compensate for bypassed page cache.
+pub const DEFAULT_USE_DIRECT_READS: bool = true;
+pub const DEFAULT_USE_DIRECT_IO_FOR_FLUSH_AND_COMPACTION: bool = true;
+// RocksDB requires compaction_readahead_size > 0 when direct I/O flush/compaction is
+// enabled; 2 MB is the minimum recommended value (also RocksDB's internal default).
+// Applied unconditionally when io-uring feature is on — safe no-op when Direct I/O is off.
+pub const DEFAULT_COMPACTION_READAHEAD_SIZE: usize = 2 * 1024 * 1024;
 
 /// Result type for PathProvider operations.
 pub type PathProviderResult<T> = Result<T, PathProviderError>;
@@ -103,6 +112,18 @@ pub struct PathProviderConfig {
     pub async_io: bool,
     /// Whether to verify checksums on reads.
     pub verify_checksums: bool,
+
+    /// Use Direct I/O for reads (bypasses page cache; best combined with io-uring feature).
+    /// Only applied to RocksDB when the `io-uring` cargo feature is enabled.
+    pub use_direct_reads: bool,
+    /// Use Direct I/O for flush and compaction (bypasses page cache).
+    /// Only applied to RocksDB when the `io-uring` cargo feature is enabled.
+    /// Requires `compaction_readahead_size` > 0.
+    pub use_direct_io_for_flush_and_compaction: bool,
+    /// Readahead size used during compaction (bytes).
+    /// Must be > 0 when `use_direct_io_for_flush_and_compaction` is true to avoid
+    /// many tiny O_DIRECT reads during compaction degrading performance.
+    pub compaction_readahead_size: usize,
 }
 
 impl Default for PathProviderConfig {
@@ -126,6 +147,9 @@ impl Default for PathProviderConfig {
             readahead_size: DEFAULT_READAHEAD_SIZE,
             async_io: DEFAULT_ASYNC_IO,
             verify_checksums: DEFAULT_VERIFY_CHECKSUMS,
+            use_direct_reads: DEFAULT_USE_DIRECT_READS,
+            use_direct_io_for_flush_and_compaction: DEFAULT_USE_DIRECT_IO_FOR_FLUSH_AND_COMPACTION,
+            compaction_readahead_size: DEFAULT_COMPACTION_READAHEAD_SIZE,
         }
     }
 }

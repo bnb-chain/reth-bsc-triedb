@@ -189,6 +189,30 @@ impl PathDB {
         // Compaction will happen automatically in the background during runtime
         db_opts.set_disable_auto_compactions(true);
 
+        // Apply Direct I/O options when the io-uring feature is enabled.
+        // Inserted before ensure_column_families so that on first run, when
+        // ensure_column_families opens a temporary DB to bootstrap missing column
+        // families, it also receives the Direct I/O configuration.
+        #[cfg(feature = "io-uring")]
+        {
+            db_opts.set_use_direct_reads(config.use_direct_reads);
+            db_opts.set_use_direct_io_for_flush_and_compaction(
+                config.use_direct_io_for_flush_and_compaction,
+            );
+            // compaction_readahead_size must be > 0 when direct I/O flush/compaction is
+            // enabled; only set it in that case to avoid unintended side effects otherwise.
+            if config.use_direct_io_for_flush_and_compaction {
+                db_opts.set_compaction_readahead_size(config.compaction_readahead_size);
+            }
+            tracing::info!(
+                target: "pathdb::rocksdb",
+                use_direct_reads = config.use_direct_reads,
+                use_direct_io_for_flush_and_compaction = config.use_direct_io_for_flush_and_compaction,
+                compaction_readahead_size = config.compaction_readahead_size,
+                "io-uring feature enabled: Direct I/O config applied",
+            );
+        }
+
         // Ensure all required Column Families exist
         ensure_column_families(path, &db_opts, &config, &block_based)?;
 
