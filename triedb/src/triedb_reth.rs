@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
-use rust_eth_triedb_state_trie::node::{MergedNodeSet, NodeSet, DiffLayer, DiffLayers};
+use rust_eth_triedb_state_trie::node::{MergedNodeSet, DiffLayer, DiffLayers};
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
 use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
@@ -291,10 +291,17 @@ where
                         }
 
                         let new_storage_root = storage_trie.hash();
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
-                        new_account.storage_root = new_storage_root;
+                        let updated_account = match accounts_clone.get(&hashed_address) {
+                            Some(Some(account)) => {
+                                let mut new_account = account.clone();
+                                new_account.storage_root = new_storage_root;
+                                Some(new_account)
+                            }
+                            // Account deleted or not present — storage update is moot
+                            Some(None) | None => None,
+                        };
 
-                        Ok((hashed_address, (Some(new_account), new_storage_root, storage_trie)))
+                        Ok((hashed_address, (updated_account, new_storage_root, storage_trie)))
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map(|vec| {
@@ -345,15 +352,16 @@ where
 
         // Start both tasks in parallel using rayon
         let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
-        let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) = rayon::join(
+        let (account_commit_result, storage_commit_results) = rayon::join(
             || account_trie_clone.commit(true),
             || self.storage_tries
                 .par_iter()
                 .map(|(hashed_address, trie)| {
-                    let (_, node_set) = trie.clone().commit(false).unwrap();
-                    (*hashed_address, node_set)
+                    let (_, node_set) = trie.clone().commit(false)
+                        .map_err(|e| TrieDBError::Database(format!("Failed to commit storage trie for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))?;
+                    Ok::<_, TrieDBError>((*hashed_address, node_set))
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()
         );
 
         let (root_hash, account_node_set) = account_commit_result?;
@@ -363,7 +371,7 @@ where
                 .map_err(|e| TrieDBError::Database(e))?;
         }
 
-        for (_, node_set) in storage_commit_results {
+        for (_, node_set) in storage_commit_results? {
             if let Some(node_set) = node_set {
                 merged_node_set.merge(node_set)
                     .map_err(|e| TrieDBError::Database(e))?;
@@ -539,13 +547,20 @@ where
                         }
 
                         let (new_storage_root, node_set) = storage_trie.commit(false)?;
-                        let mut new_account = accounts_clone.get(&hashed_address).unwrap().unwrap().clone();
-                        new_account.storage_root = new_storage_root;
+                        let updated_account = match accounts_clone.get(&hashed_address) {
+                            Some(Some(account)) => {
+                                let mut new_account = account.clone();
+                                new_account.storage_root = new_storage_root;
+                                Some(new_account)
+                            }
+                            // Account deleted or not present — storage update is moot
+                            Some(None) | None => None,
+                        };
 
-                        Ok((hashed_address, (Some(new_account), new_storage_root, node_set)))
+                        Ok((hashed_address, (updated_account, new_storage_root, node_set)))
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map(|vec| {
+                    .and_then(|vec| {
                         let mut new_accounts = HashMap::new();
                         let mut diff_account_storage_roots = Box::new(HashMap::new());
                         let mut merged_node_set = Box::new(MergedNodeSet::new());
@@ -553,10 +568,11 @@ where
                             new_accounts.insert(hashed_address, account);
                             diff_account_storage_roots.insert(hashed_address, storage_root);
                             if let Some(node_set) = node_set {
-                                merged_node_set.merge(node_set).unwrap();
+                                merged_node_set.merge(node_set)
+                                    .map_err(|e| TrieDBError::Database(e))?;
                             }
                         }
-                        (new_accounts, diff_account_storage_roots, merged_node_set)
+                        Ok((new_accounts, diff_account_storage_roots, merged_node_set))
                     });
                 metrics_clone.record_intermediate_state_objects_storage_duration(task2_start.elapsed().as_secs_f64());
                 result
@@ -591,7 +607,8 @@ where
         let (root_hash, node_set) = self.account_trie.as_mut().unwrap().commit(true)?;
         self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
         if let Some(node_set) = node_set {
-            merged_node_set.merge(node_set).unwrap();
+            merged_node_set.merge(node_set)
+                .map_err(|e| TrieDBError::Database(e))?;
         }
         self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
 
