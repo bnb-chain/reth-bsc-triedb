@@ -39,7 +39,7 @@ impl FullNode {
     /// only when they need to be modified (write-on-copy).
     pub fn to_mutable_copy_with_cow(&self) -> Self {
         Self {
-            children: self.children.clone(), // 初始共享，写时复制
+            children: self.children.clone(), // initially shared, copy-on-write
             flags: self.flags.clone(),
         }
     }

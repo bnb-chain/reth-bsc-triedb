@@ -94,7 +94,7 @@ pub struct DiffLayer {
 impl DiffLayer {
     /// Create a new diff layer
     pub fn new(diff_nodes: Arc<HashMap<Vec<u8>, Arc<TrieNode>>>, diff_storage_roots: Arc<HashMap<B256, B256>>) -> Self {
-        Self { diff_nodes: diff_nodes.clone(), diff_storage_roots: diff_storage_roots.clone() }
+        Self { diff_nodes, diff_storage_roots }
     }
 
     /// Get a trie node by prefix
@@ -175,7 +175,12 @@ pub struct DiffLayers {
 }
 
 impl DiffLayers {
-    /// Insert a diff layer into the collection
+    /// Insert a diff layer into the collection.
+    ///
+    /// **Callers must insert layers in reverse chronological order** (newest block first),
+    /// so that `diff_layers[0]` always holds the most recent layer.
+    /// The engine tree achieves this by walking from the parent block backwards through
+    /// its ancestors, inserting each layer via this method in that order.
     pub fn insert_difflayer(&mut self, difflayer: Arc<DiffLayer>) {
         self.diff_layers.push(difflayer);
     }

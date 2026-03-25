@@ -27,7 +27,7 @@ schnellru.workspace = true
 metrics.workspace = true
 
 # External dependencies
-alloy-primitives = { workspace = true , asm-keccak = true}
+alloy-primitives = { workspace = true }
 thiserror.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 rayon.workspace = true
@@ -49,8 +49,3 @@ tokio = { version = "1.0", features = ["full"] }
 tempfile.workspace = true
 serial_test = "0.8"
 
-[profile.maxperf]
-inherits = "release"
-opt-level = 3
-lto = "thin"
-codegen-units = 1

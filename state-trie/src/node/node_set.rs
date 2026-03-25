@@ -238,7 +238,7 @@ impl MergedNodeSet {
     #[allow(dead_code)]
     pub fn merge(&mut self, other: Arc<NodeSet>) -> Result<(), String> {
         if self.sets.contains_key(&other.owner) {
-            panic!("repeated nodeset to merge, owner: {:?} already exists", other.owner);
+            return Err(format!("repeated nodeset to merge, owner: {:?} already exists", other.owner));
         }
         self.sets.insert(other.owner, other.clone());
         self.difflayer.extend(other.difflayer.iter().map(|(key, node)| (key.clone(), node.clone())));

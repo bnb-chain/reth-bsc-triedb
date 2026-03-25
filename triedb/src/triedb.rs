@@ -241,10 +241,10 @@ where
         // Reset simple fields immediately
         self.root_hash = EMPTY_ROOT_HASH;
         
-        // Spawn background thread to asynchronously drop Arc references
-        std::thread::spawn(move || {
-            // Drop all values in background thread
-            // This allows Arc references to be released asynchronously
+        // Offload Arc-reference drops to the rayon global thread pool to avoid
+        // blocking the caller. Unlike std::thread::spawn, rayon::spawn reuses
+        // existing worker threads and avoids per-block OS thread creation.
+        rayon::spawn(move || {
             drop(prefetcher);
             drop(account_trie);
             drop(storage_tries);
