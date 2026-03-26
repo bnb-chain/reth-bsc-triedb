@@ -198,6 +198,11 @@ where
         }
     }
 
+    fn touch_account_with_hash_state(&mut self, hashed_address: B256) -> Result<(), Self::Error> {
+        self.trie.get(hashed_address.as_slice())?;
+        Ok(())
+    }
+
     fn update_account_with_hash_state(&mut self, hashed_address: B256, account: &StateAccount) -> Result<(), Self::Error> {
         let mut encoded_account = Vec::new();
         account.encode(&mut encoded_account);
@@ -225,6 +230,11 @@ where
         // Extract the RLP string/content. Map any raw-RLP error to our domain error.
         let (_, value, _) = rlp_raw::split(&enc).map_err(|_| SecureTrieError::InvalidStorage)?;
         Ok(Some(value.to_vec()))
+    }
+
+    fn touch_storage_with_hash_state(&mut self, hashed_key: B256) -> Result<(), Self::Error> {
+        self.trie.get(hashed_key.as_slice())?;
+        Ok(())
     }
 
     fn update_storage_with_hash_state(&mut self, _: B256, hashed_key: B256, value: &[u8]) -> Result<(), Self::Error> {

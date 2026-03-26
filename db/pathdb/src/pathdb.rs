@@ -5,8 +5,12 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rocksdb::{ColumnFamilyDescriptor,DB, Options, ReadOptions, WriteBatch, WriteOptions};
-use schnellru::{ByLength, LruMap};
+use rocksdb::{
+    BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
+    WriteBatch, WriteOptions,
+};
+// use schnellru::{ByLength, LruMap};
+use mini_moka::sync::{Cache as MokaCache, CacheBuilder};
 use tracing::{error, trace, warn};
 
 use alloy_primitives::B256;
@@ -86,9 +90,9 @@ const COLUMN_FAMILY_NAMES: [&str; 4] = [DEFAULT_COLUMN_FAMILY_NAME, META_COLUMN_
 #[derive(Metrics, Clone)]
 #[metrics(scope = "rust.eth.triedb.pathdb")]
 pub(crate) struct PathDBMetrics {
-    /// Counter of cache hits
+    /// Counter of trie node cache hits
     pub(crate) trie_node_cache_hits: Counter,
-    /// Counter of cache misses
+    /// Counter of trie node cache misses
     pub(crate) trie_node_cache_misses: Counter,
     /// Counter of storage root cache hits
     pub(crate) storage_root_cache_hits: Counter,
@@ -108,12 +112,33 @@ pub struct PathDB {
     pub write_options: WriteOptions,
     /// Read options for read operations.
     pub read_options: ReadOptions,
-    /// LRU cache for key-value pairs.
-    pub trie_node_cache: Arc<Mutex<LruMap<Vec<u8>, Option<Vec<u8>>, ByLength>>>,
-    /// LRU cache for storage root key-value pairs.
-    pub storage_root_cache: Arc<Mutex<LruMap<Vec<u8>, Option<Vec<u8>>, ByLength>>>,
+    /// Thread-safe LRU cache for trie node key-value pairs.
+    /// Uses mini_moka for high-concurrency performance with sharded locks.
+    pub trie_node_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
+    /// Thread-safe LRU cache for storage root key-value pairs.
+    /// Uses mini_moka for high-concurrency performance with sharded locks.
+    pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Metrics for the PathDB.
     metrics: PathDBMetrics,
+}
+
+/// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
+///
+/// Returns the `(Cache, BlockBasedOptions)` pair. After `set_block_cache` is called,
+/// `BlockBasedOptions` already holds its own `Arc<CacheWrapper>` clone (via `outlive`),
+/// so the returned `Cache` is a redundant extra reference. It is safe to bind it to `_`
+/// and let it drop at end of scope — the C++ `shared_ptr<Cache>` inside RocksDB keeps
+/// the underlying cache alive for the lifetime of the DB.
+fn build_block_based_options(config: &PathProviderConfig) -> (RocksCache, BlockBasedOptions) {
+    let rocks_block_cache = RocksCache::new_lru_cache(config.block_cache_size_bytes);
+    let mut block_based = BlockBasedOptions::default();
+    block_based.set_block_cache(&rocks_block_cache);
+    block_based.set_bloom_filter(config.bloom_filter_bits_per_key, config.bloom_filter_block_based);
+    block_based.set_cache_index_and_filter_blocks(config.cache_index_and_filter_blocks);
+    block_based.set_pin_l0_filter_and_index_blocks_in_cache(
+        config.pin_l0_filter_and_index_blocks_in_cache,
+    );
+    (rocks_block_cache, block_based)
 }
 
 impl Debug for PathDB {
@@ -158,8 +183,17 @@ impl PathDB {
         db_opts.set_max_background_jobs(config.max_background_jobs);
         db_opts.create_if_missing(config.create_if_missing);
 
+        // Explicitly configure BlockBasedTable. This directly impacts random reads
+        // of trie nodes. If unset, RocksDB defaults to a tiny internal cache (~8MB).
+        let (_rocks_block_cache, block_based) = build_block_based_options(&config);
+        db_opts.set_block_based_table_factory(&block_based);
+        
+        // Disable auto compaction during startup to avoid slow initialization
+        // Compaction will happen automatically in the background during runtime
+        db_opts.set_disable_auto_compactions(true);
+
         // Ensure all required Column Families exist
-        ensure_column_families(path, &db_opts, &config)?;
+        ensure_column_families(path, &db_opts, &config, &block_based)?;
 
         // Now open database with all required Column Families
         let mut cf_descriptors = Vec::new();
@@ -167,11 +201,33 @@ impl PathDB {
             let mut cf_opts = Options::default();
             cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
             cf_opts.set_write_buffer_size(config.write_buffer_size);
+            cf_opts.set_block_based_table_factory(&block_based);
+            // Disable auto compaction for each column family as well
+            cf_opts.set_disable_auto_compactions(true);
             cf_descriptors.push(ColumnFamilyDescriptor::new(cf_name, cf_opts));
         }
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
             .map_err(|e| PathProviderError::Database(format!("Failed to open RocksDB: {}", e)))?;
+        
+        // Re-enable auto compaction after database is opened
+        // This allows compaction to happen gradually in the background during runtime
+        // without blocking startup
+        for cf_name in COLUMN_FAMILY_NAMES {
+            if let Some(cf) = db.cf_handle(cf_name) {
+                if let Err(e) = db.set_options_cf(&cf, &[("disable_auto_compactions", "false")]) {
+                    warn!(
+                        target: "pathdb::rocksdb",
+                        "Failed to re-enable auto compaction for column family '{}': {}", cf_name, e
+                    );
+                } else {
+                    trace!(
+                        target: "pathdb::rocksdb",
+                        "Re-enabled auto compaction for column family '{}'", cf_name
+                    );
+                }
+            }
+        }
 
         let cf_names_set: HashSet<String> = COLUMN_FAMILY_NAMES.iter().map(|s| s.to_string()).collect();
 
@@ -186,14 +242,28 @@ impl PathDB {
         let trie_node_cache_size = config.trie_node_cache_size;
         let storage_root_cache_size = config.storage_root_cache_size;
 
+        // Create thread-safe LRU caches using mini_moka.
+        // CacheBuilder::new(n) sets max_capacity = n; the weigher returns 1 per entry
+        // so capacity is measured in number of entries.
+        let trie_node_cache = Arc::new(
+            CacheBuilder::new(trie_node_cache_size as u64)
+                .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
+                .build()
+        );
+        let storage_root_cache = Arc::new(
+            CacheBuilder::new(storage_root_cache_size as u64)
+                .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
+                .build()
+        );
+
         Ok(Self {
             db: Arc::new(db),
             column_family_names: Arc::new(Mutex::new(cf_names_set)),
             config,
             write_options,
             read_options,
-            trie_node_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(trie_node_cache_size)))),
-            storage_root_cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(storage_root_cache_size)))),
+            trie_node_cache,
+            storage_root_cache,
             metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
         })
     }
@@ -211,16 +281,17 @@ impl PathDB {
     /// Clear the LRU cache.
     pub fn clear_cache(&self) {
         warn!(target: "pathdb::rocksdb", "Clearing LRU cache");
-        self.trie_node_cache.lock().unwrap().clear();
-        self.storage_root_cache.lock().unwrap().clear();
+        self.trie_node_cache.invalidate_all();
+        self.storage_root_cache.invalidate_all();
     }
 
     /// Get cache statistics.
     pub fn cache_stats(&self) -> (usize, usize) {
-        let trie_node_cache = self.trie_node_cache.lock().unwrap();
-        let storage_root_cache = self.storage_root_cache.lock().unwrap();
-
-        (trie_node_cache.len(), storage_root_cache.len())
+        // mini_moka Cache is thread-safe, no locking needed
+        (
+            self.trie_node_cache.entry_count() as usize,
+            self.storage_root_cache.entry_count() as usize,
+        )
     }
 
     /// Create a new metrics instance for the PathDB.
@@ -233,17 +304,14 @@ impl PathDB {
     pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
-        // Check cache first
-        {
-            let cache = self.trie_node_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                self.metrics.trie_node_cache_hits.increment(1);
-                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-                return Ok(cached_value.clone());
-            } else {
-                self.metrics.trie_node_cache_misses.increment(1);
-            }
+        // Check cache first - mini_moka cache is thread-safe and doesn't require locking
+        let key_vec = key.to_vec();
+        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            self.metrics.trie_node_cache_hits.increment(1);
+            trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+            return Ok(cached_value);
         }
+        self.metrics.trie_node_cache_misses.increment(1);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -254,11 +322,14 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
+                // Insert into cache - mini_moka handles LRU eviction automatically
+                self.trie_node_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}': 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
+                // Cache None values to avoid repeated DB lookups
+                self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
@@ -271,24 +342,22 @@ impl PathDB {
     pub fn put_raw_trie_node(&self, key: &[u8], value: &[u8]) -> PathProviderResult<()> {
         trace!(target: "pathdb::rocksdb", "Putting key: {:?}, value_len: {}", key, value.len());
 
-        // Update cache first
-        self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
-
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
 
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-        // Then write to DB
+        // Write to DB first
         match self.db.put_cf_opt(&cf, key, value, &self.write_options) {
             Ok(()) => {
                 trace!(target: "pathdb::rocksdb", "Successfully put in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
+                // Update cache after successful write - mini_moka is thread-safe
+                self.trie_node_cache.insert(key.to_vec(), Some(value.to_vec()));
                 Ok(())
             }
             Err(e) => {
                 error!(target: "pathdb::rocksdb", "Error putting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                self.trie_node_cache.lock().unwrap().remove(key);
                 Err(PathProviderError::Database(format!("RocksDB put in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
             }
         }
@@ -297,19 +366,19 @@ impl PathDB {
     pub fn delete_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<()> {
         trace!(target: "pathdb::rocksdb", "Deleting key: {:?}", key);
 
-        // Remove from cache first
-        self.trie_node_cache.lock().unwrap().remove(key);
-
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
 
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let key_vec = key.to_vec();
 
-        // Then delete from DB
+        // Delete from DB first
         match self.db.delete_cf_opt(&cf, key, &self.write_options) {
             Ok(()) => {
                 trace!(target: "pathdb::rocksdb", "Successfully deleted in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
+                // Remove from cache after successful delete
+                self.trie_node_cache.invalidate(&key_vec);
                 Ok(())
             }
             Err(e) => {
@@ -322,33 +391,30 @@ impl PathDB {
     pub fn exists_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<bool> {
         trace!(target: "pathdb::rocksdb", "Checking existence of key: {:?}", key);
 
-        // Check cache first
-        {
-            let cache = self.trie_node_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                trace!(target: "pathdb::rocksdb", "Key exists in cache: {:?}", key);
-                self.metrics.trie_node_cache_hits.increment(1);
-                return Ok(cached_value.is_some());
-            } else {
-                self.metrics.trie_node_cache_misses.increment(1);
-            }
+        // Check cache first - cached None means absent, cached Some(_) means present
+        let key_vec = key.to_vec();
+        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            self.metrics.trie_node_cache_hits.increment(1);
+            trace!(target: "pathdb::rocksdb", "Cache hit for exists check, key: {:?}", key);
+            return Ok(cached_value.is_some());
         }
+        self.metrics.trie_node_cache_misses.increment(1);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
-            
+
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-        // Cache miss, check DB
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
-            Ok(Some(_)) => {
+            Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Key exists in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(vec![]));
+                self.trie_node_cache.insert(key_vec, Some(value));
                 Ok(true)
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key does not exist in CF '{}' for key 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
+                self.trie_node_cache.insert(key_vec, None);
                 Ok(false)
             }
             Err(e) => {
@@ -361,17 +427,14 @@ impl PathDB {
     pub fn get_raw_storage_root(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
         trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
 
-        // Check cache first
-        {
-            let cache = self.storage_root_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                self.metrics.storage_root_cache_hits.increment(1);
-                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-                return Ok(cached_value.clone());
-            } else {
-                self.metrics.storage_root_cache_misses.increment(1);
-            }
+        // Check cache first - mini_moka cache is thread-safe and doesn't require locking
+        let key_vec = key.to_vec();
+        if let Some(cached_value) = self.storage_root_cache.get(&key_vec) {
+            self.metrics.storage_root_cache_hits.increment(1);
+            trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+            return Ok(cached_value);
         }
+        self.metrics.storage_root_cache_misses.increment(1);
 
         let cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
@@ -383,11 +446,13 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key 0x{}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex);
-                self.storage_root_cache.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
+                self.storage_root_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}' for key 0x{}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex);
+                // Cache None values to avoid repeated DB lookups
+                self.storage_root_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
@@ -400,22 +465,18 @@ impl PathDB {
     pub fn put_raw_storage_root(&self, key: &[u8], value: &[u8]) -> PathProviderResult<()> {
         trace!(target: "pathdb::rocksdb", "Putting storage root key: {:?}, value_len: {}", key, value.len());
 
-        {
-            // Update cache first
-            let mut cache = self.storage_root_cache.lock().unwrap();
-            cache.insert(key.to_vec(), Some(value.to_vec()));
-        }
-        
-
         let cf = self.db.cf_handle(STORAGE_ROOT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", STORAGE_ROOT_COLUMN_FAMILY_NAME))
         })?;
 
         let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
+        // Write to DB first
         match self.db.put_cf_opt(&cf, key, value, &self.write_options) {
             Ok(()) => {
                 trace!(target: "pathdb::rocksdb", "Successfully put value in CF '{}' for key 0x{}", STORAGE_ROOT_COLUMN_FAMILY_NAME, key_hex);
+                // Update cache after successful write - mini_moka is thread-safe
+                self.storage_root_cache.insert(key.to_vec(), Some(value.to_vec()));
                 Ok(())
             }
             Err(e) => {
@@ -426,14 +487,14 @@ impl PathDB {
     }
 
     pub fn get_raw_meta_data(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
-        // Check cache first
-        {
-            let cache = self.trie_node_cache.lock().unwrap();
-            if let Some(cached_value) = cache.peek(key) {
-                trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
-                return Ok(cached_value.clone());
-            }
+        // Check cache first - metadata uses trie_node_cache
+        let key_vec = key.to_vec();
+        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            self.metrics.trie_node_cache_hits.increment(1);
+            trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+            return Ok(cached_value);
         }
+        self.metrics.trie_node_cache_misses.increment(1);
 
         // TODO:: change to META_COLUMN_FAMILY_NAME from default CF in the future.
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
@@ -446,11 +507,14 @@ impl PathDB {
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
                 trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
-                self.trie_node_cache.lock().unwrap().insert(key.to_vec(), Some(value.clone()));
+                // Insert into cache - mini_moka handles LRU eviction automatically
+                self.trie_node_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
                 trace!(target: "pathdb::rocksdb", "Key not found in CF '{}' for key: {}", DEFAULT_COLUMN_FAMILY_NAME, key_string);
+                // Cache the absence to avoid repeated DB lookups
+                self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
@@ -487,7 +551,21 @@ impl PathProviderManager for PathDB {
     fn compact(&self) -> PathProviderResult<()> {
         trace!(target: "pathdb::rocksdb", "Compacting database");
 
-        // Simplified compact implementation
+        // Compact all column families over the full key-range.
+        //
+        // This can be useful to:
+        // - Rewrite existing SSTs so bloom/filter/index blocks match current table settings.
+        // - Reduce read amplification after large write bursts / state transitions.
+        for cf_name in COLUMN_FAMILY_NAMES {
+            let cf = self.db.cf_handle(cf_name).ok_or_else(|| {
+                PathProviderError::Database(format!(
+                    "Column Family '{}' handle not found for compaction",
+                    cf_name
+                ))
+            })?;
+            self.db
+                .compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+        }
         Ok(())
     }
 }
@@ -567,46 +645,50 @@ impl TrieDatabase for PathDB {
         let mut diff_storage_roots_len = 0;
 
         let mut batch = WriteBatch::default();
-        {
-            let mut trie_node_cache = self.trie_node_cache.lock().unwrap();
-            let mut storage_root_cache = self.storage_root_cache.lock().unwrap();
 
-            batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
+        batch.put_cf(&default_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
+        batch.put_cf(&default_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
 
-            // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
-            batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
-            batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
+        // TODO:: double Write to meta CF using put_cf, will be delete default CF in the future.
+        batch.put_cf(&meta_cf, TRIE_STATE_ROOT_KEY, state_root.as_slice());
+        batch.put_cf(&meta_cf, TRIE_STATE_BLOCK_NUMBER_KEY, &block_number.to_le_bytes());
 
-            trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
-            trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
-        
-            if let Some(difflayer) = difflayer {
-                diff_nodes_len = difflayer.diff_nodes.len();
-                diff_storage_roots_len = difflayer.diff_storage_roots.len();
+        if let Some(difflayer) = difflayer {
+            diff_nodes_len = difflayer.diff_nodes.len();
+            diff_storage_roots_len = difflayer.diff_storage_roots.len();
 
-                for (key, node) in difflayer.diff_nodes.iter() {
-                    if node.is_deleted() {
-                        trie_node_cache.remove(key);
-                        batch.delete_cf(&default_cf, key);
-                        
-                    } else {
-                        if let Some(blob) = &node.blob {
-                            trie_node_cache.insert(key.clone(), Some(blob.clone()));
-                            batch.put_cf(&default_cf, key, blob);
-                        }
-                    }
+            for (key, node) in difflayer.diff_nodes.iter() {
+                if node.is_deleted() {
+                    batch.delete_cf(&default_cf, key);
+                } else if let Some(blob) = &node.blob {
+                    batch.put_cf(&default_cf, key, blob);
                 }
+            }
 
-                for (key, value) in difflayer.diff_storage_roots.iter() {
-                    storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
-                    batch.put_cf(&storage_root_cf, key.as_slice(), value.as_slice());
-                }
+            for (key, value) in difflayer.diff_storage_roots.iter() {
+                batch.put_cf(&storage_root_cf, key.as_slice(), value.as_slice());
             }
         }
 
+        // Write batch first; only update caches on success to keep them consistent with DB.
         match self.db.write_opt(batch, &self.write_options) {
             Ok(()) => {
+                self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
+                self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+
+                if let Some(difflayer) = difflayer {
+                    for (key, node) in difflayer.diff_nodes.iter() {
+                        if node.is_deleted() {
+                            self.trie_node_cache.invalidate(key);
+                        } else if let Some(blob) = &node.blob {
+                            self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                        }
+                    }
+                    for (key, value) in difflayer.diff_storage_roots.iter() {
+                        self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
+                    }
+                }
+
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())
             }
@@ -614,7 +696,6 @@ impl TrieDatabase for PathDB {
                 error!(target: "pathdb::batch", "Error committing batch: block_number: {}, state_root: {:?}, error: {}", block_number, state_root, e);
                 Err(PathProviderError::Database(format!("Batch commit error: {}", e)))
             }
-
         }
     }
 }
@@ -635,6 +716,7 @@ fn ensure_column_families(
     path: &str,
     db_opts: &Options,
     config: &PathProviderConfig,
+    block_based: &BlockBasedOptions,
 ) -> PathProviderResult<()> {
     // List existing Column Families in the database
     let existing_cfs = DB::list_cf(db_opts, path)
@@ -670,6 +752,9 @@ fn ensure_column_families(
         let mut cf_opts = Options::default();
         cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
         cf_opts.set_write_buffer_size(config.write_buffer_size);
+        cf_opts.set_block_based_table_factory(block_based);
+        // Disable auto compaction during startup
+        cf_opts.set_disable_auto_compactions(true);
         existing_cf_descriptors.push(ColumnFamilyDescriptor::new(cf_name, cf_opts));
     }
 
@@ -681,6 +766,7 @@ fn ensure_column_families(
         let mut cf_opts = Options::default();
         cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
         cf_opts.set_write_buffer_size(config.write_buffer_size);
+        cf_opts.set_block_based_table_factory(block_based);
         temp_db.create_cf(cf_name, &cf_opts).map_err(|e| {
             PathProviderError::Database(format!(
                 "Failed to create Column Family '{}': {}",

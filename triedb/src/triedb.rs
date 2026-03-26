@@ -1,6 +1,7 @@
 //! Trie database implementation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
@@ -12,6 +13,7 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieBuilder};
 
 use crate::triedb_metrics::TrieDBMetrics;
+use crate::triedb_reth::TrieDBPrefetchState;
 
 /// Error type for trie database operations
 #[derive(Debug, thiserror::Error)]
@@ -150,7 +152,7 @@ where
     /// **Purpose**: When storage is modified, the storage trie's root hash changes.
     /// This map tracks these changes so that the account's `storage_root` field
     /// can be updated in the account trie during commit operations.
-    pub(crate) updated_storage_roots: HashMap<B256, B256>,
+    pub(crate) updated_storage_roots: Box<HashMap<B256, B256>>,
     
     /// Uncommitted diff layers for tracking state changes.
     ///
@@ -163,6 +165,11 @@ where
     ///
     /// This database provides the persistent storage backend for all trie operations.
     pub(crate) path_db: DB,
+
+    /// The prefetch state of the trie db
+    ///
+    /// This is used to store the prefetched state of the trie db.
+    pub(crate) prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>,
     
     /// Metrics for monitoring trie database operations and performance.
     pub(crate) metrics: TrieDBMetrics,
@@ -181,21 +188,27 @@ where
             account_trie: None,
             storage_tries: HashMap::new(),
             accounts_with_storage_trie: HashMap::new(),
-            updated_storage_roots: HashMap::new(),
+            updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: path_db.clone(),
+            prefetcher: None,
             metrics: TrieDBMetrics::new_with_labels(&[("instance", "default")]),
         }
     }
 
     /// Reset the state of the trie db to the given root hash and difflayer
-    pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>) -> Result<(), TrieDBError> {
-        let id = SecureTrieId::new(root_hash);
-        self.account_trie = Some(
-            SecureTrieBuilder::new(self.path_db.clone())
-            .with_id(id)
-            .build_with_difflayer(difflayer)?
-        );
+    pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
+        self.prefetcher = prefetcher;
+        if let Some(prefetcher) = &self.prefetcher {
+            self.account_trie = Some(prefetcher.account_trie.clone());
+        } else {
+            let id = SecureTrieId::new(root_hash);
+            self.account_trie = Some(
+                SecureTrieBuilder::new(self.path_db.clone())
+                .with_id(id)
+                .build_with_difflayer(difflayer)?
+            );
+        }
         self.root_hash = root_hash;
         self.updated_storage_roots.clear();
         self.difflayer = difflayer.map(|d| d.clone());
@@ -210,13 +223,35 @@ where
     }
 
     /// Clean the trie db
-    pub fn clean(&mut self) {
+    /// 
+    /// This method resets all fields immediately and asynchronously releases
+    /// Arc references in a background thread to avoid blocking.
+    pub fn clean(&mut self)
+    where
+        DB: 'static,
+    {
+        // Move out values that contain Arc references for async cleanup
+        let account_trie = std::mem::take(&mut self.account_trie);
+        let storage_tries = std::mem::take(&mut self.storage_tries);
+        let accounts_with_storage_trie = std::mem::take(&mut self.accounts_with_storage_trie);
+        let updated_storage_roots = std::mem::take(&mut self.updated_storage_roots);
+        let difflayer = std::mem::take(&mut self.difflayer);
+        let prefetcher = std::mem::take(&mut self.prefetcher);
+        
+        // Reset simple fields immediately
         self.root_hash = EMPTY_ROOT_HASH;
-        self.account_trie = None;
-        self.storage_tries.clear();
-        self.accounts_with_storage_trie.clear();
-        self.updated_storage_roots.clear();
-        self.difflayer = None;
+        
+        // Offload Arc-reference drops to the rayon global thread pool to avoid
+        // blocking the caller. Unlike std::thread::spawn, rayon::spawn reuses
+        // existing worker threads and avoids per-block OS thread creation.
+        rayon::spawn(move || {
+            drop(prefetcher);
+            drop(account_trie);
+            drop(storage_tries);
+            drop(accounts_with_storage_trie);
+            drop(updated_storage_roots);
+            drop(difflayer);
+        });
     }
 }
 
@@ -231,9 +266,10 @@ where
             account_trie: None,
             storage_tries: HashMap::new(),
             accounts_with_storage_trie: HashMap::new(),
-            updated_storage_roots: HashMap::new(),
+            updated_storage_roots: Box::new(HashMap::new()),
             difflayer: None,
             path_db: self.path_db.clone(),
+            prefetcher: None,
             metrics: self.metrics.clone()
         }
     }

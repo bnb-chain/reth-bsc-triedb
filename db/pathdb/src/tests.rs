@@ -38,16 +38,20 @@ fn test_cache_operations() {
     let key = b"cache_test_key";
     let value = b"cache_test_value";
     
+    // Write to database
     db.put_raw_trie_node(key, value).unwrap();
+
+    // Read from database - this will populate the cache
+    let retrieved = db.get_raw_trie_node(key).unwrap();
+    assert_eq!(retrieved, Some(value.to_vec()));
     
-    // Get cache stats
+    // Get cache stats - should have entries after read
     let (cache_len, _) = db.cache_stats();
-    assert!(cache_len > 0);
+    assert!(cache_len > 0, "Cache should have entries after read");
     
-    // Clear cache
     db.clear_cache();
-    let (cache_len_after_clear, _) = db.cache_stats();
-    assert_eq!(cache_len_after_clear, 0);
+    // After clear, the previously cached key should no longer be present.
+    assert!(db.trie_node_cache.get(&key.to_vec()).is_none());
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, hex};
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer};
 
 use crate::triedb::{TrieDB, TrieDBError};
@@ -15,26 +15,15 @@ where
     DB: TrieDatabase + Clone + Send + Sync,
     DB::Error: std::fmt::Debug,
 {
-    pub fn get_storage_root(&mut self, hased_address: B256) -> Result<Option<B256>, TrieDBError> {
+    pub fn get_storage_root(&mut self, hashed_address: B256) -> Result<B256, TrieDBError> {
         if let Some(dl) = self.difflayer.as_ref() {
-            if let Some(root) = dl.get_storage_root(hased_address) {
-                self.metrics.increment_get_storage_root_from_flat_counter();
-                return Ok(Some(root));
+            if let Some(root) = dl.get_storage_root(hashed_address) {
+                return Ok(root);
             }
         }
-
-        // TODO: query storage root from flat kv, instead of trie
-        // if let Some(root) = self.path_db.get_storage_root(hased_address)
-        //     .map_err(|e| TrieDBError::Database(format!("Failed to get storage root: {:?}", e)))? {
-        //     self.metrics.increment_get_storage_root_from_flat_counter();
-        //     return Ok(Some(root));
-        // }
-        if let Some(account) = self.get_account_with_hash_state(hased_address)? {
-            self.metrics.increment_get_storage_root_from_trie_counter();
-            return Ok(Some(account.storage_root));
-        }
-
-        Ok(None)
+        self.path_db.get_storage_root(hashed_address)
+            .map_err(|e| TrieDBError::Database(format!("Failed to get storage root for hashed_address: 0x{}, error: {:?}", hex::encode(hashed_address), e)))
+            .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
     }
 
     pub fn latest_persist_state(&self) -> Result<(u64, B256), TrieDBError> {

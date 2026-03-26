@@ -34,6 +34,7 @@ hex = "0.4"
 rocksdb = "0.24"
 tracing = "0.1"
 schnellru = "0.2"
+mini-moka = "0.10"
 tempfile = "3.8"
 tikv-jemallocator = "0.6"
 clap = { version = "4", features = ["derive"] }
@@ -53,33 +54,6 @@ metrics-derive = "0.1"
 # test utilities
 ctor = "0.2"
 
-[workspace.features]
-jemalloc = [
-    "tikv-jemallocator",
-    "rust-eth-triedb-common/jemalloc",
-    "rust-eth-triedb-pathdb/jemalloc",
-    "rust-eth-triedb-state-trie/jemalloc",
-    "rust-eth-triedb/jemalloc",
-    "rust-eth-triedb-smoke-test/jemalloc",
-]
-jemalloc-prof = [
-    "tikv-jemallocator?/profiling",
-    "rust-eth-triedb-common/jemalloc-prof",
-    "rust-eth-triedb-pathdb/jemalloc-prof",
-    "rust-eth-triedb-state-trie/jemalloc-prof",
-    "rust-eth-triedb/jemalloc-prof",
-]
-asm-keccak = [
-    "rust-eth-triedb-common/asm-keccak",
-    "rust-eth-triedb-pathdb/asm-keccak",
-    "rust-eth-triedb-state-trie/asm-keccak",
-    "rust-eth-triedb/asm-keccak",
-    "rust-eth-triedb-smoke-test/asm-keccak",
-]
-io-uring = [
-    "rust-eth-triedb-pathdb/io-uring",
-    "rust-eth-triedb/io-uring",
-] 
 
 [profile.release]
 opt-level = 3

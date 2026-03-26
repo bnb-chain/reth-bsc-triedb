@@ -24,6 +24,8 @@ pub struct NodeSet {
     pub updates: usize,
     /// Count of deleted nodes
     pub deletes: usize,
+    /// Diff layer
+    pub difflayer: Box<HashMap<Vec<u8>, Arc<TrieNode>>>,
 }
 
 impl NodeSet {
@@ -35,6 +37,7 @@ impl NodeSet {
             nodes: HashMap::new(),
             updates: 0,
             deletes: 0,
+            difflayer: Box::new(HashMap::new()),
         }
     }
 
@@ -49,6 +52,11 @@ impl NodeSet {
             self.updates += 1;
         }
 
+        if self.owner == B256::ZERO {
+            self.difflayer.insert(encoding::account_trie_node_key(path), node.clone());
+        } else {
+            self.difflayer.insert(encoding::storage_trie_node_key(self.owner.as_slice(), path), node.clone());
+        }
         self.nodes.insert(path_str, node);
     }
 
@@ -86,6 +94,10 @@ impl NodeSet {
         self.leaves.extend(other.leaves.clone());
         self.updates += other.updates;
         self.deletes += other.deletes;
+        // Merge difflayer as well
+        for (key, node) in other.difflayer.iter() {
+            self.difflayer.insert(key.clone(), node.clone());
+        }
 
         Ok(())
     }
@@ -99,6 +111,7 @@ impl NodeSet {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.leaves.clear();
+        self.difflayer.clear();
         self.updates = 0;
         self.deletes = 0;
     }
@@ -211,40 +224,30 @@ impl std::fmt::Debug for NodeSet {
 #[allow(dead_code)]
 pub struct MergedNodeSet {
     pub sets: HashMap<B256, Arc<NodeSet>>,
+    pub difflayer: HashMap<Vec<u8>, Arc<TrieNode>>,
 }
 
 impl MergedNodeSet {
     /// Create a new merged node set
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self { sets: HashMap::new() }
+        Self { sets: HashMap::new(), difflayer: HashMap::new() }
     }
 
     /// Merge a node set into the merged set
     #[allow(dead_code)]
     pub fn merge(&mut self, other: Arc<NodeSet>) -> Result<(), String> {
         if self.sets.contains_key(&other.owner) {
-            panic!("repeated nodeset to merge, owner: {:?} already exists", other.owner);
+            return Err(format!("repeated nodeset to merge, owner: {:?} already exists", other.owner));
         }
         self.sets.insert(other.owner, other.clone());
+        self.difflayer.extend(other.difflayer.iter().map(|(key, node)| (key.clone(), node.clone())));
         Ok(())
     }
 
-    /// Convert the merged node set to a difflayer
+    /// Convert the merged node set to a difflayer, consuming self
     pub fn to_diff_nodes(&self) -> Arc<HashMap<Vec<u8>, Arc<TrieNode>>> {
-        let mut difflayer = HashMap::new();
-        for (owner, set) in &self.sets {
-            for (path, node) in &set.nodes {
-                if owner == &B256::ZERO {
-                    let key = encoding::account_trie_node_key(path.as_bytes());
-                    difflayer.insert(key, node.clone());
-                } else {
-                    let key = encoding::storage_trie_node_key(owner.as_slice(), path.as_bytes());
-                    difflayer.insert(key, node.clone());
-                }
-            }
-        }
-        Arc::new(difflayer)
+        Arc::new(self.difflayer.clone())
     }
 }
 
