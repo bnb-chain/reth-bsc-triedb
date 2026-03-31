@@ -418,13 +418,131 @@ where
             hashed_post_state.states_rebuild.clone());
     }
 
-    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError> 
+    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError>
     where
         DB: 'static,
     {
         let (root_hash, node_set, diff_storage_roots) = self.commit_inner(true)?;
         let difflayer = Arc::new(DiffLayer::new(node_set.to_diff_nodes(), diff_storage_roots));
-        Ok((root_hash, difflayer)) 
+        Ok((root_hash, difflayer))
+    }
+
+    pub fn commit_with_precomputed_storage(
+        &mut self,
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: &TrieDBHashedPostState,
+        prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>,
+        precomputed: crate::streaming::PrecomputedStorageResult<DB>,
+    ) -> Result<(B256, Arc<DiffLayer>), TrieDBError>
+    where
+        DB: 'static,
+    {
+        let intermediate_root_start = Instant::now();
+
+        self.state_at(parent_root, difflayer, prefetcher)?;
+
+        // Resolve storage roots for accounts WITHOUT storage changes (parallel).
+        let path_db_clone = self.path_db.clone();
+        let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
+        let metrics_clone = self.metrics.clone();
+        let prefetcher_clone = self.prefetcher.clone();
+        let states_rebuild = &hashed_post_state.states_rebuild;
+
+        let get_storage_root = |hashed_address: B256| -> Result<B256, TrieDBError> {
+            if states_rebuild.contains(&hashed_address) {
+                return Ok(alloy_trie::EMPTY_ROOT_HASH);
+            }
+
+            if let Some(prefetcher) = &prefetcher_clone {
+                if let Some(root) = prefetcher.storage_roots.get(&hashed_address) {
+                    metrics_clone.increment_storage_root_from_prefetcher_counter();
+                    return Ok(*root);
+                }
+            }
+
+            if let Some(dl) = difflayer_clone.as_ref() {
+                if let Some(root) = dl.get_storage_root(hashed_address) {
+                    metrics_clone.increment_storage_root_from_difflayer_counter();
+                    return Ok(root);
+                }
+            }
+            metrics_clone.increment_storage_root_from_pathdb_counter();
+            path_db_clone.get_storage_root(hashed_address)
+                .map_err(|e| TrieDBError::Database(format!(
+                    "Failed to get storage root for hashed_address: 0x{}, error: {:?}",
+                    hex::encode(hashed_address), e
+                )))
+                .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
+        };
+
+        // Compute storage roots for accounts without storage changes in parallel.
+        let no_storage_roots: Result<Vec<(B256, B256)>, TrieDBError> = hashed_post_state.states
+            .par_iter()
+            .filter(|(hashed_address, _)| !hashed_post_state.storage_states.contains_key(*hashed_address))
+            .map(|(hashed_address, _)| {
+                let root = get_storage_root(*hashed_address)?;
+                Ok((*hashed_address, root))
+            })
+            .collect();
+        let no_storage_roots = no_storage_roots?;
+
+        // Build updated_storage_roots: start with precomputed (storage-changed accounts),
+        // then add resolved roots for accounts without storage changes.
+        let mut all_storage_roots: Box<HashMap<B256, B256>> = Box::new(HashMap::new());
+        for (addr, root) in &precomputed.storage_roots {
+            all_storage_roots.insert(*addr, *root);
+        }
+        for (addr, root) in &no_storage_roots {
+            all_storage_roots.insert(*addr, *root);
+        }
+
+        // Set storage tries and updated_storage_roots from precomputed data.
+        self.storage_tries = precomputed.storage_tries;
+        self.updated_storage_roots = all_storage_roots;
+
+        // Delete selfdestructed accounts.
+        for hashed_address in &hashed_post_state.states_rebuild {
+            self.delete_account_with_hash_state(*hashed_address)
+                .map_err(|e| TrieDBError::Database(format!(
+                    "Failed to delete account for hashed_address: 0x{}, error: {}",
+                    hex::encode(hashed_address), e
+                )))?;
+        }
+
+        // Update all accounts in the account trie with resolved/precomputed storage roots.
+        for (hashed_address, account) in &hashed_post_state.states {
+            let storage_root = if let Some(root) = precomputed.storage_roots.get(hashed_address) {
+                *root
+            } else if let Some(root) = no_storage_roots.iter().find(|(a, _)| a == hashed_address).map(|(_, r)| *r) {
+                root
+            } else {
+                alloy_trie::EMPTY_ROOT_HASH
+            };
+
+            if let Some(account) = account {
+                let mut new_account = account.clone();
+                new_account.storage_root = storage_root;
+                self.update_account_with_hash_state(*hashed_address, &new_account)
+                    .map_err(|e| TrieDBError::Database(format!(
+                        "Failed to update account for hashed_address: 0x{}, error: {}",
+                        hex::encode(hashed_address), e
+                    )))?;
+            } else {
+                self.delete_account_with_hash_state(*hashed_address)
+                    .map_err(|e| TrieDBError::Database(format!(
+                        "Failed to delete account for hashed_address: 0x{}, error: {}",
+                        hex::encode(hashed_address), e
+                    )))?;
+            }
+        }
+
+        let hash_start = Instant::now();
+        self.account_trie.as_mut().unwrap().hash();
+        self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
+        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
+
+        self.commit(true)
     }
 }
 

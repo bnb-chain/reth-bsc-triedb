@@ -9,6 +9,7 @@ pub mod triedb_manager;
 pub mod triedb_metrics;
 pub mod triedb_disk;
 pub mod triedb_reth;
+pub mod streaming;
 
 #[cfg(test)]
 mod triedb_test;
@@ -18,3 +19,4 @@ pub use triedb::TrieDB;
 pub use triedb::TrieDBError;
 pub use triedb_reth::{TrieDBHashedPostState, TrieDBPrefetchState};
 pub use triedb_manager::{init_global_triedb_manager, get_global_triedb, disable_triedb};
+pub use streaming::{StreamingTrieUpdater, PrecomputedStorageResult, StorageTrieMsg};
