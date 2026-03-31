@@ -26,6 +26,8 @@ schnellru.workspace = true
 # metrics (required by reth-metrics derive macro)
 metrics.workspace = true
 
+crossbeam-channel.workspace = true
+
 # External dependencies
 alloy-primitives = { workspace = true }
 thiserror.workspace = true

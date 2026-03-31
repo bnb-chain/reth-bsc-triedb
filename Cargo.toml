@@ -25,6 +25,7 @@ alloy-primitives = "1.3.0"
 alloy-rlp = "0.3"
 alloy-trie = "0.9.0"
 auto_impl = "1.2"
+crossbeam-channel = "0.5"
 thiserror = "1.0"
 parking_lot = "0.12"
 pretty_assertions = "1.4"
@@ -45,7 +46,7 @@ rust-eth-triedb-pathdb = { version = "0.1.0", path = "db/pathdb" }
 rust-eth-triedb-state-trie = { version = "0.1.0", path = "state-trie" }
 
 # reth
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git"}
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.8" }
 
 # metrics (required by reth-metrics)
 metrics = "0.24.0"

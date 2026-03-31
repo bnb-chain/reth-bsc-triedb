@@ -1824,8 +1824,8 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
 name = "reth-metrics"
-version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git#93678359038b3096d6fe738bdea1a42b46ec7f43"
+version = "1.10.2"
+source = "git+https://github.com/bnb-chain/reth.git?tag=v0.0.8#b02940f65fe1e12a4224452c7cdfaa9e56ce8f0f"
 dependencies = [
  "futures",
  "metrics",
@@ -1903,6 +1903,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
+ "crossbeam-channel",
  "metrics",
  "once_cell",
  "rayon",
