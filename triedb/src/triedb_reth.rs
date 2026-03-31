@@ -510,15 +510,23 @@ where
                 )))?;
         }
 
+        // Debug assertion: every account in storage_states should also be in states.
+        #[cfg(debug_assertions)]
+        for addr in precomputed.storage_roots.keys() {
+            debug_assert!(
+                hashed_post_state.states.contains_key(addr),
+                "precomputed storage root for 0x{} has no corresponding account in states",
+                hex::encode(addr)
+            );
+        }
+
         // Update all accounts in the account trie with resolved/precomputed storage roots.
+        // Use self.updated_storage_roots (HashMap) for O(1) lookup instead of linear scan.
         for (hashed_address, account) in &hashed_post_state.states {
-            let storage_root = if let Some(root) = precomputed.storage_roots.get(hashed_address) {
-                *root
-            } else if let Some(root) = no_storage_roots.iter().find(|(a, _)| a == hashed_address).map(|(_, r)| *r) {
-                root
-            } else {
-                alloy_trie::EMPTY_ROOT_HASH
-            };
+            let storage_root = self.updated_storage_roots
+                .get(hashed_address)
+                .copied()
+                .unwrap_or(alloy_trie::EMPTY_ROOT_HASH);
 
             if let Some(account) = account {
                 let mut new_account = account.clone();
