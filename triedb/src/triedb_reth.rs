@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::time::Instant;
+use tracing::debug;
 
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
@@ -142,36 +143,58 @@ where
     }
 
     fn intermediate_inner(
-        &mut self, 
+        &mut self,
         accounts: HashMap<B256, Option<StateAccount>>,
         storages: HashMap<B256, HashMap<B256, Option<U256>>>,
-        states_rebuild: HashSet<B256>) -> 
+        states_rebuild: HashSet<B256>) ->
         Result<B256, TrieDBError> {
-        
+
         let intermediate_root_start = Instant::now();
 
         let intermediate_state_objects = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;        
+        let account_count = accounts.len();
+        let storage_account_count = storages.len();
+        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;
+        let update_state_objects_ms = intermediate_state_objects.elapsed().as_millis();
         self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
-        
-        for hashed_address in states_rebuild {
-            self.delete_account_with_hash_state(hashed_address)
+
+        let step = Instant::now();
+        for hashed_address in &states_rebuild {
+            self.delete_account_with_hash_state(*hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
         }
-        
-        for (hashed_address, account) in updated_accounts {
+
+        for (hashed_address, account) in &updated_accounts {
             if let Some(account) = account {
-                self.update_account_with_hash_state(hashed_address, &account)
+                self.update_account_with_hash_state(*hashed_address, account)
                     .map_err(|e| TrieDBError::Database(format!("Failed to update account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             } else {
-                self.delete_account_with_hash_state(hashed_address)
+                self.delete_account_with_hash_state(*hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             }
         }
+        let update_account_trie_ms = step.elapsed().as_millis();
+
         let hash_start = Instant::now();
         let root_hash = self.account_trie.as_mut().unwrap().hash();
+        let hash_ms = hash_start.elapsed().as_millis();
         self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
+
+        let total_ms = intermediate_root_start.elapsed().as_millis();
         self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
+
+        debug!(
+            target: "triedb::standard",
+            total_ms,
+            update_state_objects_ms,
+            update_account_trie_ms,
+            hash_ms,
+            account_count,
+            storage_account_count,
+            states_rebuild_count = states_rebuild.len(),
+            "intermediate_inner timing breakdown"
+        );
+
         return Ok(root_hash);
     }
 
@@ -440,9 +463,13 @@ where
     {
         let intermediate_root_start = Instant::now();
 
+        // Step 1: Initialize account trie
+        let step = Instant::now();
         self.state_at(parent_root, difflayer, prefetcher)?;
+        let state_at_ms = step.elapsed().as_millis();
 
-        // Resolve storage roots for accounts WITHOUT storage changes (parallel).
+        // Step 2: Resolve storage roots for accounts WITHOUT storage changes (parallel).
+        let step = Instant::now();
         let path_db_clone = self.path_db.clone();
         let difflayer_clone = self.difflayer.as_ref().map(|d| d.clone());
         let metrics_clone = self.metrics.clone();
@@ -476,7 +503,11 @@ where
                 .map(|opt| opt.unwrap_or(alloy_trie::EMPTY_ROOT_HASH))
         };
 
-        // Compute storage roots for accounts without storage changes in parallel.
+        let no_storage_count = hashed_post_state.states
+            .keys()
+            .filter(|a| !hashed_post_state.storage_states.contains_key(*a))
+            .count();
+
         let no_storage_roots: Result<Vec<(B256, B256)>, TrieDBError> = hashed_post_state.states
             .par_iter()
             .filter(|(hashed_address, _)| !hashed_post_state.storage_states.contains_key(*hashed_address))
@@ -486,9 +517,10 @@ where
             })
             .collect();
         let no_storage_roots = no_storage_roots?;
+        let resolve_roots_ms = step.elapsed().as_millis();
 
-        // Build updated_storage_roots: start with precomputed (storage-changed accounts),
-        // then add resolved roots for accounts without storage changes.
+        // Step 3: Build merged storage roots map.
+        let step = Instant::now();
         let mut all_storage_roots: Box<HashMap<B256, B256>> = Box::new(HashMap::new());
         for (addr, root) in &precomputed.storage_roots {
             all_storage_roots.insert(*addr, *root);
@@ -497,11 +529,12 @@ where
             all_storage_roots.insert(*addr, *root);
         }
 
-        // Set storage tries and updated_storage_roots from precomputed data.
         self.storage_tries = precomputed.storage_tries;
         self.updated_storage_roots = all_storage_roots;
+        let merge_ms = step.elapsed().as_millis();
 
-        // Delete selfdestructed accounts.
+        // Step 4: Delete selfdestructed accounts + update account trie.
+        let step = Instant::now();
         for hashed_address in &hashed_post_state.states_rebuild {
             self.delete_account_with_hash_state(*hashed_address)
                 .map_err(|e| TrieDBError::Database(format!(
@@ -510,7 +543,6 @@ where
                 )))?;
         }
 
-        // Debug assertion: every account in storage_states should also be in states.
         #[cfg(debug_assertions)]
         for addr in precomputed.storage_roots.keys() {
             debug_assert!(
@@ -520,8 +552,7 @@ where
             );
         }
 
-        // Update all accounts in the account trie with resolved/precomputed storage roots.
-        // Use self.updated_storage_roots (HashMap) for O(1) lookup instead of linear scan.
+        let account_count = hashed_post_state.states.len();
         for (hashed_address, account) in &hashed_post_state.states {
             let storage_root = self.updated_storage_roots
                 .get(hashed_address)
@@ -544,13 +575,42 @@ where
                     )))?;
             }
         }
+        let update_account_trie_ms = step.elapsed().as_millis();
 
+        // Step 5: Hash account trie.
         let hash_start = Instant::now();
         self.account_trie.as_mut().unwrap().hash();
+        let hash_ms = hash_start.elapsed().as_millis();
         self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
+
+        let total_ms = intermediate_root_start.elapsed().as_millis();
         self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
 
-        self.commit(true)
+        debug!(
+            target: "triedb::precomputed",
+            total_ms,
+            state_at_ms,
+            resolve_roots_ms,
+            no_storage_count,
+            merge_ms,
+            update_account_trie_ms,
+            account_count,
+            hash_ms,
+            precomputed_storage_accounts = precomputed.storage_roots.len(),
+            states_rebuild_count = hashed_post_state.states_rebuild.len(),
+            storage_states_count = hashed_post_state.storage_states.len(),
+            "commit_with_precomputed_storage timing breakdown"
+        );
+
+        // Step 6: Commit.
+        let commit_start = Instant::now();
+        let result = self.commit(true);
+        debug!(
+            target: "triedb::precomputed",
+            commit_ms = commit_start.elapsed().as_millis(),
+            "commit phase"
+        );
+        result
     }
 }
 
