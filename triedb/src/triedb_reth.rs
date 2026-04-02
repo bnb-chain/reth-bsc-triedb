@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::time::Instant;
 
+use tracing::debug;
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
 use rust_eth_triedb_state_trie::node::{MergedNodeSet, DiffLayer, DiffLayers};
@@ -148,17 +149,19 @@ where
         states_rebuild: HashSet<B256>) -> 
         Result<B256, TrieDBError> {
         
-        let intermediate_root_start = Instant::now();
+        let total_start = Instant::now();
 
-        let intermediate_state_objects = Instant::now();
-        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;        
-        self.metrics.record_intermediate_state_objects_duration(intermediate_state_objects.elapsed().as_secs_f64());
-        
+        let step = Instant::now();
+        let updated_accounts = self.update_state_objects(accounts, storages, states_rebuild.clone())?;
+        let update_state_objects_ms = step.elapsed().as_millis();
+        self.metrics.record_intermediate_state_objects_duration(step.elapsed().as_secs_f64());
+
+        let step = Instant::now();
         for hashed_address in states_rebuild {
             self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
         }
-        
+
         for (hashed_address, account) in updated_accounts {
             if let Some(account) = account {
                 self.update_account_with_hash_state(hashed_address, &account)
@@ -168,10 +171,24 @@ where
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             }
         }
-        let hash_start = Instant::now();
+        let update_account_trie_ms = step.elapsed().as_millis();
+
+        let step = Instant::now();
         let root_hash = self.account_trie.as_mut().unwrap().hash();
-        self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
-        self.metrics.record_intermediate_root_duration(intermediate_root_start.elapsed().as_secs_f64());
+        let account_hash_ms = step.elapsed().as_millis();
+        self.metrics.record_hash_duration(step.elapsed().as_secs_f64());
+
+        let total_ms = total_start.elapsed().as_millis();
+        self.metrics.record_intermediate_root_duration(total_start.elapsed().as_secs_f64());
+
+        debug!(
+            target: "triedb::timing",
+            total_ms,
+            update_state_objects_ms,
+            update_account_trie_ms,
+            account_hash_ms,
+            "intermediate_inner breakdown"
+        );
         return Ok(root_hash);
     }
 
@@ -259,6 +276,7 @@ where
                 let result = storages_for_task2
                     .into_par_iter()
                     .map(|(hashed_address, kvs)| {
+                        let acct_start = Instant::now();
 
                         // Try to get storage_trie from prefetcher, otherwise create a new one
                         let mut storage_trie = match prefetcher_clone.as_ref()
@@ -277,9 +295,10 @@ where
                                     .map_err(|e| TrieDBError::Database(format!("Failed to build storage trie for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?
                             }
                         };
-                        
+
                         // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();
+                        let slot_count = kvs_vec.len();
                         for (hashed_key, new_value) in kvs_vec {
                             if let Some(new_value) = new_value {
                                 storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
@@ -300,6 +319,17 @@ where
                             // Account deleted or not present — storage update is moot
                             Some(None) | None => None,
                         };
+
+                        let acct_ms = acct_start.elapsed().as_millis();
+                        if acct_ms > 5 {
+                            tracing::trace!(
+                                target: "triedb::timing",
+                                hashed_address = %hex::encode(hashed_address),
+                                acct_ms,
+                                slot_count,
+                                "slow storage trie update"
+                            );
+                        }
 
                         Ok((hashed_address, (updated_account, new_storage_root, storage_trie)))
                     })
@@ -324,6 +354,14 @@ where
         let (mut accounts_no_storage, mut roots_no_storage) = account_result?;
         let (accounts_with_storage, roots_with_storage, storage_tries) = storage_result?;
 
+        debug!(
+            target: "triedb::timing",
+            task1_no_storage_accounts = accounts_no_storage.len(),
+            task2_storage_accounts = accounts_with_storage.len(),
+            task2_storage_tries = storage_tries.len(),
+            "update_state_objects result counts"
+        );
+
         accounts_no_storage.extend(accounts_with_storage);
         roots_no_storage.extend(roots_with_storage.into_iter());
 
@@ -337,15 +375,25 @@ where
     where
         DB: 'static,
     {
-        let commit_start = Instant::now();
+        let storage_tries_count = self.storage_tries.len();
+
+        let step = Instant::now();
         let (root_hash, node_set) = self.commit_state_objects(true)?;
-        self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
+        let commit_state_objects_ms = step.elapsed().as_millis();
+        self.metrics.record_commit_duration(step.elapsed().as_secs_f64());
 
         // Move the HashMap out of the Box without cloning, then wrap in Arc.
         // mem::take replaces self.updated_storage_roots with an empty Box (Default),
         // so the subsequent self.clean() safely takes an empty HashMap.
         let diff_storage_roots = Arc::from(*std::mem::take(&mut self.updated_storage_roots));
         self.clean();
+
+        debug!(
+            target: "triedb::timing",
+            commit_state_objects_ms,
+            storage_tries_count,
+            "commit_inner breakdown"
+        );
 
         Ok((root_hash, node_set, diff_storage_roots))
     }
@@ -393,12 +441,35 @@ where
     where
         DB: 'static,
     {
+        let total_start = Instant::now();
+
+        let step = Instant::now();
         self.state_at(parent_root, difflayer, prefetcher)?;
+        let state_at_ms = step.elapsed().as_millis();
+
+        let step = Instant::now();
         self.intermediate_inner(
-            hashed_post_state.states.clone(), 
-            hashed_post_state.storage_states.clone(), 
+            hashed_post_state.states.clone(),
+            hashed_post_state.storage_states.clone(),
             hashed_post_state.states_rebuild.clone())?;
-        return self.commit(true)
+        let intermediate_inner_ms = step.elapsed().as_millis();
+
+        let step = Instant::now();
+        let result = self.commit(true);
+        let commit_ms = step.elapsed().as_millis();
+
+        debug!(
+            target: "triedb::timing",
+            total_ms = total_start.elapsed().as_millis(),
+            state_at_ms,
+            intermediate_inner_ms,
+            commit_ms,
+            states_count = hashed_post_state.states.len(),
+            storage_states_count = hashed_post_state.storage_states.len(),
+            states_rebuild_count = hashed_post_state.states_rebuild.len(),
+            "intermediate_and_commit_hashed_post_state breakdown"
+        );
+        result
     }
 
     pub fn intermediate_hashed_post_state(
