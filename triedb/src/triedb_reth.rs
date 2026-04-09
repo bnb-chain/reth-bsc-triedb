@@ -187,6 +187,7 @@ where
             update_state_objects_ms,
             update_account_trie_ms,
             account_hash_ms,
+            caller = if self.prefetcher.is_some() { "miner" } else { "import" },
             "intermediate_inner breakdown"
         );
         return Ok(root_hash);
@@ -392,6 +393,7 @@ where
             target: "triedb::timing",
             commit_state_objects_ms,
             storage_tries_count,
+            caller = if self.prefetcher.is_some() { "miner" } else { "import" },
             "commit_inner breakdown"
         );
 
@@ -467,6 +469,7 @@ where
             states_count = hashed_post_state.states.len(),
             storage_states_count = hashed_post_state.storage_states.len(),
             states_rebuild_count = hashed_post_state.states_rebuild.len(),
+            caller = if self.prefetcher.is_some() { "miner" } else { "import" },
             "intermediate_and_commit_hashed_post_state breakdown"
         );
         result
