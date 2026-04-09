@@ -469,6 +469,12 @@ where
         self.state_at(parent_root, difflayer, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
 
+        // Cache the parent-root trie BEFORE modifications.
+        // Multiple miner builds for the same parent can reuse this.
+        if let Some(trie) = self.account_trie.as_ref() {
+            set_cached_account_trie_root(parent_root, trie.root_node());
+        }
+
         let step = Instant::now();
         let new_root = self.intermediate_inner(
             hashed_post_state.states.clone(),
@@ -476,8 +482,8 @@ where
             hashed_post_state.states_rebuild.clone())?;
         let intermediate_inner_ms = step.elapsed().as_millis();
 
-        // Cache the pre-resolved root node BEFORE commit collapses it to Hash nodes.
-        // The root at this point contains all resolved Full/Short nodes in memory.
+        // Also cache the post-hash trie (new root). This benefits the NEXT block
+        // whose parent_root = this block's new_root.
         if let Some(trie) = self.account_trie.as_ref() {
             set_cached_account_trie_root(new_root, trie.root_node());
         }

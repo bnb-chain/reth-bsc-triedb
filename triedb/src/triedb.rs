@@ -199,14 +199,15 @@ where
 
     /// Reset the state of the trie db to the given root hash and difflayer.
     ///
-    /// Trie source priority: prefetcher > cached root node > build from PathDB.
+    /// Account trie source priority: cached root node > prefetcher > build from PathDB.
+    /// Cached root has ALL resolved nodes from previous block; prefetcher only has
+    /// nodes warmed during execution. Prefetcher storage_roots/storage_tries are
+    /// still used regardless.
     pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
         self.prefetcher = prefetcher;
-        if let Some(prefetcher) = &self.prefetcher {
-            self.account_trie = Some(prefetcher.account_trie.clone());
-        } else if let Some(cached_root) = take_cached_account_trie_root(root_hash) {
-            // Reuse the pre-resolved root node from the previous block.
-            // This avoids ~1000 Hash node resolutions from PathDB.
+
+        // Try cached root first — it has the most complete set of resolved nodes.
+        if let Some(cached_root) = take_cached_account_trie_root(root_hash) {
             let id = SecureTrieId::new(root_hash);
             self.account_trie = Some(
                 StateTrie::new_from_cached_root(id, cached_root, self.path_db.clone(), difflayer)
@@ -214,8 +215,11 @@ where
             tracing::debug!(
                 target: "triedb::timing",
                 root_hash = %root_hash,
+                has_prefetcher = self.prefetcher.is_some(),
                 "state_at: reused cached account trie root"
             );
+        } else if let Some(prefetcher) = &self.prefetcher {
+            self.account_trie = Some(prefetcher.account_trie.clone());
         } else {
             let id = SecureTrieId::new(root_hash);
             self.account_trie = Some(

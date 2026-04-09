@@ -42,33 +42,45 @@ pub fn is_triedb_active() -> bool {
     ACTIVE_TRIEDB.get().map_or(false, |&b| b)
 }
 
-/// Cached account trie root node from the last committed block.
+/// Cached account trie root nodes for cross-block reuse.
 ///
-/// Storing the pre-resolved root node allows the next block to reuse
-/// in-memory trie nodes instead of re-resolving ~1000 Hash nodes from
-/// PathDB at ~31μs each.
-static CACHED_ACCOUNT_TRIE_ROOT: OnceLock<Mutex<Option<(B256, Arc<Node>)>>> = OnceLock::new();
+/// Stores up to 2 entries (parent_root + new_root) so that:
+/// - Same-parent repeated miner builds hit the parent_root cache
+/// - Next block's first build hits the new_root cache
+///
+/// Uses Arc<Node> which is a cheap ref-count clone. The actual resolved
+/// trie nodes stay alive in memory as long as any Arc reference exists.
+static CACHED_ACCOUNT_TRIE_ROOTS: OnceLock<Mutex<Vec<(B256, Arc<Node>)>>> = OnceLock::new();
 
-fn cached_root_lock() -> &'static Mutex<Option<(B256, Arc<Node>)>> {
-    CACHED_ACCOUNT_TRIE_ROOT.get_or_init(|| Mutex::new(None))
+const MAX_CACHED_ROOTS: usize = 2;
+
+fn cached_roots_lock() -> &'static Mutex<Vec<(B256, Arc<Node>)>> {
+    CACHED_ACCOUNT_TRIE_ROOTS.get_or_init(|| Mutex::new(Vec::with_capacity(MAX_CACHED_ROOTS)))
 }
 
-/// Store the account trie root node after a successful intermediate_inner (post-hash).
+/// Store a pre-resolved account trie root node keyed by root hash.
+/// Overwrites an existing entry with the same root_hash; evicts oldest if full.
 pub fn set_cached_account_trie_root(root_hash: B256, root_node: Arc<Node>) {
-    let mut guard = cached_root_lock().lock().unwrap();
-    *guard = Some((root_hash, root_node));
+    let mut guard = cached_roots_lock().lock().unwrap();
+    // Update in place if same root already cached (refresh the node).
+    if let Some(entry) = guard.iter_mut().find(|(h, _)| *h == root_hash) {
+        entry.1 = root_node;
+        return;
+    }
+    // Evict oldest if at capacity.
+    if guard.len() >= MAX_CACHED_ROOTS {
+        guard.remove(0);
+    }
+    guard.push((root_hash, root_node));
 }
 
-/// Take the cached account trie root if it matches the requested root hash.
-/// Returns None if no cache or root hash mismatch.
+/// Clone the cached root node for the given root hash (non-destructive).
+/// Returns None if not cached.
 pub fn take_cached_account_trie_root(root_hash: B256) -> Option<Arc<Node>> {
-    let mut guard = cached_root_lock().lock().unwrap();
-    if let Some((cached_root, _)) = guard.as_ref() {
-        if *cached_root == root_hash {
-            return guard.take().map(|(_, node)| node);
-        }
-    }
-    None
+    let guard = cached_roots_lock().lock().unwrap();
+    guard.iter()
+        .find(|(h, _)| *h == root_hash)
+        .map(|(_, node)| Arc::clone(node))
 }
 
 /// Global TrieDB Manager
