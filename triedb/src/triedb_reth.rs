@@ -157,9 +157,13 @@ where
         self.metrics.record_intermediate_state_objects_duration(step.elapsed().as_secs_f64());
 
         let step = Instant::now();
+        let resolves_before = self.account_trie.as_ref().unwrap().trie().tracer.access_list().len();
+        let mut account_count = 0u32;
+
         for hashed_address in states_rebuild {
             self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
+            account_count += 1;
         }
 
         for (hashed_address, account) in updated_accounts {
@@ -170,8 +174,22 @@ where
                 self.delete_account_with_hash_state(hashed_address)
                     .map_err(|e| TrieDBError::Database(format!("Failed to delete account for hashed_address: 0x{}, error: {}", hex::encode(hashed_address), e)))?;
             }
+            account_count += 1;
         }
         let update_account_trie_ms = step.elapsed().as_millis();
+        let resolves_after = self.account_trie.as_ref().unwrap().trie().tracer.access_list().len();
+        let hash_resolves = resolves_after - resolves_before;
+
+        if update_account_trie_ms > 10 {
+            tracing::warn!(
+                target: "triedb::timing",
+                update_account_trie_ms,
+                account_count,
+                hash_resolves,
+                caller = if self.prefetcher.is_some() { "miner" } else { "import" },
+                "slow update_account_trie"
+            );
+        }
 
         let step = Instant::now();
         let root_hash = self.account_trie.as_mut().unwrap().hash();
@@ -187,6 +205,8 @@ where
             update_state_objects_ms,
             update_account_trie_ms,
             account_hash_ms,
+            account_count,
+            hash_resolves,
             caller = if self.prefetcher.is_some() { "miner" } else { "import" },
             "intermediate_inner breakdown"
         );
