@@ -376,6 +376,7 @@ where
     where
         DB: 'static,
     {
+        let caller = if self.prefetcher.is_some() { "miner" } else { "import" };
         let storage_tries_count = self.storage_tries.len();
 
         let step = Instant::now();
@@ -383,9 +384,6 @@ where
         let commit_state_objects_ms = step.elapsed().as_millis();
         self.metrics.record_commit_duration(step.elapsed().as_secs_f64());
 
-        // Move the HashMap out of the Box without cloning, then wrap in Arc.
-        // mem::take replaces self.updated_storage_roots with an empty Box (Default),
-        // so the subsequent self.clean() safely takes an empty HashMap.
         let diff_storage_roots = Arc::from(*std::mem::take(&mut self.updated_storage_roots));
         self.clean();
 
@@ -393,7 +391,7 @@ where
             target: "triedb::timing",
             commit_state_objects_ms,
             storage_tries_count,
-            caller = if self.prefetcher.is_some() { "miner" } else { "import" },
+            caller,
             "commit_inner breakdown"
         );
 
@@ -443,6 +441,7 @@ where
     where
         DB: 'static,
     {
+        let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
         let step = Instant::now();
@@ -469,7 +468,7 @@ where
             states_count = hashed_post_state.states.len(),
             storage_states_count = hashed_post_state.storage_states.len(),
             states_rebuild_count = hashed_post_state.states_rebuild.len(),
-            caller = if self.prefetcher.is_some() { "miner" } else { "import" },
+            caller,
             "intermediate_and_commit_hashed_post_state breakdown"
         );
         result
