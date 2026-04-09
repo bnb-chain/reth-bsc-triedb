@@ -3,11 +3,11 @@
 //! This module provides a singleton manager for TrieDB instances,
 //! allowing global access to a shared TrieDB across the application.
 
-use std::sync::{OnceLock};
+use std::sync::{Mutex, OnceLock, Arc};
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
-// use rust_eth_triedb_snapshotdb::{SnapshotDB, PathProviderConfig as SnapshotPathProviderConfig};
 use super::TrieDB;
-use rust_eth_triedb_state_trie::node::init_empty_root_node;
+use rust_eth_triedb_state_trie::node::{init_empty_root_node, Node};
+use alloy_primitives::B256;
 use tracing::info;
 
 // Global singleton for active_triedb flag - can only be initialized once
@@ -42,8 +42,37 @@ pub fn is_triedb_active() -> bool {
     ACTIVE_TRIEDB.get().map_or(false, |&b| b)
 }
 
+/// Cached account trie root node from the last committed block.
+///
+/// Storing the pre-resolved root node allows the next block to reuse
+/// in-memory trie nodes instead of re-resolving ~1000 Hash nodes from
+/// PathDB at ~31μs each.
+static CACHED_ACCOUNT_TRIE_ROOT: OnceLock<Mutex<Option<(B256, Arc<Node>)>>> = OnceLock::new();
+
+fn cached_root_lock() -> &'static Mutex<Option<(B256, Arc<Node>)>> {
+    CACHED_ACCOUNT_TRIE_ROOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Store the account trie root node after a successful intermediate_inner (post-hash).
+pub fn set_cached_account_trie_root(root_hash: B256, root_node: Arc<Node>) {
+    let mut guard = cached_root_lock().lock().unwrap();
+    *guard = Some((root_hash, root_node));
+}
+
+/// Take the cached account trie root if it matches the requested root hash.
+/// Returns None if no cache or root hash mismatch.
+pub fn take_cached_account_trie_root(root_hash: B256) -> Option<Arc<Node>> {
+    let mut guard = cached_root_lock().lock().unwrap();
+    if let Some((cached_root, _)) = guard.as_ref() {
+        if *cached_root == root_hash {
+            return guard.take().map(|(_, node)| node);
+        }
+    }
+    None
+}
+
 /// Global TrieDB Manager
-/// 
+///
 /// A singleton manager that maintains a single TrieDB instance
 /// accessible throughout the application lifecycle.
 pub struct TrieDBManager {

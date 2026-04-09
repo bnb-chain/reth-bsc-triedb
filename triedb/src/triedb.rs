@@ -14,6 +14,7 @@ use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieBuilder};
 
 use crate::triedb_metrics::TrieDBMetrics;
 use crate::triedb_reth::TrieDBPrefetchState;
+use crate::triedb_manager::take_cached_account_trie_root;
 
 /// Error type for trie database operations
 #[derive(Debug, thiserror::Error)]
@@ -196,11 +197,25 @@ where
         }
     }
 
-    /// Reset the state of the trie db to the given root hash and difflayer
+    /// Reset the state of the trie db to the given root hash and difflayer.
+    ///
+    /// Trie source priority: prefetcher > cached root node > build from PathDB.
     pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
         self.prefetcher = prefetcher;
         if let Some(prefetcher) = &self.prefetcher {
             self.account_trie = Some(prefetcher.account_trie.clone());
+        } else if let Some(cached_root) = take_cached_account_trie_root(root_hash) {
+            // Reuse the pre-resolved root node from the previous block.
+            // This avoids ~1000 Hash node resolutions from PathDB.
+            let id = SecureTrieId::new(root_hash);
+            self.account_trie = Some(
+                StateTrie::new_from_cached_root(id, cached_root, self.path_db.clone(), difflayer)
+            );
+            tracing::debug!(
+                target: "triedb::timing",
+                root_hash = %root_hash,
+                "state_at: reused cached account trie root"
+            );
         } else {
             let id = SecureTrieId::new(root_hash);
             self.account_trie = Some(

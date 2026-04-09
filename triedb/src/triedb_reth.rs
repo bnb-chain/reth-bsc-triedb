@@ -12,6 +12,7 @@ use rust_eth_triedb_state_trie::node::{MergedNodeSet, DiffLayer, DiffLayers};
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
 use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
+use crate::triedb_manager::set_cached_account_trie_root;
 
 use crate::triedb::{TrieDB, TrieDBError};
 
@@ -469,11 +470,17 @@ where
         let state_at_ms = step.elapsed().as_millis();
 
         let step = Instant::now();
-        self.intermediate_inner(
+        let new_root = self.intermediate_inner(
             hashed_post_state.states.clone(),
             hashed_post_state.storage_states.clone(),
             hashed_post_state.states_rebuild.clone())?;
         let intermediate_inner_ms = step.elapsed().as_millis();
+
+        // Cache the pre-resolved root node BEFORE commit collapses it to Hash nodes.
+        // The root at this point contains all resolved Full/Short nodes in memory.
+        if let Some(trie) = self.account_trie.as_ref() {
+            set_cached_account_trie_root(new_root, trie.root_node());
+        }
 
         let step = Instant::now();
         let result = self.commit(true);

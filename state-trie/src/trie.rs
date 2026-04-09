@@ -59,6 +59,33 @@ where
         Ok(tr)
     }
 
+    /// Creates a new trie reusing a pre-resolved root node from a previous block.
+    ///
+    /// This avoids re-resolving Hash nodes from the database for nodes that were
+    /// already loaded in memory during the previous block's execution.
+    pub fn new_from_cached_root(
+        owner: B256,
+        root: Arc<Node>,
+        database: DB,
+        difflayer: Option<&DiffLayers>,
+    ) -> Self {
+        Self {
+            root,
+            owner,
+            committed: false,
+            unhashed: 0,
+            uncommitted: 0,
+            tracer: TrieTracer::new(),
+            database,
+            difflayers: difflayer.map(|d| d.clone()),
+        }
+    }
+
+    /// Returns a clone of the root node Arc (cheap ref-count bump).
+    pub fn root_node(&self) -> Arc<Node> {
+        Arc::clone(&self.root)
+    }
+
     /// Creates a new flag for the trie
     pub fn new_flag(&self) -> NodeFlag {
         NodeFlag::default()
