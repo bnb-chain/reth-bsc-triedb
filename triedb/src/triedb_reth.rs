@@ -14,6 +14,7 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
 use crate::triedb::{TrieDB, TrieDBError};
+use crate::triedb_manager::{layer_tree_insert, layer_tree_collect_ancestors, layer_tree_len};
 
 /// Reth-compatible interface functions using hashed keys for TrieDB.
 ///
@@ -443,11 +444,34 @@ where
         let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
-        // Snapshot PathDB cache counters before this call.
+        // Merge engine-provided DiffLayers with Layer Tree ancestors.
+        let tree_layers = layer_tree_collect_ancestors(parent_root);
+        let merged_difflayer: Option<DiffLayers>;
+        let effective_dl: Option<&DiffLayers>;
+        if tree_layers.is_empty() {
+            merged_difflayer = None;
+            effective_dl = difflayer;
+        } else {
+            let mut merged = DiffLayers::default();
+            // Engine layers first (newest, highest priority)
+            if let Some(engine_dl) = difflayer {
+                for dl in &engine_dl.diff_layers {
+                    merged.insert_difflayer(dl.clone());
+                }
+            }
+            // Then tree layers (older ancestors, walked by parent chain)
+            for dl in &tree_layers.diff_layers {
+                merged.insert_difflayer(dl.clone());
+            }
+            merged_difflayer = Some(merged);
+            effective_dl = merged_difflayer.as_ref();
+        }
+        let lt_len = layer_tree_len();
+
         let (hits_before, misses_before) = self.path_db.trie_cache_snapshot();
 
         let step = Instant::now();
-        self.state_at(parent_root, difflayer, prefetcher)?;
+        self.state_at(parent_root, effective_dl, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
 
         let step = Instant::now();
@@ -460,6 +484,11 @@ where
         let step = Instant::now();
         let result = self.commit(true);
         let commit_ms = step.elapsed().as_millis();
+
+        // Insert the new DiffLayer into the Layer Tree.
+        if let Ok((ref new_root, ref new_dl)) = result {
+            layer_tree_insert(*new_root, parent_root, new_dl.clone());
+        }
 
         let (hits_after, misses_after) = self.path_db.trie_cache_snapshot();
         let cache_hits = hits_after - hits_before;
@@ -475,6 +504,7 @@ where
             storage_states_count = hashed_post_state.storage_states.len(),
             cache_hits,
             cache_misses,
+            lt_len,
             caller,
             "intermediate_and_commit breakdown"
         );
@@ -483,19 +513,40 @@ where
 
     pub fn intermediate_hashed_post_state(
         &mut self,
-        parent_root: B256, 
-        difflayer: Option<&DiffLayers>, 
-        hashed_post_state: &TrieDBHashedPostState, 
+        parent_root: B256,
+        difflayer: Option<&DiffLayers>,
+        hashed_post_state: &TrieDBHashedPostState,
         prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>
     ) -> Result<B256, TrieDBError>
     where
         DB: 'static,
     {
-        self.state_at(parent_root, difflayer, prefetcher)?;
-        return self.intermediate_inner(
-            hashed_post_state.states.clone(), 
-            hashed_post_state.storage_states.clone(), 
-            hashed_post_state.states_rebuild.clone());
+        // Merge with Layer Tree ancestors (same logic as intermediate_and_commit).
+        let tree_layers = layer_tree_collect_ancestors(parent_root);
+        let merged_difflayer: Option<DiffLayers>;
+        let effective_dl: Option<&DiffLayers>;
+        if tree_layers.is_empty() {
+            merged_difflayer = None;
+            effective_dl = difflayer;
+        } else {
+            let mut merged = DiffLayers::default();
+            if let Some(engine_dl) = difflayer {
+                for dl in &engine_dl.diff_layers {
+                    merged.insert_difflayer(dl.clone());
+                }
+            }
+            for dl in &tree_layers.diff_layers {
+                merged.insert_difflayer(dl.clone());
+            }
+            merged_difflayer = Some(merged);
+            effective_dl = merged_difflayer.as_ref();
+        }
+
+        self.state_at(parent_root, effective_dl, prefetcher)?;
+        self.intermediate_inner(
+            hashed_post_state.states.clone(),
+            hashed_post_state.storage_states.clone(),
+            hashed_post_state.states_rebuild.clone())
     }
 
     pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<DiffLayer>), TrieDBError> 

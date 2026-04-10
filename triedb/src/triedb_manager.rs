@@ -3,11 +3,14 @@
 //! This module provides a singleton manager for TrieDB instances,
 //! allowing global access to a shared TrieDB across the application.
 
-use std::sync::{OnceLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use alloy_primitives::B256;
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
-// use rust_eth_triedb_snapshotdb::{SnapshotDB, PathProviderConfig as SnapshotPathProviderConfig};
 use super::TrieDB;
 use rust_eth_triedb_state_trie::node::init_empty_root_node;
+use rust_eth_triedb_common::DiffLayer;
+use rust_eth_triedb_state_trie::node::DiffLayers;
 use tracing::info;
 
 // Global singleton for active_triedb flag - can only be initialized once
@@ -42,8 +45,92 @@ pub fn is_triedb_active() -> bool {
     ACTIVE_TRIEDB.get().map_or(false, |&b| b)
 }
 
+// ---------------------------------------------------------------------------
+// Layer Tree — state-root-indexed DiffLayer chain (like geth's 128-layer tree)
+// ---------------------------------------------------------------------------
+
+const LAYER_TREE_MAX_ENTRIES: usize = 256;
+
+struct LayerEntry {
+    parent_root: B256,
+    diff_layer: Arc<DiffLayer>,
+}
+
+struct LayerTree {
+    layers: HashMap<B256, LayerEntry>,
+    insertion_order: VecDeque<B256>,
+    max_entries: usize,
+}
+
+impl LayerTree {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            layers: HashMap::with_capacity(max_entries),
+            insertion_order: VecDeque::with_capacity(max_entries),
+            max_entries,
+        }
+    }
+
+    fn insert(&mut self, state_root: B256, parent_root: B256, diff_layer: Arc<DiffLayer>) {
+        if self.layers.contains_key(&state_root) {
+            return;
+        }
+        while self.layers.len() >= self.max_entries {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.layers.remove(&oldest);
+            }
+        }
+        self.layers.insert(state_root, LayerEntry { parent_root, diff_layer });
+        self.insertion_order.push_back(state_root);
+    }
+
+    fn collect_ancestors(&self, start_root: B256) -> DiffLayers {
+        let mut result = DiffLayers::default();
+        let mut current = start_root;
+        for _ in 0..self.max_entries {
+            match self.layers.get(&current) {
+                Some(entry) => {
+                    result.insert_difflayer(entry.diff_layer.clone());
+                    current = entry.parent_root;
+                }
+                None => break,
+            }
+        }
+        result
+    }
+
+    fn len(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+static LAYER_TREE: OnceLock<Mutex<LayerTree>> = OnceLock::new();
+
+fn get_layer_tree() -> &'static Mutex<LayerTree> {
+    LAYER_TREE.get_or_init(|| Mutex::new(LayerTree::new(LAYER_TREE_MAX_ENTRIES)))
+}
+
+/// Insert a committed DiffLayer into the global Layer Tree.
+pub fn layer_tree_insert(state_root: B256, parent_root: B256, diff_layer: Arc<DiffLayer>) {
+    get_layer_tree().lock().unwrap().insert(state_root, parent_root, diff_layer);
+}
+
+/// Collect ancestor DiffLayers by walking the parent chain from `start_root`.
+pub fn layer_tree_collect_ancestors(start_root: B256) -> DiffLayers {
+    get_layer_tree().lock().unwrap().collect_ancestors(start_root)
+}
+
+/// Current number of entries in the Layer Tree.
+pub fn layer_tree_len() -> usize {
+    get_layer_tree().lock().unwrap().len()
+}
+
+// ---------------------------------------------------------------------------
+// Global TrieDB Manager
+// ---------------------------------------------------------------------------
+
 /// Global TrieDB Manager
-/// 
+///
 /// A singleton manager that maintains a single TrieDB instance
 /// accessible throughout the application lifecycle.
 pub struct TrieDBManager {
