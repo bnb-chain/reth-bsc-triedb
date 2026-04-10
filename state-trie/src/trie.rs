@@ -59,6 +59,74 @@ where
         Ok(tr)
     }
 
+    /// Creates a new trie reusing a pre-resolved root node from a previous block.
+    pub fn new_from_cached_root(
+        owner: B256,
+        root: Arc<Node>,
+        database: DB,
+        difflayer: Option<&DiffLayers>,
+    ) -> Self {
+        let mut tr = Self {
+            root,
+            owner,
+            committed: false,
+            unhashed: 0,
+            uncommitted: 0,
+            tracer: TrieTracer::new(),
+            database,
+            difflayers: difflayer.map(|d| d.clone()),
+        };
+        // Pre-populate the tracer's access_list with all resolved node paths.
+        // This is required so that deleted_nodes() correctly identifies deletions
+        // for nodes that were pre-resolved in the cache (not via resolve_and_track).
+        tr.populate_access_list_from_root();
+        tr
+    }
+
+    /// Returns a clone of the root node Arc (cheap ref-count bump).
+    pub fn root_node(&self) -> Arc<Node> {
+        Arc::clone(&self.root)
+    }
+
+    /// Walk the root tree and add all resolved (non-Hash) node paths to the
+    /// tracer's access_list. This ensures commit correctness when the trie was
+    /// built from a cached root node.
+    fn populate_access_list_from_root(&mut self) {
+        let root = self.root.clone();
+        Self::walk_and_mark(&mut self.tracer, &root, &mut Vec::new());
+    }
+
+    fn walk_and_mark(tracer: &mut TrieTracer, node: &Node, prefix: &mut Vec<u8>) {
+        match node {
+            Node::Full(full) => {
+                tracer.mark_accessible(prefix.as_slice());
+                for i in 0..16u8 {
+                    match full.children[i as usize].as_ref() {
+                        Node::Empty | Node::Hash(_) | Node::Value(_) => {}
+                        child => {
+                            prefix.push(i);
+                            Self::walk_and_mark(tracer, child, prefix);
+                            prefix.pop();
+                        }
+                    }
+                }
+            }
+            Node::Short(short) => {
+                tracer.mark_accessible(prefix.as_slice());
+                match short.val.as_ref() {
+                    Node::Empty | Node::Hash(_) | Node::Value(_) => {}
+                    child => {
+                        let key_start = prefix.len();
+                        prefix.extend_from_slice(&short.key);
+                        Self::walk_and_mark(tracer, child, prefix);
+                        prefix.truncate(key_start);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Creates a new flag for the trie
     pub fn new_flag(&self) -> NodeFlag {
         NodeFlag::default()

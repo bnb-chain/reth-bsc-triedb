@@ -10,7 +10,7 @@ use super::account::StateAccount;
 use super::secure_trie::{SecureTrieId, SecureTrieError};
 use super::traits::SecureTrieTrait;
 use super::trie::Trie;
-use super::node::{NodeSet, DiffLayers};
+use super::node::{Node, NodeSet, DiffLayers};
 use super::node::rlp_raw;
 
 /// Ethereum-compatible state trie implementation with secure key hashing.
@@ -90,6 +90,23 @@ where
     pub fn new(id: SecureTrieId, database: DB, difflayer: Option<&DiffLayers>) -> Result<Self, SecureTrieError> {
         let trie = Trie::new(&id, database, difflayer)?;
         Ok(Self { trie, id })
+    }
+
+    /// Creates a new state trie reusing a pre-resolved root node.
+    /// The tracer's access_list is pre-populated by walking resolved nodes.
+    pub fn new_from_cached_root(
+        id: SecureTrieId,
+        root: Arc<Node>,
+        database: DB,
+        difflayer: Option<&DiffLayers>,
+    ) -> Self {
+        let trie = Trie::new_from_cached_root(id.owner, root, database, difflayer);
+        Self { trie, id }
+    }
+
+    /// Returns a clone of the underlying root node Arc.
+    pub fn root_node(&self) -> Arc<Node> {
+        self.trie.root_node()
     }
 
     /// Returns the identifier of this state trie
