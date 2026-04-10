@@ -157,7 +157,6 @@ where
         self.metrics.record_intermediate_state_objects_duration(step.elapsed().as_secs_f64());
 
         let step = Instant::now();
-        let resolves_before = self.account_trie.as_ref().unwrap().trie().tracer.access_list().len();
         let mut account_count = 0u32;
 
         for hashed_address in states_rebuild {
@@ -177,19 +176,6 @@ where
             account_count += 1;
         }
         let update_account_trie_ms = step.elapsed().as_millis();
-        let resolves_after = self.account_trie.as_ref().unwrap().trie().tracer.access_list().len();
-        let hash_resolves = resolves_after - resolves_before;
-
-        if update_account_trie_ms > 10 {
-            tracing::warn!(
-                target: "triedb::timing",
-                update_account_trie_ms,
-                account_count,
-                hash_resolves,
-                caller = if self.prefetcher.is_some() { "miner" } else { "import" },
-                "slow update_account_trie"
-            );
-        }
 
         let step = Instant::now();
         let root_hash = self.account_trie.as_mut().unwrap().hash();
@@ -206,7 +192,6 @@ where
             update_account_trie_ms,
             account_hash_ms,
             account_count,
-            hash_resolves,
             caller = if self.prefetcher.is_some() { "miner" } else { "import" },
             "intermediate_inner breakdown"
         );
@@ -375,13 +360,7 @@ where
         let (mut accounts_no_storage, mut roots_no_storage) = account_result?;
         let (accounts_with_storage, roots_with_storage, storage_tries) = storage_result?;
 
-        debug!(
-            target: "triedb::timing",
-            task1_no_storage_accounts = accounts_no_storage.len(),
-            task2_storage_accounts = accounts_with_storage.len(),
-            task2_storage_tries = storage_tries.len(),
-            "update_state_objects result counts"
-        );
+        // Removed verbose result counts log
 
         accounts_no_storage.extend(accounts_with_storage);
         roots_no_storage.extend(roots_with_storage.into_iter());
@@ -464,6 +443,9 @@ where
         let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
+        // Snapshot PathDB cache counters before this call.
+        let (hits_before, misses_before) = self.path_db.trie_cache_snapshot();
+
         let step = Instant::now();
         self.state_at(parent_root, difflayer, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
@@ -479,6 +461,10 @@ where
         let result = self.commit(true);
         let commit_ms = step.elapsed().as_millis();
 
+        let (hits_after, misses_after) = self.path_db.trie_cache_snapshot();
+        let cache_hits = hits_after - hits_before;
+        let cache_misses = misses_after - misses_before;
+
         debug!(
             target: "triedb::timing",
             total_ms = total_start.elapsed().as_millis(),
@@ -487,9 +473,10 @@ where
             commit_ms,
             states_count = hashed_post_state.states.len(),
             storage_states_count = hashed_post_state.storage_states.len(),
-            states_rebuild_count = hashed_post_state.states_rebuild.len(),
+            cache_hits,
+            cache_misses,
             caller,
-            "intermediate_and_commit_hashed_post_state breakdown"
+            "intermediate_and_commit breakdown"
         );
         result
     }

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rocksdb::{
     BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
@@ -120,6 +121,9 @@ pub struct PathDB {
     pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Metrics for the PathDB.
     metrics: PathDBMetrics,
+    /// Readable atomic counters for per-call cache stats.
+    pub trie_cache_hits: Arc<AtomicU64>,
+    pub trie_cache_misses: Arc<AtomicU64>,
 }
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
@@ -168,6 +172,8 @@ impl Clone for PathDB {
             trie_node_cache: self.trie_node_cache.clone(),
             storage_root_cache: self.storage_root_cache.clone(),
             metrics: self.metrics.clone(),
+            trie_cache_hits: self.trie_cache_hits.clone(),
+            trie_cache_misses: self.trie_cache_misses.clone(),
         }
     }
 }
@@ -265,6 +271,8 @@ impl PathDB {
             trie_node_cache,
             storage_root_cache,
             metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
+            trie_cache_hits: Arc::new(AtomicU64::new(0)),
+            trie_cache_misses: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -287,10 +295,17 @@ impl PathDB {
 
     /// Get cache statistics.
     pub fn cache_stats(&self) -> (usize, usize) {
-        // mini_moka Cache is thread-safe, no locking needed
         (
             self.trie_node_cache.entry_count() as usize,
             self.storage_root_cache.entry_count() as usize,
+        )
+    }
+
+    /// Snapshot the trie cache hit/miss counters (for per-call delta).
+    pub fn trie_cache_snapshot(&self) -> (u64, u64) {
+        (
+            self.trie_cache_hits.load(Ordering::Relaxed),
+            self.trie_cache_misses.load(Ordering::Relaxed),
         )
     }
 
@@ -302,16 +317,15 @@ impl PathDB {
 
 impl PathDB {
     pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
-        trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
-
         // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
             self.metrics.trie_node_cache_hits.increment(1);
-            trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+            self.trie_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached_value);
         }
         self.metrics.trie_node_cache_misses.increment(1);
+        self.trie_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
@@ -612,6 +626,13 @@ impl TrieDatabase for PathDB {
 
     fn clear_cache(&self) {
         self.clear_cache();
+    }
+
+    fn trie_cache_snapshot(&self) -> (u64, u64) {
+        (
+            self.trie_cache_hits.load(Ordering::Relaxed),
+            self.trie_cache_misses.load(Ordering::Relaxed),
+        )
     }
 
     fn latest_persist_state(&self) -> Result<(u64, B256), Self::Error> {
