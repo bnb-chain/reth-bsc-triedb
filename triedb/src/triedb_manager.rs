@@ -3,11 +3,12 @@
 //! This module provides a singleton manager for TrieDB instances,
 //! allowing global access to a shared TrieDB across the application.
 
-use std::sync::{OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock, Arc};
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
-// use rust_eth_triedb_snapshotdb::{SnapshotDB, PathProviderConfig as SnapshotPathProviderConfig};
 use super::TrieDB;
 use rust_eth_triedb_state_trie::node::init_empty_root_node;
+use rust_eth_triedb_common::DiffLayer;
 use tracing::info;
 
 // Global singleton for active_triedb flag - can only be initialized once
@@ -42,8 +43,50 @@ pub fn is_triedb_active() -> bool {
     ACTIVE_TRIEDB.get().map_or(false, |&b| b)
 }
 
+/// Global ring buffer of recent DiffLayers (like geth's 128-layer tree).
+///
+/// Each block's commit produces a DiffLayer containing its dirty trie nodes.
+/// By accumulating the last N layers, resolve_and_track() can find recently-
+/// modified nodes in-memory instead of hitting PathDB/RocksDB.
+///
+/// At BSC 0.45s block time, 128 layers ≈ 57 seconds of state history.
+/// Memory: ~200KB-1MB per layer × 128 = ~25-128MB.
+static DIFFLAYER_HISTORY: OnceLock<Mutex<VecDeque<Arc<DiffLayer>>>> = OnceLock::new();
+
+const MAX_DIFFLAYER_HISTORY: usize = 128;
+
+fn history_lock() -> &'static Mutex<VecDeque<Arc<DiffLayer>>> {
+    DIFFLAYER_HISTORY.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_DIFFLAYER_HISTORY)))
+}
+
+/// Append a newly committed DiffLayer to the global history.
+pub fn push_difflayer_history(dl: Arc<DiffLayer>) {
+    let mut guard = history_lock().lock().unwrap();
+    if guard.len() >= MAX_DIFFLAYER_HISTORY {
+        guard.pop_front(); // evict oldest
+    }
+    guard.push_back(dl);
+}
+
+/// Get all accumulated DiffLayers as a DiffLayers collection.
+/// Returns layers from newest (back) to oldest (front).
+pub fn get_difflayer_history() -> rust_eth_triedb_common::DiffLayers {
+    let guard = history_lock().lock().unwrap();
+    let mut dls = rust_eth_triedb_common::DiffLayers::default();
+    // Insert from newest to oldest (DiffLayers expects newest first)
+    for dl in guard.iter().rev() {
+        dls.insert_difflayer(dl.clone());
+    }
+    dls
+}
+
+/// Returns the current number of DiffLayers in history.
+pub fn difflayer_history_len() -> usize {
+    history_lock().lock().unwrap().len()
+}
+
 /// Global TrieDB Manager
-/// 
+///
 /// A singleton manager that maintains a single TrieDB instance
 /// accessible throughout the application lifecycle.
 pub struct TrieDBManager {

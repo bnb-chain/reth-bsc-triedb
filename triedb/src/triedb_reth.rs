@@ -14,6 +14,7 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
 use crate::triedb::{TrieDB, TrieDBError};
+use crate::triedb_manager::{push_difflayer_history, get_difflayer_history, difflayer_history_len};
 
 /// Reth-compatible interface functions using hashed keys for TrieDB.
 ///
@@ -443,11 +444,23 @@ where
         let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
-        // Snapshot PathDB cache counters before this call.
+        // Merge caller-provided DiffLayers with global history for wider coverage.
+        let merged_difflayers = {
+            let mut merged = get_difflayer_history();
+            if let Some(caller_dls) = difflayer {
+                for dl in &caller_dls.diff_layers {
+                    merged.insert_difflayer(dl.clone());
+                }
+            }
+            merged
+        };
+        let merged_ref = if merged_difflayers.is_empty() { None } else { Some(&merged_difflayers) };
+        let dl_history_len = difflayer_history_len();
+
         let (hits_before, misses_before) = self.path_db.trie_cache_snapshot();
 
         let step = Instant::now();
-        self.state_at(parent_root, difflayer, prefetcher)?;
+        self.state_at(parent_root, merged_ref, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
 
         let step = Instant::now();
@@ -460,6 +473,11 @@ where
         let step = Instant::now();
         let result = self.commit(true);
         let commit_ms = step.elapsed().as_millis();
+
+        // Save the newly committed DiffLayer to global history.
+        if let Ok((_, ref new_dl)) = result {
+            push_difflayer_history(new_dl.clone());
+        }
 
         let (hits_after, misses_after) = self.path_db.trie_cache_snapshot();
         let cache_hits = hits_after - hits_before;
@@ -475,6 +493,7 @@ where
             storage_states_count = hashed_post_state.storage_states.len(),
             cache_hits,
             cache_misses,
+            dl_history_len,
             caller,
             "intermediate_and_commit breakdown"
         );
