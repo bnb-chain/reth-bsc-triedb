@@ -49,13 +49,6 @@ impl TrieTracer {
         self.deletes.insert(key.to_vec());
     }
 
-    /// Mark a path as accessible in the access_list without storing the RLP blob.
-    /// Used when building a trie from a cached root where nodes are already resolved
-    /// in memory (not via resolve_and_track from the database).
-    pub fn mark_accessible(&mut self, path: impl AsRef<[u8]>) {
-        self.access_list.entry(path.as_ref().to_vec()).or_insert_with(Vec::new);
-    }
-
     /// Clears all tracked data.
     pub fn reset(&mut self) {
         self.inserts.clear();

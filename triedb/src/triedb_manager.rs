@@ -3,11 +3,11 @@
 //! This module provides a singleton manager for TrieDB instances,
 //! allowing global access to a shared TrieDB across the application.
 
-use std::sync::{Mutex, OnceLock, Arc};
+use std::sync::{OnceLock};
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
+// use rust_eth_triedb_snapshotdb::{SnapshotDB, PathProviderConfig as SnapshotPathProviderConfig};
 use super::TrieDB;
-use rust_eth_triedb_state_trie::node::{init_empty_root_node, Node};
-use alloy_primitives::B256;
+use rust_eth_triedb_state_trie::node::init_empty_root_node;
 use tracing::info;
 
 // Global singleton for active_triedb flag - can only be initialized once
@@ -42,41 +42,8 @@ pub fn is_triedb_active() -> bool {
     ACTIVE_TRIEDB.get().map_or(false, |&b| b)
 }
 
-/// Cached account trie root nodes for cross-block reuse (2-slot LRU).
-///
-/// Stores parent_root (for repeated miner builds on same parent) and
-/// new_root (for the next block whose parent = this block's root).
-static CACHED_ROOTS: OnceLock<Mutex<Vec<(B256, Arc<Node>)>>> = OnceLock::new();
-
-const MAX_CACHED_ROOTS: usize = 2;
-
-fn cached_roots_lock() -> &'static Mutex<Vec<(B256, Arc<Node>)>> {
-    CACHED_ROOTS.get_or_init(|| Mutex::new(Vec::with_capacity(MAX_CACHED_ROOTS)))
-}
-
-/// Store a pre-resolved account trie root node keyed by root hash.
-pub fn set_cached_account_trie_root(root_hash: B256, root_node: Arc<Node>) {
-    let mut guard = cached_roots_lock().lock().unwrap();
-    if let Some(entry) = guard.iter_mut().find(|(h, _)| *h == root_hash) {
-        entry.1 = root_node;
-        return;
-    }
-    if guard.len() >= MAX_CACHED_ROOTS {
-        guard.remove(0);
-    }
-    guard.push((root_hash, root_node));
-}
-
-/// Clone the cached root node for the given root hash (non-destructive).
-pub fn take_cached_account_trie_root(root_hash: B256) -> Option<Arc<Node>> {
-    let guard = cached_roots_lock().lock().unwrap();
-    guard.iter()
-        .find(|(h, _)| *h == root_hash)
-        .map(|(_, node)| Arc::clone(node))
-}
-
 /// Global TrieDB Manager
-///
+/// 
 /// A singleton manager that maintains a single TrieDB instance
 /// accessible throughout the application lifecycle.
 pub struct TrieDBManager {
