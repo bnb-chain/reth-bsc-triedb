@@ -66,7 +66,7 @@ where
         database: DB,
         difflayer: Option<&DiffLayers>,
     ) -> Self {
-        let mut tr = Self {
+        Self {
             root,
             owner,
             committed: false,
@@ -75,12 +75,7 @@ where
             tracer: TrieTracer::new(),
             database,
             difflayers: difflayer.map(|d| d.clone()),
-        };
-        // Pre-populate the tracer's access_list with all resolved node paths.
-        // This is required so that deleted_nodes() correctly identifies deletions
-        // for nodes that were pre-resolved in the cache (not via resolve_and_track).
-        tr.populate_access_list_from_root();
-        tr
+        }
     }
 
     /// Returns a clone of the root node Arc (cheap ref-count bump).
@@ -88,40 +83,14 @@ where
         Arc::clone(&self.root)
     }
 
-    /// Walk the root tree and add all resolved (non-Hash) node paths to the
-    /// tracer's access_list. This ensures commit correctness when the trie was
-    /// built from a cached root node.
-    fn populate_access_list_from_root(&mut self) {
-        let root = self.root.clone();
-        Self::walk_and_mark(&mut self.tracer, &root, &mut Vec::new());
-    }
-
-    fn walk_and_mark(tracer: &mut TrieTracer, node: &Node, prefix: &mut Vec<u8>) {
+    /// Mark a resolved (non-Hash) node as accessible in the tracer.
+    /// Called during insert/delete traversal to ensure the access_list
+    /// is correct when using a cached root node.
+    #[inline]
+    fn mark_resolved_node(&mut self, node: &Node, prefix: &[u8]) {
         match node {
-            Node::Full(full) => {
-                tracer.mark_accessible(prefix.as_slice());
-                for i in 0..16u8 {
-                    match full.children[i as usize].as_ref() {
-                        Node::Empty | Node::Hash(_) | Node::Value(_) => {}
-                        child => {
-                            prefix.push(i);
-                            Self::walk_and_mark(tracer, child, prefix);
-                            prefix.pop();
-                        }
-                    }
-                }
-            }
-            Node::Short(short) => {
-                tracer.mark_accessible(prefix.as_slice());
-                match short.val.as_ref() {
-                    Node::Empty | Node::Hash(_) | Node::Value(_) => {}
-                    child => {
-                        let key_start = prefix.len();
-                        prefix.extend_from_slice(&short.key);
-                        Self::walk_and_mark(tracer, child, prefix);
-                        prefix.truncate(key_start);
-                    }
-                }
+            Node::Short(_) | Node::Full(_) => {
+                self.tracer.mark_accessible(prefix);
             }
             _ => {}
         }
@@ -434,6 +403,7 @@ where
         match &*node {
             // Short node - handle key matching and splitting
             Node::Short(short) => {
+                self.mark_resolved_node(&node, &prefix);
                 let matchlen = common_prefix_length(&nibbles_key, &short.key);
 
                 // If the short node's key is a prefix of the insertion key
@@ -507,6 +477,7 @@ where
 
             // Full node - traverse to appropriate child
             Node::Full(full) => {
+                self.mark_resolved_node(&node, &prefix);
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend(&nibbles_key[0..1]);
 
@@ -575,6 +546,7 @@ where
         match &*node {
             // Handle ShortNode deletion
             Node::Short(short) => {
+                self.mark_resolved_node(&node, &prefix);
                 let matchlen = common_prefix_length(&nibbles_key, &short.key);
 
                 // Key doesn't match this short node - no deletion needed
@@ -637,6 +609,7 @@ where
 
             // Handle FullNode deletion
             Node::Full(full) => {
+                self.mark_resolved_node(&node, &prefix);
                 // Prepare prefix for recursive call
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend(&nibbles_key[0..1]);
@@ -780,6 +753,8 @@ where
                 return self.resolve_and_track(hash, prefix);
             }
             _ => {
+                // Mark pre-resolved nodes accessible for tracer correctness.
+                self.mark_resolved_node(&node, prefix);
                 return Ok(node);
             }
         }
