@@ -8,9 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use alloy_primitives::B256;
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
 use super::TrieDB;
-use rust_eth_triedb_state_trie::node::init_empty_root_node;
+use rust_eth_triedb_state_trie::node::{init_empty_root_node, Node, DiffLayers};
 use rust_eth_triedb_common::DiffLayer;
-use rust_eth_triedb_state_trie::node::DiffLayers;
 use tracing::info;
 
 // Global singleton for active_triedb flag - can only be initialized once
@@ -123,6 +122,37 @@ pub fn layer_tree_collect_ancestors(start_root: B256) -> DiffLayers {
 /// Current number of entries in the Layer Tree.
 pub fn layer_tree_len() -> usize {
     get_layer_tree().lock().unwrap().len()
+}
+
+// ---------------------------------------------------------------------------
+// Cached account trie root node (2-slot, keyed by state root)
+// ---------------------------------------------------------------------------
+
+static CACHED_ROOTS: OnceLock<Mutex<Vec<(B256, Arc<Node>)>>> = OnceLock::new();
+
+fn cached_roots_lock() -> &'static Mutex<Vec<(B256, Arc<Node>)>> {
+    CACHED_ROOTS.get_or_init(|| Mutex::new(Vec::with_capacity(2)))
+}
+
+/// Store a pre-resolved account trie root node keyed by root hash.
+pub fn set_cached_account_trie_root(root_hash: B256, root_node: Arc<Node>) {
+    let mut guard = cached_roots_lock().lock().unwrap();
+    if let Some(entry) = guard.iter_mut().find(|(h, _)| *h == root_hash) {
+        entry.1 = root_node;
+        return;
+    }
+    if guard.len() >= 2 {
+        guard.remove(0);
+    }
+    guard.push((root_hash, root_node));
+}
+
+/// Clone the cached root node for the given root hash (non-destructive).
+pub fn get_cached_account_trie_root(root_hash: B256) -> Option<Arc<Node>> {
+    let guard = cached_roots_lock().lock().unwrap();
+    guard.iter()
+        .find(|(h, _)| *h == root_hash)
+        .map(|(_, node)| Arc::clone(node))
 }
 
 // ---------------------------------------------------------------------------

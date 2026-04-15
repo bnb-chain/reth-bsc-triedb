@@ -14,7 +14,10 @@ use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
 
 use crate::triedb::{TrieDB, TrieDBError};
-use crate::triedb_manager::{layer_tree_insert, layer_tree_collect_ancestors, layer_tree_len};
+use crate::triedb_manager::{
+    layer_tree_insert, layer_tree_collect_ancestors, layer_tree_len,
+    set_cached_account_trie_root,
+};
 
 /// Reth-compatible interface functions using hashed keys for TrieDB.
 ///
@@ -474,12 +477,22 @@ where
         self.state_at(parent_root, effective_dl, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
 
+        // Cache parent-root trie (before modifications) for same-parent repeated builds.
+        if let Some(trie) = self.account_trie.as_ref() {
+            set_cached_account_trie_root(parent_root, trie.root_node());
+        }
+
         let step = Instant::now();
-        self.intermediate_inner(
+        let new_root = self.intermediate_inner(
             hashed_post_state.states.clone(),
             hashed_post_state.storage_states.clone(),
             hashed_post_state.states_rebuild.clone())?;
         let intermediate_inner_ms = step.elapsed().as_millis();
+
+        // Cache post-hash trie (new root) for next block's first build.
+        if let Some(trie) = self.account_trie.as_ref() {
+            set_cached_account_trie_root(new_root, trie.root_node());
+        }
 
         let step = Instant::now();
         let result = self.commit(true);

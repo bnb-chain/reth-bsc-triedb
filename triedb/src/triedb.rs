@@ -196,10 +196,17 @@ where
         }
     }
 
-    /// Reset the state of the trie db to the given root hash and difflayer
+    /// Reset the state of the trie db to the given root hash and difflayer.
+    /// Account trie source priority: cached root > prefetcher > build from PathDB.
     pub fn state_at(&mut self, root_hash: B256, difflayer: Option<&DiffLayers>, prefetcher: Option<Arc<TrieDBPrefetchState<DB>>>) -> Result<(), TrieDBError> {
         self.prefetcher = prefetcher;
-        if let Some(prefetcher) = &self.prefetcher {
+
+        if let Some(cached_root) = crate::triedb_manager::get_cached_account_trie_root(root_hash) {
+            let id = SecureTrieId::new(root_hash);
+            self.account_trie = Some(
+                StateTrie::new_from_cached_root(id, cached_root, self.path_db.clone(), difflayer)
+            );
+        } else if let Some(prefetcher) = &self.prefetcher {
             self.account_trie = Some(prefetcher.account_trie.clone());
         } else {
             let id = SecureTrieId::new(root_hash);

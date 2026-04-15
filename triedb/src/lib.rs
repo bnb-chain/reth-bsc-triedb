@@ -20,4 +20,5 @@ pub use triedb_reth::{TrieDBHashedPostState, TrieDBPrefetchState};
 pub use triedb_manager::{
     init_global_triedb_manager, get_global_triedb, disable_triedb,
     layer_tree_insert, layer_tree_collect_ancestors, layer_tree_len,
+    set_cached_account_trie_root, get_cached_account_trie_root,
 };
