@@ -59,23 +59,6 @@ where
         Ok(tr)
     }
 
-    /// Creates a new trie reusing a pre-resolved root node from a previous block.
-    /// No access_list pre-population needed — delete_internal marks paths lazily.
-    pub fn new_from_cached_root(
-        owner: B256, root: Arc<Node>, database: DB, difflayer: Option<&DiffLayers>,
-    ) -> Self {
-        Self {
-            root, owner, committed: false, unhashed: 0, uncommitted: 0,
-            tracer: TrieTracer::new(), database,
-            difflayers: difflayer.map(|d| d.clone()),
-        }
-    }
-
-    /// Returns a clone of the root node Arc (cheap ref-count bump).
-    pub fn root_node(&self) -> Arc<Node> {
-        Arc::clone(&self.root)
-    }
-
     /// Creates a new flag for the trie
     pub fn new_flag(&self) -> NodeFlag {
         NodeFlag::default()
@@ -521,16 +504,6 @@ where
         nibbles_key: Vec<u8>
     ) -> Result<(bool, Arc<Node>), SecureTrieError> {
 
-        // Mark pre-resolved (non-Hash) nodes as accessible for tracer correctness.
-        // Only needed in delete path — ensures deleted_nodes() recognizes deletions
-        // of nodes that were pre-resolved in a cached root (not via resolve_and_track).
-        match &*node {
-            Node::Short(_) | Node::Full(_) => {
-                self.tracer.mark_accessible(&prefix);
-            }
-            _ => {}
-        }
-
         match &*node {
             // Handle ShortNode deletion
             Node::Short(short) => {
@@ -732,16 +705,11 @@ where
     DB::Error: std::fmt::Debug,
 {
 
-    /// Resolves a node from a hash. Also marks pre-resolved nodes as accessible
-    /// (used in delete path for FullNode collapse with cached root).
+    /// Resolves a node from a hash
     pub fn resolve(&mut self, node: Arc<Node> , prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
         match &*node {
             Node::Hash(hash) => {
                 return self.resolve_and_track(hash, prefix);
-            }
-            Node::Short(_) | Node::Full(_) => {
-                self.tracer.mark_accessible(prefix);
-                return Ok(node);
             }
             _ => {
                 return Ok(node);
