@@ -289,6 +289,20 @@ where
                         let is_prefetched = prefetcher_clone.as_ref()
                             .and_then(|p| p.storage_tries.get(&hashed_address))
                             .is_some();
+                        if !is_prefetched {
+                            let pf_keys_count = prefetcher_clone.as_ref()
+                                .map(|p| p.storage_tries.len()).unwrap_or(0);
+                            let has_root = prefetcher_clone.as_ref()
+                                .and_then(|p| p.storage_roots.get(&hashed_address)).is_some();
+                            tracing::debug!(
+                                target: "triedb::timing",
+                                hashed_address = %hex::encode(&hashed_address.as_slice()[..4]),
+                                pf_keys_count,
+                                has_root,
+                                has_prefetcher = prefetcher_clone.is_some(),
+                                "storage trie NOT in prefetcher"
+                            );
+                        }
                         let mut storage_trie = match prefetcher_clone.as_ref()
                             .and_then(|p| p.storage_tries.get(&hashed_address))
                             .cloned()
