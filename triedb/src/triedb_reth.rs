@@ -468,12 +468,15 @@ where
         }
         let lt_len = layer_tree_len();
 
-        let (hits_before, misses_before) = self.path_db.trie_cache_snapshot();
-        let (acct_miss_before, stor_miss_before) = self.path_db.trie_miss_breakdown();
+        let snap0 = self.path_db.trie_cache_snapshot();
+        let miss0 = self.path_db.trie_miss_breakdown();
 
         let step = Instant::now();
         self.state_at(parent_root, effective_dl, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
+
+        let snap1 = self.path_db.trie_cache_snapshot();
+        let miss1 = self.path_db.trie_miss_breakdown();
 
         let step = Instant::now();
         self.intermediate_inner(
@@ -482,21 +485,31 @@ where
             hashed_post_state.states_rebuild.clone())?;
         let intermediate_inner_ms = step.elapsed().as_millis();
 
+        let snap2 = self.path_db.trie_cache_snapshot();
+        let miss2 = self.path_db.trie_miss_breakdown();
+
         let step = Instant::now();
         let result = self.commit(true);
         let commit_ms = step.elapsed().as_millis();
 
-        // Insert the new DiffLayer into the Layer Tree.
         if let Ok((ref new_root, ref new_dl)) = result {
             layer_tree_insert(*new_root, parent_root, new_dl.clone());
         }
 
-        let (hits_after, misses_after) = self.path_db.trie_cache_snapshot();
-        let (acct_miss_after, stor_miss_after) = self.path_db.trie_miss_breakdown();
-        let cache_hits = hits_after - hits_before;
-        let cache_misses = misses_after - misses_before;
-        let acct_misses = acct_miss_after - acct_miss_before;
-        let stor_misses = stor_miss_after - stor_miss_before;
+        let snap3 = self.path_db.trie_cache_snapshot();
+        let miss3 = self.path_db.trie_miss_breakdown();
+
+        let cache_hits = snap3.0 - snap0.0;
+        let cache_misses = snap3.1 - snap0.1;
+        let acct_misses = miss3.0 - miss0.0;
+        let stor_misses = miss3.1 - miss0.1;
+
+        // Per-phase miss breakdown
+        let state_at_misses = (snap1.1 - snap0.1) as i64;
+        let intermediate_misses = (snap2.1 - snap1.1) as i64;
+        let commit_misses = (snap3.1 - snap2.1) as i64;
+        let intermediate_stor = (miss2.1 - miss1.1) as i64;
+        let commit_stor = (miss3.1 - miss2.1) as i64;
 
         debug!(
             target: "triedb::timing",
@@ -510,6 +523,11 @@ where
             cache_misses,
             acct_misses,
             stor_misses,
+            state_at_misses,
+            intermediate_misses,
+            commit_misses,
+            intermediate_stor,
+            commit_stor,
             lt_len,
             caller,
             "intermediate_and_commit breakdown"
