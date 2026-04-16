@@ -11,7 +11,6 @@ pub const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 4;
 pub const DEFAULT_CREATE_IF_MISSING: bool = true;
 pub const DEFAULT_TRIE_NODECACHE_SIZE: u32 = 20_000_000; // 20M entries (~7GB); each entry ~350B (key 74B + blob avg 224B + moka overhead 52B)
 pub const DEFAULT_STORAGE_ROOT_CACHE_SIZE: u32 = 6_000_000; // 6M entries (~1GB); each entry ~164B (key 56B + value 56B + moka overhead 52B)
-pub const DEFAULT_CLEAN_CACHE_SIZE: u32 = 500_000; // ~500K entries (~100MB); read-only cache not polluted by commit writes
 
 // BlockBasedTable configuration constants (directly impacts random reads)
 //
