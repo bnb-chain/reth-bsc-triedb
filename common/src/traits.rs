@@ -263,6 +263,8 @@ pub trait TrieDatabase {
     fn clear_cache(&self);
 
     /// Returns a snapshot of (cache_hits, cache_misses) for trie node lookups.
-    /// Default returns (0, 0) for implementations without cache tracking.
     fn trie_cache_snapshot(&self) -> (u64, u64) { (0, 0) }
+
+    /// Returns (account_trie_misses, storage_trie_misses) breakdown.
+    fn trie_miss_breakdown(&self) -> (u64, u64) { (0, 0) }
 }
