@@ -716,6 +716,8 @@ impl TrieDatabase for PathDB {
 
                 if let Some(difflayer) = difflayer {
                     for (key, node) in difflayer.diff_nodes.iter() {
+                        // Invalidate clean_cache for ALL modified keys (stale prevention).
+                        self.clean_cache.invalidate(key);
                         if node.is_deleted() {
                             self.trie_node_cache.invalidate(key);
                         } else if let Some(blob) = &node.blob {
