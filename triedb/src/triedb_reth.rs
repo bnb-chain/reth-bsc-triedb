@@ -286,13 +286,15 @@ where
                         let acct_start = Instant::now();
 
                         // Try to get storage_trie from prefetcher, otherwise create a new one
+                        let is_prefetched = prefetcher_clone.as_ref()
+                            .and_then(|p| p.storage_tries.get(&hashed_address))
+                            .is_some();
                         let mut storage_trie = match prefetcher_clone.as_ref()
                             .and_then(|p| p.storage_tries.get(&hashed_address))
                             .cloned()
                         {
                             Some(trie) => trie,
                             None => {
-                                // Get storage root from path_db or difflayer
                                 let storage_root = get_storage_root(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
@@ -303,9 +305,9 @@ where
                             }
                         };
 
-                        // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();
                         let slot_count = kvs_vec.len();
+                        let miss_before = path_db_clone.trie_miss_breakdown().1;
                         for (hashed_key, new_value) in kvs_vec {
                             if let Some(new_value) = new_value {
                                 storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
@@ -314,6 +316,18 @@ where
                                 storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
                                     .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
                             }
+                        }
+                        let miss_after = path_db_clone.trie_miss_breakdown().1;
+                        let per_acct_stor_miss = miss_after - miss_before;
+                        if per_acct_stor_miss > 5 {
+                            tracing::debug!(
+                                target: "triedb::timing",
+                                hashed_address = %hex::encode(&hashed_address.as_slice()[..4]),
+                                slot_count,
+                                per_acct_stor_miss,
+                                is_prefetched,
+                                "storage trie per-account miss"
+                            );
                         }
 
                         let new_storage_root = storage_trie.hash();
