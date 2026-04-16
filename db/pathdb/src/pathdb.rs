@@ -124,6 +124,9 @@ pub struct PathDB {
     /// Readable atomic counters for per-call cache stats.
     pub trie_cache_hits: Arc<AtomicU64>,
     pub trie_cache_misses: Arc<AtomicU64>,
+    /// Per-call miss breakdown: account trie misses vs storage trie misses.
+    pub account_trie_misses: Arc<AtomicU64>,
+    pub storage_trie_misses: Arc<AtomicU64>,
 }
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
@@ -174,6 +177,8 @@ impl Clone for PathDB {
             metrics: self.metrics.clone(),
             trie_cache_hits: self.trie_cache_hits.clone(),
             trie_cache_misses: self.trie_cache_misses.clone(),
+            account_trie_misses: self.account_trie_misses.clone(),
+            storage_trie_misses: self.storage_trie_misses.clone(),
         }
     }
 }
@@ -273,6 +278,8 @@ impl PathDB {
             metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
             trie_cache_hits: Arc::new(AtomicU64::new(0)),
             trie_cache_misses: Arc::new(AtomicU64::new(0)),
+            account_trie_misses: Arc::new(AtomicU64::new(0)),
+            storage_trie_misses: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -317,7 +324,6 @@ impl PathDB {
 
 impl PathDB {
     pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
-        // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
             self.metrics.trie_node_cache_hits.increment(1);
@@ -330,25 +336,26 @@ impl PathDB {
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
-        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-        // Cache miss, read from DB
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
-                trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Insert into cache - mini_moka handles LRU eviction automatically
+                // Track miss breakdown by trie type
+                if key.first() == Some(&b'A') {
+                    self.account_trie_misses.fetch_add(1, Ordering::Relaxed);
+                } else if key.first() == Some(&b'O') {
+                    self.storage_trie_misses.fetch_add(1, Ordering::Relaxed);
+                }
                 self.trie_node_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
-                trace!(target: "pathdb::rocksdb", "Key not found in CF '{}': 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Cache None values to avoid repeated DB lookups
                 self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
-                error!(target: "pathdb::rocksdb", "Error getting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                Err(PathProviderError::Database(format!("RocksDB get in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
+                let hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                error!(target: "pathdb::rocksdb", "Error getting key 0x{}: {}", hex, e);
+                Err(PathProviderError::Database(format!("RocksDB get error for key 0x{}: {}", hex, e)))
             }
         }
     }
@@ -632,6 +639,13 @@ impl TrieDatabase for PathDB {
         (
             self.trie_cache_hits.load(Ordering::Relaxed),
             self.trie_cache_misses.load(Ordering::Relaxed),
+        )
+    }
+
+    fn trie_miss_breakdown(&self) -> (u64, u64) {
+        (
+            self.account_trie_misses.load(Ordering::Relaxed),
+            self.storage_trie_misses.load(Ordering::Relaxed),
         )
     }
 

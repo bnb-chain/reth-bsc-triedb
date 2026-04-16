@@ -469,6 +469,7 @@ where
         let lt_len = layer_tree_len();
 
         let (hits_before, misses_before) = self.path_db.trie_cache_snapshot();
+        let (acct_miss_before, stor_miss_before) = self.path_db.trie_miss_breakdown();
 
         let step = Instant::now();
         self.state_at(parent_root, effective_dl, prefetcher)?;
@@ -491,8 +492,11 @@ where
         }
 
         let (hits_after, misses_after) = self.path_db.trie_cache_snapshot();
+        let (acct_miss_after, stor_miss_after) = self.path_db.trie_miss_breakdown();
         let cache_hits = hits_after - hits_before;
         let cache_misses = misses_after - misses_before;
+        let acct_misses = acct_miss_after - acct_miss_before;
+        let stor_misses = stor_miss_after - stor_miss_before;
 
         debug!(
             target: "triedb::timing",
@@ -504,6 +508,8 @@ where
             storage_states_count = hashed_post_state.storage_states.len(),
             cache_hits,
             cache_misses,
+            acct_misses,
+            stor_misses,
             lt_len,
             caller,
             "intermediate_and_commit breakdown"
