@@ -294,12 +294,13 @@ where
                                 .map(|p| p.storage_tries.len()).unwrap_or(0);
                             let has_root = prefetcher_clone.as_ref()
                                 .and_then(|p| p.storage_roots.get(&hashed_address)).is_some();
+                            let caller = if prefetcher_clone.is_some() { "miner" } else { "import" };
                             tracing::debug!(
                                 target: "triedb::timing",
                                 hashed_address = %hex::encode(&hashed_address.as_slice()[..4]),
                                 pf_keys_count,
                                 has_root,
-                                has_prefetcher = prefetcher_clone.is_some(),
+                                caller,
                                 "storage trie NOT in prefetcher"
                             );
                         }
@@ -334,12 +335,14 @@ where
                         let miss_after = path_db_clone.trie_miss_breakdown().1;
                         let per_acct_stor_miss = miss_after - miss_before;
                         if per_acct_stor_miss > 5 {
+                            let caller = if prefetcher_clone.is_some() { "miner" } else { "import" };
                             tracing::debug!(
                                 target: "triedb::timing",
                                 hashed_address = %hex::encode(&hashed_address.as_slice()[..4]),
                                 slot_count,
                                 per_acct_stor_miss,
                                 is_prefetched,
+                                caller,
                                 "storage trie per-account miss"
                             );
                         }
