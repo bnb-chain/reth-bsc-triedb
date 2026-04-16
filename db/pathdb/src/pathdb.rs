@@ -114,10 +114,13 @@ pub struct PathDB {
     /// Read options for read operations.
     pub read_options: ReadOptions,
     /// Thread-safe LRU cache for trie node key-value pairs.
-    /// Uses mini_moka for high-concurrency performance with sharded locks.
+    /// Written by BOTH read path (cache-on-miss) AND commit path (cache-on-write).
     pub trie_node_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
+    /// Read-only clean cache: populated ONLY by read path (get_raw_trie_node on miss).
+    /// NOT written by commit_difflayer, so it retains hot read data without pollution.
+    /// Equivalent to geth's diskLayer.nodes fastcache.
+    pub clean_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Thread-safe LRU cache for storage root key-value pairs.
-    /// Uses mini_moka for high-concurrency performance with sharded locks.
     pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Metrics for the PathDB.
     metrics: PathDBMetrics,
@@ -170,6 +173,7 @@ impl Clone for PathDB {
             write_options,
             read_options,
             trie_node_cache: self.trie_node_cache.clone(),
+            clean_cache: self.clean_cache.clone(),
             storage_root_cache: self.storage_root_cache.clone(),
             metrics: self.metrics.clone(),
             trie_cache_hits: self.trie_cache_hits.clone(),
@@ -248,11 +252,14 @@ impl PathDB {
         let trie_node_cache_size = config.trie_node_cache_size;
         let storage_root_cache_size = config.storage_root_cache_size;
 
-        // Create thread-safe LRU caches using mini_moka.
-        // CacheBuilder::new(n) sets max_capacity = n; the weigher returns 1 per entry
-        // so capacity is measured in number of entries.
         let trie_node_cache = Arc::new(
             CacheBuilder::new(trie_node_cache_size as u64)
+                .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
+                .build()
+        );
+        // Clean cache: read-only, not polluted by commit_difflayer writes.
+        let clean_cache = Arc::new(
+            CacheBuilder::new(DEFAULT_CLEAN_CACHE_SIZE as u64)
                 .weigher(|_k: &Vec<u8>, _v: &Option<Vec<u8>>| -> u32 { 1 })
                 .build()
         );
@@ -269,6 +276,7 @@ impl PathDB {
             write_options,
             read_options,
             trie_node_cache,
+            clean_cache,
             storage_root_cache,
             metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
             trie_cache_hits: Arc::new(AtomicU64::new(0)),
@@ -317,38 +325,47 @@ impl PathDB {
 
 impl PathDB {
     pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
-        // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
-        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+
+        // 1. Check clean_cache first (read-only, not polluted by commits)
+        if let Some(cached_value) = self.clean_cache.get(&key_vec) {
             self.metrics.trie_node_cache_hits.increment(1);
             self.trie_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached_value);
         }
+
+        // 2. Check trie_node_cache (written by both reads and commits)
+        if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
+            self.metrics.trie_node_cache_hits.increment(1);
+            self.trie_cache_hits.fetch_add(1, Ordering::Relaxed);
+            // Promote to clean_cache since this is a read hit
+            self.clean_cache.insert(key_vec, cached_value.clone());
+            return Ok(cached_value);
+        }
+
         self.metrics.trie_node_cache_misses.increment(1);
         self.trie_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
-        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-        // Cache miss, read from DB
+        // 3. Cache miss → read from RocksDB → populate BOTH caches
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
-                trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Insert into cache - mini_moka handles LRU eviction automatically
+                self.clean_cache.insert(key_vec.clone(), Some(value.clone()));
                 self.trie_node_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
-                trace!(target: "pathdb::rocksdb", "Key not found in CF '{}': 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Cache None values to avoid repeated DB lookups
+                self.clean_cache.insert(key_vec.clone(), None);
                 self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
-                error!(target: "pathdb::rocksdb", "Error getting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                Err(PathProviderError::Database(format!("RocksDB get in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
+                let hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                error!(target: "pathdb::rocksdb", "Error getting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, hex, e);
+                Err(PathProviderError::Database(format!("RocksDB get in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, hex, e)))
             }
         }
     }
