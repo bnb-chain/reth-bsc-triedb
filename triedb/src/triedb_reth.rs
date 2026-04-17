@@ -8,7 +8,7 @@ use std::time::Instant;
 use tracing::debug;
 use alloy_primitives::{B256, U256, hex};
 use rust_eth_triedb_common::TrieDatabase;
-use rust_eth_triedb_state_trie::node::{MergedNodeSet, DiffLayer, DiffLayers, TrieNode};
+use rust_eth_triedb_state_trie::node::{MergedNodeSet, DiffLayer, DiffLayers};
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
 use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
@@ -475,16 +475,28 @@ where
         let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
-        // Merge engine-provided DiffLayers with Layer Tree ancestors into
-        // a single flat DiffLayer for O(1) resolve lookups.
+        // Merge engine-provided DiffLayers with Layer Tree ancestors.
+        // collect_ancestors already flattens tree layers into 1 layer,
+        // so the merged stack is only 2-3 layers (engine + flat tree).
         let tree_layers = layer_tree_collect_ancestors(parent_root);
         let lt_len = layer_tree_len();
-        let merged_difflayer = if tree_layers.is_empty() && difflayer.is_none() {
+        let merged_difflayer = if tree_layers.is_empty() {
             None
         } else {
-            Some(Self::flatten_difflayers(difflayer, &tree_layers))
+            let mut merged = DiffLayers::default();
+            // Engine layers first (newest, highest priority)
+            if let Some(engine_dl) = difflayer {
+                for dl in &engine_dl.diff_layers {
+                    merged.insert_difflayer(dl.clone());
+                }
+            }
+            // Then flat tree layer (older ancestors, already merged into 1 layer)
+            for dl in &tree_layers.diff_layers {
+                merged.insert_difflayer(dl.clone());
+            }
+            Some(merged)
         };
-        let effective_dl = merged_difflayer.as_ref();
+        let effective_dl = merged_difflayer.as_ref().or(difflayer);
 
         let snap0 = self.path_db.trie_cache_snapshot();
         let miss0 = self.path_db.trie_miss_breakdown();
@@ -563,14 +575,23 @@ where
     where
         DB: 'static,
     {
-        // Merge with Layer Tree ancestors into a single flat DiffLayer.
+        // Merge with Layer Tree ancestors (same stacked logic).
         let tree_layers = layer_tree_collect_ancestors(parent_root);
-        let merged_difflayer = if tree_layers.is_empty() && difflayer.is_none() {
+        let merged_difflayer = if tree_layers.is_empty() {
             None
         } else {
-            Some(Self::flatten_difflayers(difflayer, &tree_layers))
+            let mut merged = DiffLayers::default();
+            if let Some(engine_dl) = difflayer {
+                for dl in &engine_dl.diff_layers {
+                    merged.insert_difflayer(dl.clone());
+                }
+            }
+            for dl in &tree_layers.diff_layers {
+                merged.insert_difflayer(dl.clone());
+            }
+            Some(merged)
         };
-        let effective_dl = merged_difflayer.as_ref();
+        let effective_dl = merged_difflayer.as_ref().or(difflayer);
 
         self.state_at(parent_root, effective_dl, prefetcher)?;
         self.intermediate_inner(
@@ -588,47 +609,6 @@ where
         Ok((root_hash, difflayer))
     }
 
-    /// Merge engine-provided DiffLayers with tree-collected (already flat)
-    /// DiffLayers into a single flat DiffLayer.
-    ///
-    /// Priority: engine layers (newest) > tree layers (older ancestors).
-    /// Tree layers come from `collect_ancestors` which already flattened them
-    /// into at most 1 layer.
-    fn flatten_difflayers(
-        engine_dl: Option<&DiffLayers>,
-        tree_layers: &DiffLayers,
-    ) -> DiffLayers {
-        let mut flat_nodes: HashMap<Vec<u8>, Arc<TrieNode>> = HashMap::new();
-        let mut flat_roots: HashMap<B256, B256> = HashMap::new();
-
-        // Insert tree layers first (older, lower priority — will be overwritten)
-        for dl in &tree_layers.diff_layers {
-            for (k, v) in dl.diff_nodes.iter() {
-                flat_nodes.insert(k.clone(), v.clone());
-            }
-            for (k, v) in dl.diff_storage_roots.iter() {
-                flat_roots.insert(*k, *v);
-            }
-        }
-
-        // Engine layers overwrite (newer, higher priority)
-        if let Some(engine) = engine_dl {
-            for dl in &engine.diff_layers {
-                for (k, v) in dl.diff_nodes.iter() {
-                    flat_nodes.insert(k.clone(), v.clone());
-                }
-                for (k, v) in dl.diff_storage_roots.iter() {
-                    flat_roots.insert(*k, *v);
-                }
-            }
-        }
-
-        let flat = Arc::new(DiffLayer::new(
-            Arc::new(flat_nodes),
-            Arc::new(flat_roots),
-        ));
-        DiffLayers { diff_layers: vec![flat] }
-    }
 }
 
 
