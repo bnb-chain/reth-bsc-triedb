@@ -9,7 +9,7 @@ use alloy_primitives::B256;
 use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
 use super::TrieDB;
 use rust_eth_triedb_state_trie::node::init_empty_root_node;
-use rust_eth_triedb_common::DiffLayer;
+use rust_eth_triedb_common::{DiffLayer, TrieNode};
 use rust_eth_triedb_state_trie::node::DiffLayers;
 use tracing::info;
 
@@ -60,6 +60,13 @@ struct LayerTree {
     layers: HashMap<B256, LayerEntry>,
     insertion_order: VecDeque<B256>,
     max_entries: usize,
+    /// Cached flattened DiffLayer for a given start_root + generation.
+    /// Avoids re-flattening when the same parent_root is queried multiple
+    /// times within a single block (e.g., multiple miner candidates).
+    flat_cache: Option<(B256, u64, Arc<DiffLayer>)>,
+    /// Monotonically increasing counter, bumped on every insert/eviction
+    /// so that stale flat_cache entries are invalidated.
+    generation: u64,
 }
 
 impl LayerTree {
@@ -68,6 +75,8 @@ impl LayerTree {
             layers: HashMap::with_capacity(max_entries),
             insertion_order: VecDeque::with_capacity(max_entries),
             max_entries,
+            flat_cache: None,
+            generation: 0,
         }
     }
 
@@ -82,21 +91,65 @@ impl LayerTree {
         }
         self.layers.insert(state_root, LayerEntry { parent_root, diff_layer });
         self.insertion_order.push_back(state_root);
+        self.generation += 1;
     }
 
-    fn collect_ancestors(&self, start_root: B256) -> DiffLayers {
-        let mut result = DiffLayers::default();
+    /// Walk the parent chain from `start_root` and return a **single flat
+    /// DiffLayer** that merges all ancestors.  The result is cached so that
+    /// repeated calls with the same `start_root` within the same generation
+    /// (i.e. before any new insert/eviction) are O(1).
+    fn collect_ancestors(&mut self, start_root: B256) -> DiffLayers {
+        // Fast path: cache hit
+        if let Some((cached_root, cached_gen, ref cached_flat)) = self.flat_cache {
+            if cached_root == start_root && cached_gen == self.generation {
+                return DiffLayers { diff_layers: vec![cached_flat.clone()] };
+            }
+        }
+
+        // Walk parent chain, flattening into a single HashMap.
+        // Walk order is newest → oldest.  We use `entry().or_insert_with()`
+        // so the first (= newest) value for each key wins.
+        let mut flat_nodes: HashMap<Vec<u8>, Arc<TrieNode>> = HashMap::new();
+        let mut flat_roots: HashMap<B256, B256> = HashMap::new();
         let mut current = start_root;
+        let mut depth = 0u32;
+
         for _ in 0..self.max_entries {
             match self.layers.get(&current) {
                 Some(entry) => {
-                    result.insert_difflayer(entry.diff_layer.clone());
+                    for (k, v) in entry.diff_layer.diff_nodes.iter() {
+                        flat_nodes.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    for (k, v) in entry.diff_layer.diff_storage_roots.iter() {
+                        flat_roots.entry(*k).or_insert(*v);
+                    }
                     current = entry.parent_root;
+                    depth += 1;
                 }
                 None => break,
             }
         }
-        result
+
+        if flat_nodes.is_empty() && flat_roots.is_empty() {
+            self.flat_cache = None;
+            return DiffLayers::default();
+        }
+
+        let flat = Arc::new(DiffLayer::new(
+            Arc::new(flat_nodes),
+            Arc::new(flat_roots),
+        ));
+        self.flat_cache = Some((start_root, self.generation, flat.clone()));
+
+        tracing::debug!(
+            target: "triedb::timing",
+            depth,
+            flat_nodes = flat.diff_nodes.len(),
+            flat_storage_roots = flat.diff_storage_roots.len(),
+            "collect_ancestors flattened"
+        );
+
+        DiffLayers { diff_layers: vec![flat] }
     }
 
     fn len(&self) -> usize {
