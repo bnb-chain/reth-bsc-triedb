@@ -285,13 +285,30 @@ where
                         let acct_start = Instant::now();
 
                         // Try to get storage_trie from prefetcher, otherwise create a new one
+                        let is_prefetched = prefetcher_clone.as_ref()
+                            .and_then(|p| p.storage_tries.get(&hashed_address))
+                            .is_some();
+                        if !is_prefetched {
+                            let pf_keys_count = prefetcher_clone.as_ref()
+                                .map(|p| p.storage_tries.len()).unwrap_or(0);
+                            let has_root = prefetcher_clone.as_ref()
+                                .and_then(|p| p.storage_roots.get(&hashed_address)).is_some();
+                            let caller = if prefetcher_clone.is_some() { "miner" } else { "import" };
+                            tracing::debug!(
+                                target: "triedb::timing",
+                                hashed_address = %hex::encode(&hashed_address.as_slice()[..4]),
+                                pf_keys_count,
+                                has_root,
+                                caller,
+                                "storage trie NOT in prefetcher"
+                            );
+                        }
                         let mut storage_trie = match prefetcher_clone.as_ref()
                             .and_then(|p| p.storage_tries.get(&hashed_address))
                             .cloned()
                         {
                             Some(trie) => trie,
                             None => {
-                                // Get storage root from path_db or difflayer
                                 let storage_root = get_storage_root(hashed_address)?;
                                 let id = SecureTrieId::new(storage_root)
                                     .with_owner(hashed_address);
@@ -302,9 +319,9 @@ where
                             }
                         };
 
-                        // Parallel execution for kvs within each address
                         let kvs_vec: Vec<_> = kvs.into_iter().collect();
                         let slot_count = kvs_vec.len();
+                        let miss_before = path_db_clone.trie_miss_breakdown().1;
                         for (hashed_key, new_value) in kvs_vec {
                             if let Some(new_value) = new_value {
                                 storage_trie.update_storage_u256_with_hash_state(hashed_address, hashed_key, new_value)
@@ -313,6 +330,20 @@ where
                                 storage_trie.delete_storage_with_hash_state(hashed_address, hashed_key)
                                     .map_err(|e| TrieDBError::Database(format!("Failed to delete storage for hashed_address: 0x{}, hashed_key: 0x{}, error: {}", hex::encode(hashed_address), hex::encode(hashed_key), e)))?;
                             }
+                        }
+                        let miss_after = path_db_clone.trie_miss_breakdown().1;
+                        let per_acct_stor_miss = miss_after - miss_before;
+                        if per_acct_stor_miss > 5 {
+                            let caller = if prefetcher_clone.is_some() { "miner" } else { "import" };
+                            tracing::debug!(
+                                target: "triedb::timing",
+                                hashed_address = %hex::encode(&hashed_address.as_slice()[..4]),
+                                slot_count,
+                                per_acct_stor_miss,
+                                is_prefetched,
+                                caller,
+                                "storage trie per-account miss"
+                            );
                         }
 
                         let new_storage_root = storage_trie.hash();
@@ -443,13 +474,15 @@ where
         let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
-        // Snapshot PathDB cache counters before this call.
-        let (hits_before, misses_before) = self.path_db.trie_cache_snapshot();
-        let (acct_miss_before, stor_miss_before) = self.path_db.trie_miss_breakdown();
+        let snap0 = self.path_db.trie_cache_snapshot();
+        let miss0 = self.path_db.trie_miss_breakdown();
 
         let step = Instant::now();
         self.state_at(parent_root, difflayer, prefetcher)?;
         let state_at_ms = step.elapsed().as_millis();
+
+        let snap1 = self.path_db.trie_cache_snapshot();
+        let miss1 = self.path_db.trie_miss_breakdown();
 
         let step = Instant::now();
         self.intermediate_inner(
@@ -458,16 +491,27 @@ where
             hashed_post_state.states_rebuild.clone())?;
         let intermediate_inner_ms = step.elapsed().as_millis();
 
+        let snap2 = self.path_db.trie_cache_snapshot();
+        let miss2 = self.path_db.trie_miss_breakdown();
+
         let step = Instant::now();
         let result = self.commit(true);
         let commit_ms = step.elapsed().as_millis();
 
-        let (hits_after, misses_after) = self.path_db.trie_cache_snapshot();
-        let (acct_miss_after, stor_miss_after) = self.path_db.trie_miss_breakdown();
-        let cache_hits = hits_after - hits_before;
-        let cache_misses = misses_after - misses_before;
-        let acct_misses = acct_miss_after - acct_miss_before;
-        let stor_misses = stor_miss_after - stor_miss_before;
+        let snap3 = self.path_db.trie_cache_snapshot();
+        let miss3 = self.path_db.trie_miss_breakdown();
+
+        let cache_hits = snap3.0 - snap0.0;
+        let cache_misses = snap3.1 - snap0.1;
+        let acct_misses = miss3.0 - miss0.0;
+        let stor_misses = miss3.1 - miss0.1;
+
+        // Per-phase miss breakdown
+        let state_at_misses = (snap1.1 - snap0.1) as i64;
+        let intermediate_misses = (snap2.1 - snap1.1) as i64;
+        let commit_misses = (snap3.1 - snap2.1) as i64;
+        let intermediate_stor = (miss2.1 - miss1.1) as i64;
+        let commit_stor = (miss3.1 - miss2.1) as i64;
 
         debug!(
             target: "triedb::timing",
@@ -481,6 +525,11 @@ where
             cache_misses,
             acct_misses,
             stor_misses,
+            state_at_misses,
+            intermediate_misses,
+            commit_misses,
+            intermediate_stor,
+            commit_stor,
             caller,
             "intermediate_and_commit breakdown"
         );
