@@ -12,7 +12,7 @@ use rocksdb::{
 };
 // use schnellru::{ByLength, LruMap};
 use mini_moka::sync::{Cache as MokaCache, CacheBuilder};
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
@@ -711,18 +711,56 @@ impl TrieDatabase for PathDB {
                 self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
                 self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
 
+                // Admission probe: count how many commit-path inserts actually land in moka.
+                // If mini_moka's TinyLFU admission rejects cold inserts, these numbers will
+                // diverge significantly (admitted << attempted).
+                let mut node_insert_attempted: u64 = 0;
+                let mut node_insert_admitted: u64 = 0;
+                let mut node_invalidated: u64 = 0;
+                let mut root_insert_attempted: u64 = 0;
+                let mut root_insert_admitted: u64 = 0;
+
                 if let Some(difflayer) = difflayer {
                     for (key, node) in difflayer.diff_nodes.iter() {
                         if node.is_deleted() {
                             self.trie_node_cache.invalidate(key);
+                            node_invalidated += 1;
                         } else if let Some(blob) = &node.blob {
                             self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                            node_insert_attempted += 1;
+                            if self.trie_node_cache.get(key).is_some() {
+                                node_insert_admitted += 1;
+                            }
                         }
                     }
                     for (key, value) in difflayer.diff_storage_roots.iter() {
                         self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
+                        root_insert_attempted += 1;
+                        if self.storage_root_cache.get(&key.as_slice().to_vec()).is_some() {
+                            root_insert_admitted += 1;
+                        }
                     }
                 }
+
+                let (trie_cache_entries, storage_root_cache_entries) = self.cache_stats();
+                debug!(
+                    target: "pathdb::admission",
+                    block_number,
+                    node_insert_attempted,
+                    node_insert_admitted,
+                    node_admit_pct = if node_insert_attempted > 0 {
+                        node_insert_admitted * 100 / node_insert_attempted
+                    } else { 0 },
+                    node_invalidated,
+                    root_insert_attempted,
+                    root_insert_admitted,
+                    root_admit_pct = if root_insert_attempted > 0 {
+                        root_insert_admitted * 100 / root_insert_attempted
+                    } else { 0 },
+                    trie_cache_entries,
+                    storage_root_cache_entries,
+                    "commit_difflayer moka admission"
+                );
 
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())
