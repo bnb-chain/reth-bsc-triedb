@@ -476,6 +476,7 @@ where
 
         let snap0 = self.path_db.trie_cache_snapshot();
         let miss0 = self.path_db.trie_miss_breakdown();
+        let resolve0 = rust_eth_triedb_state_trie::resolve_counter_snapshot();
 
         let step = Instant::now();
         self.state_at(parent_root, difflayer, prefetcher)?;
@@ -500,6 +501,7 @@ where
 
         let snap3 = self.path_db.trie_cache_snapshot();
         let miss3 = self.path_db.trie_miss_breakdown();
+        let resolve1 = rust_eth_triedb_state_trie::resolve_counter_snapshot();
 
         let cache_hits = snap3.0 - snap0.0;
         let cache_misses = snap3.1 - snap0.1;
@@ -512,6 +514,15 @@ where
         let commit_misses = (snap3.1 - snap2.1) as i64;
         let intermediate_stor = (miss2.1 - miss1.1) as i64;
         let commit_stor = (miss3.1 - miss2.1) as i64;
+
+        // DiffLayer filter rate: how much of all resolve calls get absorbed by DiffLayer
+        // versus falling through to PathDB (moka/RocksDB).
+        let resolve_total = resolve1.0 - resolve0.0;
+        let resolve_difflayer_hit = resolve1.1 - resolve0.1;
+        let resolve_fallthrough = resolve_total.saturating_sub(resolve_difflayer_hit);
+        let difflayer_filter_pct = if resolve_total > 0 {
+            resolve_difflayer_hit * 100 / resolve_total
+        } else { 0 };
 
         debug!(
             target: "triedb::timing",
@@ -530,6 +541,10 @@ where
             commit_misses,
             intermediate_stor,
             commit_stor,
+            resolve_total,
+            resolve_difflayer_hit,
+            resolve_fallthrough,
+            difflayer_filter_pct,
             caller,
             "intermediate_and_commit breakdown"
         );
