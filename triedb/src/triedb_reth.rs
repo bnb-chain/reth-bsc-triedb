@@ -474,6 +474,14 @@ where
         let caller = if prefetcher.is_some() { "miner" } else { "import" };
         let total_start = Instant::now();
 
+        // Probe: actual DiffLayer chain depth at the time this call starts.
+        // If this is << memory_block_buffer_target, the engine tree is not surfacing
+        // as many historical DiffLayers as the config suggests.
+        let difflayer_chain_depth = difflayer.map(|d| d.diff_layers.len()).unwrap_or(0);
+        let difflayer_total_nodes: usize = difflayer.map(|d| {
+            d.diff_layers.iter().map(|l| l.diff_nodes.len()).sum()
+        }).unwrap_or(0);
+
         let snap0 = self.path_db.trie_cache_snapshot();
         let miss0 = self.path_db.trie_miss_breakdown();
         let resolve0 = rust_eth_triedb_state_trie::resolve_counter_snapshot();
@@ -545,6 +553,8 @@ where
             resolve_difflayer_hit,
             resolve_fallthrough,
             difflayer_filter_pct,
+            difflayer_chain_depth,
+            difflayer_total_nodes,
             caller,
             "intermediate_and_commit breakdown"
         );
