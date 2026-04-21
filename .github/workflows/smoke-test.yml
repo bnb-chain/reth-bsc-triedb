@@ -54,3 +54,8 @@ jobs:
           cd smoke-test
           cargo test test_state_trie_smoke_test -- --nocapture
 
+      - name: Test generate storage root smoke test
+        run: |
+          cd cli
+          cargo test test_generate_storage_root_smoke -- --nocapture
+

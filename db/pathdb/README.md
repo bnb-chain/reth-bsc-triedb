@@ -230,6 +230,53 @@ Tests include:
 3. **Snapshots**: Use snapshots for read-heavy workloads that need consistency
 4. **Iterators**: Use prefix iterators when you only need a subset of data
 
+### BlockBasedTable tuning (important for trie node random reads)
+
+RocksDB's BlockBasedTable options **directly impact random read performance** for trie nodes.
+If you don't explicitly configure a block cache, RocksDB will fall back to a very small internal
+cache (often ~8MB), which is usually insufficient for TrieDB workloads.
+
+`PathProviderConfig` exposes the most relevant knobs:
+
+```rust
+use rust_eth_triedb_pathdb::{PathDB, PathProviderConfig};
+
+let mut cfg = PathProviderConfig::default();
+
+// Example: 8GB block cache for SST data blocks (random reads benefit heavily).
+cfg.block_cache_size_bytes = 8 * 1024 * 1024 * 1024;
+
+// Bloom/filter/index cache settings (sane defaults are already provided):
+// cfg.bloom_filter_bits_per_key = 10.0;
+// cfg.cache_index_and_filter_blocks = true;
+// cfg.pin_l0_filter_and_index_blocks_in_cache = true;
+
+let db = PathDB::new("/path/to/rocksdb", cfg)?;
+```
+
+### When do you need a full compaction?
+
+- **Not required** for the cache-related options (`block_cache`, `cache_index_and_filter_blocks`,
+  `pin_l0_filter_and_index_blocks_in_cache`). These affect the **read path** and will take effect
+  immediately after reopening the DB.
+- **Recommended** if you want existing on-disk SSTs to be **rewritten** so their table layout
+  (especially filter/index blocks) matches your updated BlockBasedTable configuration. This is
+  useful when migrating from older DBs or after significant config changes.
+
+#### Run full compaction from CLI
+
+The repository provides a small CLI binary `triedb-cli` with a `compact-db` subcommand.
+
+```bash
+# From the rust-eth-triedb workspace root
+cargo run -p rust-eth-triedb-cli -- compact-db --path /path/to/rocksdb
+```
+
+Notes:
+- This opens the DB with `create_if_missing=false` to avoid accidentally creating a new empty DB
+  when a path is wrong.
+- The compaction runs over the full key-range for **all column families** used by `PathDB`.
+
 ## Integration with Reth
 
 PathDB is designed to be integrated into the Reth blockchain client as a submodule. It provides the foundation for state storage and can be extended with additional functionality as needed.

@@ -1,14 +1,8 @@
 //! Basic operations for TrieDB.
 
-use std::sync::Arc;
-use std::collections::HashMap;
-use rayon::prelude::*;
-use std::time::Instant;
-
 use alloy_primitives::{keccak256, Address, B256};
 use alloy_trie::EMPTY_ROOT_HASH;
 use rust_eth_triedb_common::TrieDatabase;
-use rust_eth_triedb_state_trie::node::{MergedNodeSet, NodeSet};
 use rust_eth_triedb_state_trie::state_trie::StateTrie;
 use rust_eth_triedb_state_trie::account::StateAccount;
 use rust_eth_triedb_state_trie::{SecureTrieId, SecureTrieTrait, SecureTrieBuilder};
@@ -84,82 +78,6 @@ where
     fn delete_storage(&mut self, address: Address, key: &[u8]) -> Result<(), TrieDBError> {
         let mut storage_trie = self.get_storage_trie(address)?;
         Ok(storage_trie.delete_storage(address, key)?)
-    }
-}
-
-/// Commit and calculate hash functions
-impl<DB> TrieDB<DB>
-where
-    DB: TrieDatabase + Clone + Send + Sync,
-    DB::Error: std::fmt::Debug,
-{
-    pub fn calculate_hash(&mut self) -> Result<B256, TrieDBError> {
-        let hash_start = Instant::now();
-
-        let (storage_hashes, storage_tries): (HashMap<B256, B256>, HashMap<B256, StateTrie<DB>>) = self.storage_tries
-        .par_iter()
-        .map(|(key, trie)| {
-            let mut trie_clone = trie.clone();
-            let hash = trie_clone.hash();
-            (*key, hash, trie_clone)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .fold((HashMap::new(), HashMap::new()), |(mut hashes, mut tries), (key, hash, trie)| {
-            hashes.insert(key, hash);
-            tries.insert(key, trie);
-            (hashes, tries)
-        });
-
-        for (hashed_address, storage_hash) in storage_hashes {   
-            let mut account = self.accounts_with_storage_trie.get(&hashed_address).unwrap().clone();
-            account.storage_root = storage_hash;
-            self.updated_storage_roots.insert(hashed_address, storage_hash);
-            self.update_account_with_hash_state(hashed_address, &account)?;
-        }
-        self.storage_tries.extend(storage_tries);
-
-        let hash = self.account_trie.as_mut().unwrap().hash();
-        self.metrics.record_hash_duration(hash_start.elapsed().as_secs_f64());
-        Ok(hash)
-    }
-
-    pub fn commit(&mut self, _collect_leaf: bool) -> Result<(B256, Arc<MergedNodeSet>), TrieDBError> {
-        let root_hash = self.calculate_hash()?;
-
-        let commit_start = Instant::now();
-        let mut merged_node_set = MergedNodeSet::new();
-
-        // Start both tasks in parallel using rayon
-        let mut account_trie_clone = self.account_trie.as_mut().unwrap().clone();
-        let (account_commit_result, storage_commit_results): (Result<(B256, Option<Arc<NodeSet>>), _>, Vec<(B256, Option<Arc<NodeSet>>)>) = rayon::join(
-            || account_trie_clone.commit(true),
-            || self.storage_tries
-                .par_iter()
-                .map(|(hashed_address, trie)| {
-                    let (_, node_set) = trie.clone().commit(false).unwrap();
-                    (*hashed_address, node_set)
-                })
-                .collect()
-        );
-        drop(account_trie_clone);
-
-        let (_, account_node_set) = account_commit_result?;
-
-        if let Some(node_set) = account_node_set {
-            merged_node_set.merge(node_set)
-                .map_err(|e| TrieDBError::Database(e))?;
-        }
-
-        for (_, node_set) in storage_commit_results {
-            if let Some(node_set) = node_set {
-                merged_node_set.merge(node_set)
-                    .map_err(|e| TrieDBError::Database(e))?;
-            }
-        }
-
-        self.metrics.record_commit_duration(commit_start.elapsed().as_secs_f64());
-        Ok((root_hash, Arc::new(merged_node_set)))
     }
 }
 

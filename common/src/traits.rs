@@ -152,6 +152,28 @@ pub trait TrieDatabase {
     /// failures.
     fn get_storage_root(&self, hased_address: B256) -> Result<Option<B256>, Self::Error>;
     
+    /// Inserts or updates a storage root in the database.
+    ///
+    /// This method stores the storage root at the specified address. If a
+    /// storage root already exists for this address, it will be overwritten with the new value.
+    ///
+    /// # Arguments
+    ///
+    /// * `hased_address` - The Keccak-256 hash of the account address (`B256`).
+    ///   This is used as the key to store the storage root.
+    /// * `value` - The storage root hash (`B256`) to store.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - The storage root was successfully stored.
+    /// * `Err(error)` - An error occurred during the database write operation.
+    ///
+    /// # Errors
+    ///
+    /// This method may return errors related to database I/O or backend-specific
+    /// failures.
+    fn put_storage_root(&self, hased_address: B256, value: B256) -> Result<(), Self::Error>;
+
     /// Commits a diff layer to the database, persisting state changes for a block.
     ///
     /// This method is responsible for atomically writing all state changes

@@ -706,7 +706,7 @@ where
 {
 
     /// Resolves a node from a hash
-    fn resolve(&mut self, node: Arc<Node> , prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
+    pub fn resolve(&mut self, node: Arc<Node> , prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
         match &*node {
             Node::Hash(hash) => {
                 return self.resolve_and_track(hash, prefix);
@@ -718,7 +718,7 @@ where
     }
 
     /// Resolves a hash and tracks it in the difflayer
-    fn resolve_and_track(&mut self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
+    pub fn resolve_and_track(&mut self, hash: &B256, prefix: &[u8]) -> Result<Arc<Node>, SecureTrieError> {
         let key = if self.owner == B256::ZERO {
             account_trie_node_key(prefix)
         } else {

@@ -31,7 +31,7 @@ pub mod trie_committer;
 #[cfg(test)]
 mod trie_test;
 
-// pub use state_trie::{StateTrie, SecureTrie};
+pub use state_trie::StateTrie;
 pub use account::StateAccount;
 pub use traits::SecureTrieTrait;
 pub use node::NodeSet;

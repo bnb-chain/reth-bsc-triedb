@@ -27,6 +27,7 @@ tracing.workspace = true
 
 # LRU Cache
 schnellru.workspace = true
+mini-moka = { workspace = true, features = ["sync"] }
 
 # Testing
 tempfile.workspace = true
@@ -50,8 +51,3 @@ io-uring = ["rocksdb/io-uring"]
 [dev-dependencies]
 tempfile.workspace = true
 
-[profile.maxperf]
-inherits = "release"
-opt-level = 3
-lto = "thin"
-codegen-units = 1

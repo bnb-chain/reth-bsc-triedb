@@ -425,7 +425,7 @@ mod tests {
 
         let mut hash_index = 0;
         for batch in 0..TOTAL_BATCHES {
-            println!("\n=== 第 {} 批开始 ===", batch + 1);
+            println!("\n=== Batch {} start ===", batch + 1);
 
             let start_idx = batch * BATCH_SIZE;
             let end_idx = start_idx + BATCH_SIZE;
@@ -440,11 +440,11 @@ mod tests {
                 all_keys.push(key.to_vec());
             }
 
-            println!("开始写入第 {} - {} 批 {} 个 key", start_idx + 1, end_idx, BATCH_SIZE);
+            println!("Writing batch {} - {}, {} keys", start_idx + 1, end_idx, BATCH_SIZE);
 
             // Calculate and print hash after writing
             let (hash_after_write, _) = hasher.hash(trie.root().clone(), true);
-            println!("第 {} 批写入后 Hash: {:?}", batch + 1, hash_after_write);
+            println!("Batch {} hash after write: {:?}", batch + 1, hash_after_write);
 
             // Extract hash from Node and compare
             if let Node::Hash(hash) = &*hash_after_write {
@@ -458,7 +458,7 @@ mod tests {
             let delete_start_idx = start_idx;
             let delete_end_idx = start_idx + DELETE_SIZE;
 
-            println!("删除当前批次第 {} - {} 个 key (共 {} 个)",
+            println!("Deleting keys {} - {} from current batch ({} total)",
                     delete_start_idx + 1, delete_end_idx, DELETE_SIZE);
 
             for i in delete_start_idx..delete_end_idx {
@@ -469,9 +469,9 @@ mod tests {
 
             // Calculate and print hash after deletion
             let (hash_after_delete, _) = hasher.hash(trie.root().clone(), true);
-            println!("第 {} 批删除后 Hash: {:?}", batch + 1, hash_after_delete);
+            println!("Batch {} hash after delete: {:?}", batch + 1, hash_after_delete);
 
-            println!("=== 第 {} 批完成 ===", batch + 1);
+            println!("=== Batch {} done ===", batch + 1);
 
             // Extract hash from Node and compare
             if let Node::Hash(hash) = &*hash_after_delete {
@@ -483,21 +483,21 @@ mod tests {
         }
 
         // Final state
-        println!("\n=== 测试完成 ===");
+        println!("\n=== Test complete ===");
         let (final_hash, _) = hasher.hash(trie.root().clone(), true);
-        println!("最终 Hash: {:?}", final_hash);
+        println!("Final hash: {:?}", final_hash);
 
                 let expected_size = TOTAL_KEYS - TOTAL_BATCHES * DELETE_SIZE;
-        println!("期望最终 key 数量: {}", expected_size);
+        println!("Expected final key count: {}", expected_size);
 
         let (root_hash, nodes_opt) = state_trie.commit(true).expect("Failed to commit trie");
         if let Some(nodes) = nodes_opt {
             // The same to BSC result - nodes sig "293954881d37bc70a771b7ed89e359c101453dd268cc2990259ab7906cc828da"
             // Temporarily commented out due to high CPU usage when running at full capacity.
             // println!("Final root hash: {root_hash:?}, nodes_sig: {:?}", nodes.signature());
-            let (updates, deletes) = nodes.size();      // 已公开
+            let (updates, deletes) = nodes.size();
             let node_cnt    = nodes.nodes().len();
-            let leaf_cnt           = nodes.leaf_count(); // 之前实现的辅助方法
+            let leaf_cnt           = nodes.leaf_count();
         
             println!(
                 "Final root hash: {root_hash:?}, updates: {updates}, deletes: {deletes}, nodes: {node_cnt}, leaves: {leaf_cnt}"

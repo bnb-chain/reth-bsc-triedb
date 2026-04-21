@@ -1,0 +1,46 @@
+[package]
+name = "rust-eth-triedb-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "CLI tools for rust-eth-triedb"
+
+[[bin]]
+name = "triedb-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Local dependencies
+rust-eth-triedb = { path = "../triedb" }
+rust-eth-triedb-common = { path = "../common" }
+rust-eth-triedb-pathdb = { path = "../db/pathdb" }
+rust-eth-triedb-state-trie = { path = "../state-trie" }
+
+# CLI
+clap.workspace = true
+
+# Error handling
+thiserror.workspace = true
+eyre.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Misc
+hex.workspace = true
+alloy-rlp.workspace = true
+alloy-primitives.workspace = true
+alloy-trie.workspace = true
+
+[features]
+default = []
+jemalloc = ["rust-eth-triedb/jemalloc"]
+asm-keccak = ["rust-eth-triedb/asm-keccak"]
+
+[dev-dependencies]
+tempfile.workspace = true
+

@@ -22,6 +22,7 @@ smoke-test/
 ## Prerequisites
 
 ### 1. Go Environment
+
 - Go version: 1.24.0 or higher (recommended 1.24.5)
 - Ensure `go` command is available
 
@@ -38,6 +39,7 @@ brew link go@1.24
 ```
 
 ### 2. Rust Environment
+
 - Rust version: Latest stable
 - Ensure `cargo` command is available
 
@@ -47,6 +49,7 @@ cargo --version
 ```
 
 ### 3. System Dependencies
+
 - macOS: Requires administrator privileges to install dynamic libraries
 - Other systems: Adjust according to specific platform
 
@@ -62,7 +65,10 @@ cd rust-eth-triedb/smoke-test
 go build -buildmode=c-shared -o libbsc_trie.dylib bsc_trie_wrapper.go
 
 # 3. Install dynamic library
+# Intel Mac
 sudo cp libbsc_trie.dylib /usr/local/lib/
+# Apple Silicon (M1/M2/M3)
+sudo cp libbsc_trie.dylib /opt/homebrew/lib/
 
 # 4. Return to reth root directory and run test
 cd ../../..
@@ -92,8 +98,11 @@ This will generate the `libbsc_trie.dylib` file.
 To ensure the dynamic library can be found at runtime, install it to the system library path:
 
 ```bash
-# macOS
+# macOS (Intel)
 sudo cp libbsc_trie.dylib /usr/local/lib/
+
+# macOS (Apple Silicon: M1/M2/M3)
+sudo cp libbsc_trie.dylib /opt/homebrew/lib/
 
 # Linux (if needed)
 sudo cp libbsc_trie.so /usr/local/lib/
@@ -111,7 +120,7 @@ cd ../../..
 Compile smoke-test:
 
 ```bash
-cargo build -p reth-triedb-smoke-test
+cargo build -p rust-eth-triedb-smoke-test
 ```
 
 ## Running Tests
@@ -119,7 +128,7 @@ cargo build -p reth-triedb-smoke-test
 ### Run Smoke Test
 
 ```bash
-cargo run -p reth-triedb-smoke-test
+cargo test -p reth-triedb-smoke-test
 ```
 
 ### Test Content
@@ -127,22 +136,19 @@ cargo run -p reth-triedb-smoke-test
 Smoke test will perform the following operations:
 
 1. **Initialization Phase**
-   - Create BSC and Reth StateTrie instances
-   - Use the same initial state root
-
+  - Create BSC and Reth StateTrie instances
+  - Use the same initial state root
 2. **Insertion Phase**
-   - Insert approximately 100,000 random accounts and storage items
-   - Commit and compare root hashes every 10,000 insertions
-   - Print insertion progress
-
+  - Insert approximately 100,000 random accounts and storage items
+  - Commit and compare root hashes every 10,000 insertions
+  - Print insertion progress
 3. **Deletion Phase**
-   - Delete approximately 50,000 previously inserted accounts and storage items
-   - Commit and compare root hashes every 5,000 deletions
-   - Print deletion progress
-
+  - Delete approximately 50,000 previously inserted accounts and storage items
+  - Commit and compare root hashes every 5,000 deletions
+  - Print deletion progress
 4. **Final Verification**
-   - Compare final root hashes of both implementations
-   - Report test results
+  - Compare final root hashes of both implementations
+  - Report test results
 
 ### Expected Output
 
@@ -177,10 +183,16 @@ If you encounter `Library not loaded: libbsc_trie.dylib` error:
 
 ```bash
 # Check if library file exists
+# Intel Mac
 ls -la /usr/local/lib/libbsc_trie.dylib
+# Apple Silicon (M1/M2/M3)
+ls -la /opt/homebrew/lib/libbsc_trie.dylib
 
 # If it doesn't exist, reinstall
+# Intel Mac
 sudo cp libbsc_trie.dylib /usr/local/lib/
+# Apple Silicon (M1/M2/M3)
+sudo cp libbsc_trie.dylib /opt/homebrew/lib/
 ```
 
 ### 2. Go Compilation Errors
@@ -217,7 +229,10 @@ If you encounter permission errors:
 sudo -v
 
 # Reinstall dynamic library
+# Intel Mac
 sudo cp libbsc_trie.dylib /usr/local/lib/
+# Apple Silicon (M1/M2/M3)
+sudo cp libbsc_trie.dylib /opt/homebrew/lib/
 ```
 
 ## Technical Details
@@ -280,16 +295,19 @@ If you need to add new FFI functions:
 ### Completed Features
 
 ✅ **BSC Integration**
+
 - Go FFI library compilation and linking
 - Memory management issues resolved
 - All StateTrie interface implementations
 
 ✅ **Smoke Test Framework**
+
 - Complete test workflow
 - Progress monitoring and logging
 - Root hash comparison functionality
 
 ✅ **Build System**
+
 - Automated build scripts
 - Dependency management
 - Cross-platform support
@@ -297,6 +315,7 @@ If you need to add new FFI functions:
 ### Known Issues
 
 ⚠️ **Reth StateTrie Implementation Issues**
+
 - "Invalid node" errors during deletion operations
 - "Trie already committed" errors during repeated commits
 - These issues do not affect the correctness of BSC integration
@@ -304,11 +323,13 @@ If you need to add new FFI functions:
 ### Future Improvements
 
 🔧 **Performance Optimization**
+
 - Reduce memory usage
 - Optimize FFI call overhead
 - Parallelize test operations
 
 🔧 **Feature Extensions**
+
 - Support more trie operations
 - Add performance benchmarks
 - Support different database backends
