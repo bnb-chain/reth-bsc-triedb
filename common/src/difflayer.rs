@@ -98,8 +98,8 @@ impl DiffLayer {
     }
 
     /// Get a trie node by prefix
-    pub fn get_trie_nodes(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
-        self.diff_nodes.get(&prefix).map(|node: &Arc<TrieNode>| node.clone())
+    pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
+        self.diff_nodes.get(prefix).map(|node: &Arc<TrieNode>| node.clone())
     }
 
     /// Get a storage root by hased address
@@ -186,9 +186,9 @@ impl DiffLayers {
     }
 
     /// Get a trie node by prefix
-    pub fn get_trie_nodes(&self, prefix: Vec<u8>) -> Option<Arc<TrieNode>> {
+    pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
         for difflayer in &self.diff_layers {
-            if let Some(node) = difflayer.get_trie_nodes(prefix.clone()) {
+            if let Some(node) = difflayer.get_trie_nodes(prefix) {
                 return Some(node);
             }
         }
