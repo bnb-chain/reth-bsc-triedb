@@ -744,7 +744,7 @@ where
 
         // 1. Check if the hash is in the difflayer
         if let Some(difflayers) = &self.difflayers {
-            if let Some(node) = difflayers.get_trie_nodes(key.clone()) {
+            if let Some(node) = difflayers.get_trie_nodes(&key) {
                 RESOLVE_DIFFLAYER_HIT.fetch_add(1, Ordering::Relaxed);
                 self.tracer.on_read(prefix, node.blob.clone().unwrap());
                 return Ok(Node::must_decode_node(Some(*hash), &node.blob.clone().unwrap()));
