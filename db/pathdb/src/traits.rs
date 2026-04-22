@@ -127,3 +127,57 @@ impl Default for PathProviderConfig {
         }
     }
 }
+
+impl PathProviderConfig {
+    /// Apply overrides from `RETHBSC_ROCKSDB_*` environment variables on top of
+    /// an existing config. Only set variables are applied; unset ones keep the
+    /// current value. Parse errors are ignored so a bad value doesn't crash the
+    /// node — the default is used instead. Supported vars:
+    ///
+    /// - `RETHBSC_ROCKSDB_WRITE_BUFFER_SIZE_MB`   (default 256)
+    /// - `RETHBSC_ROCKSDB_MAX_WRITE_BUFFER_NUMBER` (default 4)
+    /// - `RETHBSC_ROCKSDB_TARGET_FILE_SIZE_MB`    (default 64)
+    /// - `RETHBSC_ROCKSDB_MAX_BACKGROUND_JOBS`    (default 4)
+    /// - `RETHBSC_ROCKSDB_BLOCK_CACHE_GB`         (default 16)
+    /// - `RETHBSC_ROCKSDB_BLOOM_BITS_PER_KEY`     (default 10.0)
+    /// - `RETHBSC_ROCKSDB_TRIE_NODE_CACHE_ENTRIES` (default 20_000_000)
+    pub fn apply_env_overrides(mut self) -> Self {
+        fn env_usize(key: &str) -> Option<usize> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_i32(key: &str) -> Option<i32> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_u64(key: &str) -> Option<u64> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_f64(key: &str) -> Option<f64> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_u32(key: &str) -> Option<u32> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        if let Some(mb) = env_usize("RETHBSC_ROCKSDB_WRITE_BUFFER_SIZE_MB") {
+            self.write_buffer_size = mb.saturating_mul(1024 * 1024);
+        }
+        if let Some(n) = env_i32("RETHBSC_ROCKSDB_MAX_WRITE_BUFFER_NUMBER") {
+            self.max_write_buffer_number = n.max(1);
+        }
+        if let Some(mb) = env_u64("RETHBSC_ROCKSDB_TARGET_FILE_SIZE_MB") {
+            self.target_file_size_base = mb.saturating_mul(1024 * 1024);
+        }
+        if let Some(n) = env_i32("RETHBSC_ROCKSDB_MAX_BACKGROUND_JOBS") {
+            self.max_background_jobs = n.max(1);
+        }
+        if let Some(gb) = env_usize("RETHBSC_ROCKSDB_BLOCK_CACHE_GB") {
+            self.block_cache_size_bytes = gb.saturating_mul(1024 * 1024 * 1024);
+        }
+        if let Some(f) = env_f64("RETHBSC_ROCKSDB_BLOOM_BITS_PER_KEY") {
+            self.bloom_filter_bits_per_key = f;
+        }
+        if let Some(n) = env_u32("RETHBSC_ROCKSDB_TRIE_NODE_CACHE_ENTRIES") {
+            self.trie_node_cache_size = n;
+        }
+        self
+    }
+}
