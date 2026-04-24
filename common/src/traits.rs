@@ -261,4 +261,10 @@ pub trait TrieDatabase {
     /// implementation-dependent, and some implementations may be no-ops if
     /// they don't maintain caches.
     fn clear_cache(&self);
+
+    /// Returns a snapshot of (cache_hits, cache_misses) for trie node lookups.
+    fn trie_cache_snapshot(&self) -> (u64, u64) { (0, 0) }
+
+    /// Returns (account_trie_misses, storage_trie_misses) breakdown.
+    fn trie_miss_breakdown(&self) -> (u64, u64) { (0, 0) }
 }

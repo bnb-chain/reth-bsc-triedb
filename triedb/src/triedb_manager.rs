@@ -107,8 +107,24 @@ impl TrieDBManager {
     /// # Arguments
     /// * `path` - Path to the database directory
     fn new(path: &str) -> Self {
-        let pathdb = PathDB::new(path, PathProviderConfig::default())
-            .expect("Failed to create PathDB");
+        let config = PathProviderConfig::default().apply_env_overrides();
+        info!(
+            target: "reth::cli",
+            write_buffer_size_mb = config.write_buffer_size / (1024 * 1024),
+            max_write_buffer_number = config.max_write_buffer_number,
+            target_file_size_mb = config.target_file_size_base / (1024 * 1024),
+            max_background_jobs = config.max_background_jobs,
+            block_cache_gb = config.block_cache_size_bytes / (1024 * 1024 * 1024),
+            bloom_bits_per_key = config.bloom_filter_bits_per_key,
+            trie_node_cache_entries = config.trie_node_cache_size,
+            max_total_wal_mb = config.max_total_wal_size_bytes / (1024 * 1024),
+            wal_size_limit_mb = config.wal_size_limit_mb,
+            keep_log_file_num = config.keep_log_file_num,
+            delete_obsolete_files_period_secs =
+                config.delete_obsolete_files_period_micros / 1_000_000,
+            "TrieDB/RocksDB config (override via RETHBSC_ROCKSDB_* env vars)"
+        );
+        let pathdb = PathDB::new(path, config).expect("Failed to create PathDB");
 
         let triedb = TrieDB::new(pathdb);
         Self {

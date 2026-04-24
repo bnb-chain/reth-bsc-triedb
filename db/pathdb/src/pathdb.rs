@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rocksdb::{
     BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
@@ -11,7 +12,7 @@ use rocksdb::{
 };
 // use schnellru::{ByLength, LruMap};
 use mini_moka::sync::{Cache as MokaCache, CacheBuilder};
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
@@ -120,6 +121,12 @@ pub struct PathDB {
     pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Metrics for the PathDB.
     metrics: PathDBMetrics,
+    /// Readable atomic counters for per-call cache stats.
+    pub trie_cache_hits: Arc<AtomicU64>,
+    pub trie_cache_misses: Arc<AtomicU64>,
+    /// Per-call miss breakdown: account trie misses vs storage trie misses.
+    pub account_trie_misses: Arc<AtomicU64>,
+    pub storage_trie_misses: Arc<AtomicU64>,
 }
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
@@ -168,6 +175,10 @@ impl Clone for PathDB {
             trie_node_cache: self.trie_node_cache.clone(),
             storage_root_cache: self.storage_root_cache.clone(),
             metrics: self.metrics.clone(),
+            trie_cache_hits: self.trie_cache_hits.clone(),
+            trie_cache_misses: self.trie_cache_misses.clone(),
+            account_trie_misses: self.account_trie_misses.clone(),
+            storage_trie_misses: self.storage_trie_misses.clone(),
         }
     }
 }
@@ -187,7 +198,27 @@ impl PathDB {
         // of trie nodes. If unset, RocksDB defaults to a tiny internal cache (~8MB).
         let (_rocks_block_cache, block_based) = build_block_based_options(&config);
         db_opts.set_block_based_table_factory(&block_based);
-        
+
+        // Bound WAL and obsolete-file retention (issue #322).
+        //
+        // With the defaults (all zero) RocksDB never force-flushes based on WAL size
+        // and never purges WAL on a wall-clock schedule. Because PathDB uses several
+        // column families but writes hot data to only two of them, the idle CFs'
+        // memtables pin every WAL segment written since their last flush — so the
+        // `rust_eth_triedb/` directory accretes ~10 GB/hour of `.log` files until
+        // the node restarts (which forces recovery + flush).
+        //
+        // `set_max_total_wal_size` tells RocksDB "once WAL on disk exceeds this,
+        // flush the memtable backing the oldest WAL so it can be recycled." This
+        // is the primary defense. `set_wal_size_limit_mb` is a second line that
+        // lets RocksDB delete surplus WAL files outright. Both are needed.
+        db_opts.set_max_total_wal_size(config.max_total_wal_size_bytes);
+        db_opts.set_wal_size_limit_mb(config.wal_size_limit_mb);
+        db_opts.set_keep_log_file_num(config.keep_log_file_num);
+        // Periodic obsolete-file sweep so stale SSTs from compaction are deleted
+        // without requiring a DB reopen (C++ default is 6 hours).
+        db_opts.set_delete_obsolete_files_period_micros(config.delete_obsolete_files_period_micros);
+
         // Disable auto compaction during startup to avoid slow initialization
         // Compaction will happen automatically in the background during runtime
         db_opts.set_disable_auto_compactions(true);
@@ -265,6 +296,10 @@ impl PathDB {
             trie_node_cache,
             storage_root_cache,
             metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
+            trie_cache_hits: Arc::new(AtomicU64::new(0)),
+            trie_cache_misses: Arc::new(AtomicU64::new(0)),
+            account_trie_misses: Arc::new(AtomicU64::new(0)),
+            storage_trie_misses: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -287,10 +322,17 @@ impl PathDB {
 
     /// Get cache statistics.
     pub fn cache_stats(&self) -> (usize, usize) {
-        // mini_moka Cache is thread-safe, no locking needed
         (
             self.trie_node_cache.entry_count() as usize,
             self.storage_root_cache.entry_count() as usize,
+        )
+    }
+
+    /// Snapshot the trie cache hit/miss counters (for per-call delta).
+    pub fn trie_cache_snapshot(&self) -> (u64, u64) {
+        (
+            self.trie_cache_hits.load(Ordering::Relaxed),
+            self.trie_cache_misses.load(Ordering::Relaxed),
         )
     }
 
@@ -302,39 +344,38 @@ impl PathDB {
 
 impl PathDB {
     pub fn get_raw_trie_node(&self, key: &[u8]) -> PathProviderResult<Option<Vec<u8>>> {
-        trace!(target: "pathdb::rocksdb", "Getting key: {:?}", key);
-
-        // Check cache first - mini_moka cache is thread-safe and doesn't require locking
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
             self.metrics.trie_node_cache_hits.increment(1);
-            trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
+            self.trie_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached_value);
         }
         self.metrics.trie_node_cache_misses.increment(1);
+        self.trie_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))
         })?;
-        let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-        // Cache miss, read from DB
         match self.db.get_cf_opt(&cf, key, &self.read_options) {
             Ok(Some(value)) => {
-                trace!(target: "pathdb::rocksdb", "Found value in CF '{}' for key: 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Insert into cache - mini_moka handles LRU eviction automatically
+                // Track miss breakdown by trie type
+                if key.first() == Some(&b'A') {
+                    self.account_trie_misses.fetch_add(1, Ordering::Relaxed);
+                } else if key.first() == Some(&b'O') {
+                    self.storage_trie_misses.fetch_add(1, Ordering::Relaxed);
+                }
                 self.trie_node_cache.insert(key_vec, Some(value.clone()));
                 Ok(Some(value))
             }
             Ok(None) => {
-                trace!(target: "pathdb::rocksdb", "Key not found in CF '{}': 0x{}", DEFAULT_COLUMN_FAMILY_NAME, key_hex);
-                // Cache None values to avoid repeated DB lookups
                 self.trie_node_cache.insert(key_vec, None);
                 Ok(None)
             }
             Err(e) => {
-                error!(target: "pathdb::rocksdb", "Error getting in CF '{}' for key 0x{}: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e);
-                Err(PathProviderError::Database(format!("RocksDB get in CF '{}' for key 0x{} error: {}", DEFAULT_COLUMN_FAMILY_NAME, key_hex, e)))
+                let hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                error!(target: "pathdb::rocksdb", "Error getting key 0x{}: {}", hex, e);
+                Err(PathProviderError::Database(format!("RocksDB get error for key 0x{}: {}", hex, e)))
             }
         }
     }
@@ -614,6 +655,20 @@ impl TrieDatabase for PathDB {
         self.clear_cache();
     }
 
+    fn trie_cache_snapshot(&self) -> (u64, u64) {
+        (
+            self.trie_cache_hits.load(Ordering::Relaxed),
+            self.trie_cache_misses.load(Ordering::Relaxed),
+        )
+    }
+
+    fn trie_miss_breakdown(&self) -> (u64, u64) {
+        (
+            self.account_trie_misses.load(Ordering::Relaxed),
+            self.storage_trie_misses.load(Ordering::Relaxed),
+        )
+    }
+
     fn latest_persist_state(&self) -> Result<(u64, B256), Self::Error> {
         let block_number_bytes = self.get_raw_meta_data(TRIE_STATE_BLOCK_NUMBER_KEY)?;
         let state_root_bytes = self.get_raw_meta_data(TRIE_STATE_ROOT_KEY)?;
@@ -676,18 +731,56 @@ impl TrieDatabase for PathDB {
                 self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
                 self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
 
+                // Admission probe: count how many commit-path inserts actually land in moka.
+                // If mini_moka's TinyLFU admission rejects cold inserts, these numbers will
+                // diverge significantly (admitted << attempted).
+                let mut node_insert_attempted: u64 = 0;
+                let mut node_insert_admitted: u64 = 0;
+                let mut node_invalidated: u64 = 0;
+                let mut root_insert_attempted: u64 = 0;
+                let mut root_insert_admitted: u64 = 0;
+
                 if let Some(difflayer) = difflayer {
                     for (key, node) in difflayer.diff_nodes.iter() {
                         if node.is_deleted() {
                             self.trie_node_cache.invalidate(key);
+                            node_invalidated += 1;
                         } else if let Some(blob) = &node.blob {
                             self.trie_node_cache.insert(key.clone(), Some(blob.clone()));
+                            node_insert_attempted += 1;
+                            if self.trie_node_cache.get(key).is_some() {
+                                node_insert_admitted += 1;
+                            }
                         }
                     }
                     for (key, value) in difflayer.diff_storage_roots.iter() {
                         self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
+                        root_insert_attempted += 1;
+                        if self.storage_root_cache.get(&key.as_slice().to_vec()).is_some() {
+                            root_insert_admitted += 1;
+                        }
                     }
                 }
+
+                let (trie_cache_entries, storage_root_cache_entries) = self.cache_stats();
+                debug!(
+                    target: "pathdb::admission",
+                    block_number,
+                    node_insert_attempted,
+                    node_insert_admitted,
+                    node_admit_pct = if node_insert_attempted > 0 {
+                        node_insert_admitted * 100 / node_insert_attempted
+                    } else { 0 },
+                    node_invalidated,
+                    root_insert_attempted,
+                    root_insert_admitted,
+                    root_admit_pct = if root_insert_attempted > 0 {
+                        root_insert_admitted * 100 / root_insert_attempted
+                    } else { 0 },
+                    trie_cache_entries,
+                    storage_root_cache_entries,
+                    "commit_difflayer moka admission"
+                );
 
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())

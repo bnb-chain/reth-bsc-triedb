@@ -1,6 +1,7 @@
 //! Core trie implementation for secure trie operations.
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::{B256};
 use alloy_trie::EMPTY_ROOT_HASH;
@@ -11,6 +12,20 @@ use super::node::{Node, NodeFlag, FullNode, ShortNode, NodeSet, TrieNode, DiffLa
 use super::secure_trie::{SecureTrieId, SecureTrieError};
 use super::trie_hasher::Hasher;
 use super::trie_tracer::TrieTracer;
+
+/// Process-global counters for resolve_and_track: total calls and DiffLayer hits.
+/// Used by PathDB/TrieDB timing logs to derive the DiffLayer filter rate per commit.
+static RESOLVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RESOLVE_DIFFLAYER_HIT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the resolve counters for per-call delta computation.
+/// Returns (total, difflayer_hit).
+pub fn resolve_counter_snapshot() -> (u64, u64) {
+    (
+        RESOLVE_TOTAL.load(Ordering::Relaxed),
+        RESOLVE_DIFFLAYER_HIT.load(Ordering::Relaxed),
+    )
+}
 
 /// Core trie implementation
 #[derive(Clone, Debug)]
@@ -724,13 +739,16 @@ where
         } else {
             storage_trie_node_key(self.owner.as_slice(), prefix)
         };
-        
+
+        RESOLVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+
         // 1. Check if the hash is in the difflayer
         if let Some(difflayers) = &self.difflayers {
-            if let Some(node) = difflayers.get_trie_nodes(key.clone()) {
-                self.tracer.on_read(prefix, node.blob.clone().unwrap());              
+            if let Some(node) = difflayers.get_trie_nodes(&key) {
+                RESOLVE_DIFFLAYER_HIT.fetch_add(1, Ordering::Relaxed);
+                self.tracer.on_read(prefix, node.blob.clone().unwrap());
                 return Ok(Node::must_decode_node(Some(*hash), &node.blob.clone().unwrap()));
-            }           
+            }
         }
 
         // 2. Check if the hash is in the database

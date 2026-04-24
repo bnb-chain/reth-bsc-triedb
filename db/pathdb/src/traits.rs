@@ -30,6 +30,31 @@ pub const DEFAULT_READAHEAD_SIZE: usize = 4 * 1024; // 4KB
 pub const DEFAULT_ASYNC_IO: bool = true;
 pub const DEFAULT_VERIFY_CHECKSUMS: bool = false;
 
+// WAL / obsolete-file retention constants.
+//
+// Why these matter (see bnb-chain/reth-bsc#322):
+//
+// PathDB opens RocksDB with four column families, but live writes land almost
+// exclusively on the `default` (trie_node) and `storage_root` CFs. The
+// `meta_data` CF is touched only on DiffLayer commits, and `trie_node` (the
+// migration target) is currently idle. RocksDB cannot truncate a WAL segment
+// while *any* CF memtable that was writing into it is still unflushed — so an
+// idle CF pins every WAL segment written since its last flush.
+//
+// With the C++ defaults (`max_total_wal_size = 0`, `WAL_size_limit_MB = 0`,
+// `WAL_ttl_seconds = 0`), this pinning is unbounded: the only thing that
+// reclaims WAL is a process restart, which replays+flushes all WAL segments
+// during recovery. Long-running full nodes therefore see the `rust_eth_triedb/`
+// directory grow at ~10 GB/hour (one 4 GB `.log` every ~25 min) until restart.
+//
+// We fix this by bounding WAL on-disk size so RocksDB is forced to flush the
+// CF pinning the oldest WAL, and by periodically sweeping obsolete files
+// (stale SSTs from compaction) without requiring the DB to be reopened.
+pub const DEFAULT_MAX_TOTAL_WAL_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 2 * 1024; // 2 GB — second line of defense for on-disk purge
+pub const DEFAULT_KEEP_LOG_FILE_NUM: usize = 10; // info LOG files (separate from WAL); C++ default 1000 is excessive
+pub const DEFAULT_DELETE_OBSOLETE_FILES_PERIOD_MICROS: u64 = 10 * 60 * 1_000_000; // 10 minutes (C++ default is 6 hours)
+
 /// Result type for PathProvider operations.
 pub type PathProviderResult<T> = Result<T, PathProviderError>;
 
@@ -101,6 +126,23 @@ pub struct PathProviderConfig {
     pub async_io: bool,
     /// Whether to verify checksums on reads.
     pub verify_checksums: bool,
+
+    /// Max total on-disk WAL size before RocksDB force-flushes the CF backing
+    /// the oldest WAL. `0` = unbounded (C++ default). See #322: leaving this
+    /// unbounded causes the data directory to grow ~10 GB/hour until restart
+    /// because idle CFs pin old WAL segments indefinitely.
+    pub max_total_wal_size_bytes: u64,
+    /// Total WAL size cap in MiB above which RocksDB starts deleting the
+    /// earliest WAL files. `0` = disabled (C++ default). Used alongside
+    /// `max_total_wal_size_bytes` as a second line of defense.
+    pub wal_size_limit_mb: u64,
+    /// Maximum number of info LOG files (LOG, LOG.old.*) to keep. C++ default
+    /// is 1000 which is overkill for a node operator.
+    pub keep_log_file_num: usize,
+    /// Periodicity of the RocksDB obsolete-file sweep. Stale SSTs left behind
+    /// by compaction are released on every compaction, but this knob ensures
+    /// they are also swept on a wall-clock schedule without needing a restart.
+    pub delete_obsolete_files_period_micros: u64,
 }
 
 impl Default for PathProviderConfig {
@@ -124,6 +166,80 @@ impl Default for PathProviderConfig {
             readahead_size: DEFAULT_READAHEAD_SIZE,
             async_io: DEFAULT_ASYNC_IO,
             verify_checksums: DEFAULT_VERIFY_CHECKSUMS,
+            max_total_wal_size_bytes: DEFAULT_MAX_TOTAL_WAL_SIZE_BYTES,
+            wal_size_limit_mb: DEFAULT_WAL_SIZE_LIMIT_MB,
+            keep_log_file_num: DEFAULT_KEEP_LOG_FILE_NUM,
+            delete_obsolete_files_period_micros: DEFAULT_DELETE_OBSOLETE_FILES_PERIOD_MICROS,
         }
+    }
+}
+
+impl PathProviderConfig {
+    /// Apply overrides from `RETHBSC_ROCKSDB_*` environment variables on top of
+    /// an existing config. Only set variables are applied; unset ones keep the
+    /// current value. Parse errors are ignored so a bad value doesn't crash the
+    /// node — the default is used instead. Supported vars:
+    ///
+    /// - `RETHBSC_ROCKSDB_WRITE_BUFFER_SIZE_MB`   (default 256)
+    /// - `RETHBSC_ROCKSDB_MAX_WRITE_BUFFER_NUMBER` (default 4)
+    /// - `RETHBSC_ROCKSDB_TARGET_FILE_SIZE_MB`    (default 64)
+    /// - `RETHBSC_ROCKSDB_MAX_BACKGROUND_JOBS`    (default 4)
+    /// - `RETHBSC_ROCKSDB_BLOCK_CACHE_GB`         (default 16)
+    /// - `RETHBSC_ROCKSDB_BLOOM_BITS_PER_KEY`     (default 10.0)
+    /// - `RETHBSC_ROCKSDB_TRIE_NODE_CACHE_ENTRIES` (default 20_000_000)
+    /// - `RETHBSC_ROCKSDB_MAX_TOTAL_WAL_MB`       (default 2048)
+    /// - `RETHBSC_ROCKSDB_WAL_SIZE_LIMIT_MB`      (default 2048)
+    /// - `RETHBSC_ROCKSDB_KEEP_LOG_FILE_NUM`      (default 10)
+    /// - `RETHBSC_ROCKSDB_DELETE_OBSOLETE_FILES_PERIOD_SECS` (default 600)
+    pub fn apply_env_overrides(mut self) -> Self {
+        fn env_usize(key: &str) -> Option<usize> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_i32(key: &str) -> Option<i32> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_u64(key: &str) -> Option<u64> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_f64(key: &str) -> Option<f64> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        fn env_u32(key: &str) -> Option<u32> {
+            std::env::var(key).ok().and_then(|s| s.parse().ok())
+        }
+        if let Some(mb) = env_usize("RETHBSC_ROCKSDB_WRITE_BUFFER_SIZE_MB") {
+            self.write_buffer_size = mb.saturating_mul(1024 * 1024);
+        }
+        if let Some(n) = env_i32("RETHBSC_ROCKSDB_MAX_WRITE_BUFFER_NUMBER") {
+            self.max_write_buffer_number = n.max(1);
+        }
+        if let Some(mb) = env_u64("RETHBSC_ROCKSDB_TARGET_FILE_SIZE_MB") {
+            self.target_file_size_base = mb.saturating_mul(1024 * 1024);
+        }
+        if let Some(n) = env_i32("RETHBSC_ROCKSDB_MAX_BACKGROUND_JOBS") {
+            self.max_background_jobs = n.max(1);
+        }
+        if let Some(gb) = env_usize("RETHBSC_ROCKSDB_BLOCK_CACHE_GB") {
+            self.block_cache_size_bytes = gb.saturating_mul(1024 * 1024 * 1024);
+        }
+        if let Some(f) = env_f64("RETHBSC_ROCKSDB_BLOOM_BITS_PER_KEY") {
+            self.bloom_filter_bits_per_key = f;
+        }
+        if let Some(n) = env_u32("RETHBSC_ROCKSDB_TRIE_NODE_CACHE_ENTRIES") {
+            self.trie_node_cache_size = n;
+        }
+        if let Some(mb) = env_u64("RETHBSC_ROCKSDB_MAX_TOTAL_WAL_MB") {
+            self.max_total_wal_size_bytes = mb.saturating_mul(1024 * 1024);
+        }
+        if let Some(mb) = env_u64("RETHBSC_ROCKSDB_WAL_SIZE_LIMIT_MB") {
+            self.wal_size_limit_mb = mb;
+        }
+        if let Some(n) = env_usize("RETHBSC_ROCKSDB_KEEP_LOG_FILE_NUM") {
+            self.keep_log_file_num = n.max(1);
+        }
+        if let Some(secs) = env_u64("RETHBSC_ROCKSDB_DELETE_OBSOLETE_FILES_PERIOD_SECS") {
+            self.delete_obsolete_files_period_micros = secs.saturating_mul(1_000_000);
+        }
+        self
     }
 }
