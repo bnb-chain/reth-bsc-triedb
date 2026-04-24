@@ -198,7 +198,27 @@ impl PathDB {
         // of trie nodes. If unset, RocksDB defaults to a tiny internal cache (~8MB).
         let (_rocks_block_cache, block_based) = build_block_based_options(&config);
         db_opts.set_block_based_table_factory(&block_based);
-        
+
+        // Bound WAL and obsolete-file retention (issue #322).
+        //
+        // With the defaults (all zero) RocksDB never force-flushes based on WAL size
+        // and never purges WAL on a wall-clock schedule. Because PathDB uses several
+        // column families but writes hot data to only two of them, the idle CFs'
+        // memtables pin every WAL segment written since their last flush — so the
+        // `rust_eth_triedb/` directory accretes ~10 GB/hour of `.log` files until
+        // the node restarts (which forces recovery + flush).
+        //
+        // `set_max_total_wal_size` tells RocksDB "once WAL on disk exceeds this,
+        // flush the memtable backing the oldest WAL so it can be recycled." This
+        // is the primary defense. `set_wal_size_limit_mb` is a second line that
+        // lets RocksDB delete surplus WAL files outright. Both are needed.
+        db_opts.set_max_total_wal_size(config.max_total_wal_size_bytes);
+        db_opts.set_wal_size_limit_mb(config.wal_size_limit_mb);
+        db_opts.set_keep_log_file_num(config.keep_log_file_num);
+        // Periodic obsolete-file sweep so stale SSTs from compaction are deleted
+        // without requiring a DB reopen (C++ default is 6 hours).
+        db_opts.set_delete_obsolete_files_period_micros(config.delete_obsolete_files_period_micros);
+
         // Disable auto compaction during startup to avoid slow initialization
         // Compaction will happen automatically in the background during runtime
         db_opts.set_disable_auto_compactions(true);

@@ -117,6 +117,11 @@ impl TrieDBManager {
             block_cache_gb = config.block_cache_size_bytes / (1024 * 1024 * 1024),
             bloom_bits_per_key = config.bloom_filter_bits_per_key,
             trie_node_cache_entries = config.trie_node_cache_size,
+            max_total_wal_mb = config.max_total_wal_size_bytes / (1024 * 1024),
+            wal_size_limit_mb = config.wal_size_limit_mb,
+            keep_log_file_num = config.keep_log_file_num,
+            delete_obsolete_files_period_secs =
+                config.delete_obsolete_files_period_micros / 1_000_000,
             "TrieDB/RocksDB config (override via RETHBSC_ROCKSDB_* env vars)"
         );
         let pathdb = PathDB::new(path, config).expect("Failed to create PathDB");
