@@ -17,6 +17,7 @@ use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
 use crate::traits::*;
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
+use rust_eth_triedb_common::lookup_stats::{TRIE_MOKA_HITS, TRIE_DISK_READS};
 
 use reth_metrics::{
     metrics::{Counter},
@@ -308,10 +309,12 @@ impl PathDB {
         let key_vec = key.to_vec();
         if let Some(cached_value) = self.trie_node_cache.get(&key_vec) {
             self.metrics.trie_node_cache_hits.increment(1);
+            TRIE_MOKA_HITS.increment();
             trace!(target: "pathdb::rocksdb", "Found value in cache for key: {:?}", key);
             return Ok(cached_value);
         }
         self.metrics.trie_node_cache_misses.increment(1);
+        TRIE_DISK_READS.increment();
 
         let cf = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME).ok_or_else(|| {
             PathProviderError::Database(format!("Column Family '{}' handle not found", DEFAULT_COLUMN_FAMILY_NAME))

@@ -4,10 +4,10 @@
 //! used in tracking modifications during trie operations.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use alloy_primitives::B256;
 use fastbloom::BloomFilter;
+use crate::lookup_stats::TRIE_DIFFLAYER_HITS;
 
 // Trie state storage keys
 pub const TRIE_STATE_ROOT_KEY: &[u8] = b"state_root";
@@ -188,65 +188,6 @@ impl DiffLayer {
     }
 }
 
-/// Atomic counters tracking how the per-layer bloom filter performs across
-/// `DiffLayers::get_trie_nodes` calls.
-///
-/// All counters monotonically increase between resets. Use `snapshot_and_reset`
-/// to read + zero atomically at a natural per-block boundary (typically right
-/// after `triedb.intermediate_and_commit_hashed_post_state` returns).
-///
-/// Concurrency: counters use `Relaxed` ordering — they're for accounting only,
-/// not synchronization. Snapshot under concurrent updates is best-effort.
-#[derive(Debug, Default)]
-pub struct DiffLayersFilterStats {
-    /// Number of `DiffLayers::get_trie_nodes` invocations.
-    pub queries: AtomicU64,
-    /// Per-layer bloom checks performed (= sum of layers visited before hit
-    /// or full scan). `bloom_checks = bloom_rejects + bloom_passes`.
-    pub bloom_checks: AtomicU64,
-    /// Per-layer bloom checks where filter returned "definitely not present"
-    /// — the HashMap probe was skipped. This is the optimization win.
-    pub bloom_rejects: AtomicU64,
-    /// Per-layer bloom checks where filter returned "maybe present" — fell
-    /// through to a HashMap probe. `bloom_passes = hashmap_hits + hashmap_misses`.
-    pub bloom_passes: AtomicU64,
-    /// Of the bloom-passing HashMap probes, how many actually returned `Some`.
-    pub hashmap_hits: AtomicU64,
-    /// Of the bloom-passing HashMap probes, how many returned `None` — these
-    /// are bloom false positives (correctness still preserved).
-    pub hashmap_misses: AtomicU64,
-    /// Cumulative wall time spent inside `get_trie_nodes` across all queries.
-    pub total_lookup_ns: AtomicU64,
-}
-
-/// Plain-data view of `DiffLayersFilterStats` for emitting to logs.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DiffLayersFilterStatsSnapshot {
-    pub queries: u64,
-    pub bloom_checks: u64,
-    pub bloom_rejects: u64,
-    pub bloom_passes: u64,
-    pub hashmap_hits: u64,
-    pub hashmap_misses: u64,
-    pub total_lookup_ns: u64,
-}
-
-impl DiffLayersFilterStats {
-    /// Atomically read every counter and zero it out, returning the snapshot.
-    /// Intended to be called once per block at a quiescent boundary.
-    pub fn snapshot_and_reset(&self) -> DiffLayersFilterStatsSnapshot {
-        DiffLayersFilterStatsSnapshot {
-            queries: self.queries.swap(0, Ordering::Relaxed),
-            bloom_checks: self.bloom_checks.swap(0, Ordering::Relaxed),
-            bloom_rejects: self.bloom_rejects.swap(0, Ordering::Relaxed),
-            bloom_passes: self.bloom_passes.swap(0, Ordering::Relaxed),
-            hashmap_hits: self.hashmap_hits.swap(0, Ordering::Relaxed),
-            hashmap_misses: self.hashmap_misses.swap(0, Ordering::Relaxed),
-            total_lookup_ns: self.total_lookup_ns.swap(0, Ordering::Relaxed),
-        }
-    }
-}
-
 /// A collection of diff layers for uncommitted blocks in the trie state.
 ///
 /// `DiffLayers` maintains a stack of `DiffLayer` instances, where each layer
@@ -272,7 +213,7 @@ impl DiffLayersFilterStats {
 /// across multiple readers without cloning the entire layer data. However,
 /// this structure itself is not thread-safe and should be protected by
 /// appropriate synchronization primitives if used in concurrent contexts.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiffLayers {
     /// An ordered collection of diff layers, one per uncommitted block.
     ///
@@ -298,13 +239,6 @@ pub struct DiffLayers {
     /// // Querying for a node will check block_102 first, then block_101, then block_100
     /// ```
     pub diff_layers: Vec<Arc<DiffLayer>>,
-
-    /// Per-`DiffLayers` filter statistics, updated atomically inside
-    /// `get_trie_nodes`. Wrapped in `Arc` so all clones of `DiffLayers`
-    /// share the same counter set (important when the engine tree hands
-    /// the same difflayer chain to a speculative build and a real build —
-    /// both report to one place, deduplicated by `snapshot_and_reset`).
-    pub filter_stats: Arc<DiffLayersFilterStats>,
 }
 
 impl DiffLayers {
@@ -324,42 +258,22 @@ impl DiffLayers {
     /// the HashMap lookup on misses, so the common "scan all layers, find
     /// nothing" path is O(layers × bloom-hash) instead of O(layers × HashMap-hash).
     ///
-    /// Accumulates per-call counters into `self.filter_stats` (bloom rejects,
-    /// false positives, wall time). Snapshot the stats once per block via
-    /// `filter_stats.snapshot_and_reset()` to emit a probe.
+    /// On a hit, bumps the global `TRIE_DIFFLAYER_HITS` counter — a single
+    /// padded atomic increment — so the per-block lookup-path probe in the
+    /// builder can attribute this query to the DiffLayer tier. Bloom rejects
+    /// and HashMap-miss-after-bloom-pass do NOT touch the counter; only
+    /// successful node returns count, keeping the hot path branchless.
     pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
-        let start = std::time::Instant::now();
-        let mut bloom_rejects: u64 = 0;
-        let mut bloom_passes: u64 = 0;
-        let mut hashmap_hits: u64 = 0;
-        let mut hashmap_misses: u64 = 0;
-        let mut result: Option<Arc<TrieNode>> = None;
-
         for difflayer in &self.diff_layers {
             if !difflayer.diff_nodes_bloom.contains(prefix) {
-                bloom_rejects += 1;
                 continue;
             }
-            bloom_passes += 1;
             if let Some(node) = difflayer.diff_nodes.get(prefix) {
-                hashmap_hits += 1;
-                result = Some(node.clone());
-                break;
+                TRIE_DIFFLAYER_HITS.increment();
+                return Some(node.clone());
             }
-            hashmap_misses += 1;
         }
-
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
-        let stats = &self.filter_stats;
-        stats.queries.fetch_add(1, Ordering::Relaxed);
-        stats.bloom_checks.fetch_add(bloom_rejects + bloom_passes, Ordering::Relaxed);
-        stats.bloom_rejects.fetch_add(bloom_rejects, Ordering::Relaxed);
-        stats.bloom_passes.fetch_add(bloom_passes, Ordering::Relaxed);
-        stats.hashmap_hits.fetch_add(hashmap_hits, Ordering::Relaxed);
-        stats.hashmap_misses.fetch_add(hashmap_misses, Ordering::Relaxed);
-        stats.total_lookup_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-
-        result
+        None
     }
 
     /// Get a storage root by hased address

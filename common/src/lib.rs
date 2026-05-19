@@ -10,3 +10,6 @@ pub use traits::TrieDatabase;
 /// DiffLayer types for tracking trie node changes.
 mod difflayer;
 pub use difflayer::{Leaf, TrieNode, DiffLayer, DiffLayers, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
+
+/// Trie node lookup path counters (DiffLayer / moka / RocksDB).
+pub mod lookup_stats;
