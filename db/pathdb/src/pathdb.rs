@@ -676,27 +676,37 @@ impl TrieDatabase for PathDB {
         // Write batch first; only update caches on success to keep them consistent with DB.
         match self.db.write_opt(batch, &self.write_options) {
             Ok(()) => {
-                // Update only the trie metadata (state_root / block_number) in cache.
-                //
-                // Intentionally do NOT populate trie_node_cache / storage_root_cache with the
-                // committed diff_nodes / diff_storage_roots here, mirroring geth pathdb behavior:
-                //
-                //   - At the moment commit_difflayer fires, this diff has just aged out of the
-                //     in-memory DiffLayer chain (≈256 blocks old). For the next ~256 blocks the
-                //     newer DiffLayer chain still shadows these paths, so moka would not be
-                //     consulted for them anyway.
-                //   - When DiffLayer chain finally cannot serve a path, PathDB::get_raw_trie_node
-                //     reads RocksDB (data just written via batch above, almost certainly hot in
-                //     the OS page cache) and inserts the result into moka organically.
-                //   - Eagerly inserting ~19k entries per commit was thrashing the cache: every
-                //     insert triggered TinyLFU admission + eviction, displacing genuinely hot
-                //     entries with nodes that would not be read for hundreds of blocks (if ever).
-                //
-                // Correctness is unaffected: moka is a cache, not a source of truth. RocksDB
-                // (just written) + the live DiffLayer chain remain authoritative; this change
-                // only shifts insertion from commit-time to first-read-after-aging.
                 self.trie_node_cache.insert(TRIE_STATE_ROOT_KEY.to_vec(), Some(state_root.as_slice().to_vec()));
                 self.trie_node_cache.insert(TRIE_STATE_BLOCK_NUMBER_KEY.to_vec(), Some(block_number.to_le_bytes().to_vec()));
+
+                // Invalidate (don't re-insert) every path that was modified by this diff.
+                //
+                // Correctness rationale: the in-memory DiffLayer chain shadows these paths
+                // for ~256 blocks while alive, but moka can still hold a STALE value for
+                // them — picked up by an organic read during the previous epoch where this
+                // path was modified. After this commit_difflayer fires, the DiffLayer for
+                // block N drops out of the chain; subsequent queries fall through to moka,
+                // and unless we drop the stale entry here they will return a value that
+                // pre-dates the just-persisted RocksDB write. That regression manifested
+                // as mismatched state roots (e.g. block 20004790, tx_count=0, hashed_storages=1).
+                //
+                // Performance rationale: invalidate is cheaper than insert under cap-bound
+                // pressure (no TinyLFU admission, no eviction of hot entries to make room).
+                // The next read of any path that turns out to still be hot will repopulate
+                // moka organically from RocksDB (data just written via batch above, almost
+                // certainly hot in the OS page cache).
+                if let Some(difflayer) = difflayer {
+                    for (key, _node) in difflayer.diff_nodes.iter() {
+                        self.trie_node_cache.invalidate(key);
+                    }
+                    for (key, _value) in difflayer.diff_storage_roots.iter() {
+                        // mini-moka stores keys as Arc<Vec<u8>>, which only implements
+                        // Borrow<Vec<u8>>; have to materialize a Vec for the lookup.
+                        // Matches the original insert path which also allocated a Vec here.
+                        let key_vec = key.as_slice().to_vec();
+                        self.storage_root_cache.invalidate(&key_vec);
+                    }
+                }
 
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())
