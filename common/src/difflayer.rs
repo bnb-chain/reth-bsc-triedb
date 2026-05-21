@@ -185,10 +185,17 @@ impl DiffLayers {
         self.diff_layers.push(difflayer);
     }
 
-    /// Get a trie node by prefix
+    /// Get a trie node by prefix.
+    ///
+    /// On a successful hit, bumps the global `TRIE_DIFFLAYER_HITS` counter
+    /// — one cache-line-padded `AtomicU64::fetch_add(Relaxed)`. The
+    /// PathDBMetrics-side `trie_node_cache_hits`/`_misses` counters cover
+    /// the other two tiers (moka, RocksDB), so together they give the
+    /// full three-tier breakdown of every `resolve_and_track` lookup.
     pub fn get_trie_nodes(&self, prefix: &[u8]) -> Option<Arc<TrieNode>> {
         for difflayer in &self.diff_layers {
             if let Some(node) = difflayer.get_trie_nodes(prefix) {
+                crate::lookup_stats::TRIE_DIFFLAYER_HITS.increment();
                 return Some(node);
             }
         }

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use rocksdb::{
-    BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB, Options, ReadOptions,
-    WriteBatch, WriteOptions,
+    statistics::Ticker, BlockBasedOptions, Cache as RocksCache, ColumnFamilyDescriptor, DB,
+    Options, ReadOptions, WriteBatch, WriteOptions,
 };
 // use schnellru::{ByLength, LruMap};
 use mini_moka::sync::{Cache as MokaCache, CacheBuilder};
@@ -17,6 +17,7 @@ use alloy_primitives::B256;
 use alloy_trie::EMPTY_ROOT_HASH;
 use crate::traits::*;
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
+use rust_eth_triedb_common::lookup_stats::TRIE_DIFFLAYER_HITS;
 
 use reth_metrics::{
     metrics::{Counter, Gauge},
@@ -105,6 +106,56 @@ pub(crate) struct PathDBMetrics {
     pub(crate) trie_node_cache_entries: Gauge,
     /// Current number of entries in the storage_root_cache.
     pub(crate) storage_root_cache_entries: Gauge,
+
+    /// Process-monotonic count of trie lookups served by the in-memory
+    /// `DiffLayers` chain (i.e. one of the last ~256 blocks' diffs had
+    /// the requested path, so the query never reached PathDB / moka).
+    ///
+    /// Forms the top tier of the three-tier hit breakdown:
+    ///
+    ///   diff_hit_rate  = rate(trie_difflayer_hits[1m]) / total_query_rate
+    ///   moka_hit_rate  = rate(trie_node_cache_hits[1m])   / total_query_rate
+    ///   disk_read_rate = rate(trie_node_cache_misses[1m]) / total_query_rate
+    ///
+    /// where total_query_rate = sum of the three numerators. Exposed as a
+    /// Gauge holding the absolute monotonic value (resets to 0 on process
+    /// restart) — same shape as the RocksDB ticker gauges below.
+    pub(crate) trie_difflayer_hits: Gauge,
+
+    // ── RocksDB block cache & bloom filter (one tier below moka) ────────────
+    //
+    // Exposed as Gauges holding the absolute monotonic ticker value (gets
+    // reset to 0 on process restart). Use `rate(...[1m])` in PromQL to get
+    // per-second deltas — same as you'd use on a Counter. Gauge is chosen
+    // over Counter to avoid maintaining last-value state in PathDB; on the
+    // normal "process keeps running" path the value only ever increases.
+
+    /// RocksDB `BLOCK_CACHE_HIT` ticker. Each hit = SST block was already
+    /// in the in-memory block cache, no disk seek was needed.
+    pub(crate) rocksdb_block_cache_hits: Gauge,
+    /// RocksDB `BLOCK_CACHE_MISS` ticker. Each miss = block cache didn't
+    /// have it, RocksDB had to seek the underlying SST (page-cache or disk).
+    pub(crate) rocksdb_block_cache_misses: Gauge,
+    /// RocksDB `BLOCK_CACHE_ADD` ticker. Number of blocks inserted into
+    /// the block cache. Subtract redundant adds for the net unique adds.
+    pub(crate) rocksdb_block_cache_adds: Gauge,
+    /// RocksDB `BLOOM_FILTER_USEFUL` ticker. Number of SST seeks the bloom
+    /// filter successfully skipped (the value RETHBSC_ROCKSDB_BLOOM_BITS_PER_KEY
+    /// is trying to maximize).
+    pub(crate) rocksdb_bloom_filter_useful: Gauge,
+    /// RocksDB `BLOOM_FILTER_FULL_POSITIVE` ticker. Number of times bloom
+    /// said "maybe present" and the key was actually present. Compare
+    /// against `BloomFilterFullTruePositive` to estimate FPR.
+    pub(crate) rocksdb_bloom_filter_full_positive: Gauge,
+    /// RocksDB `BLOOM_FILTER_FULL_TRUE_POSITIVE` ticker. True positives
+    /// from the bloom check, i.e. the key was actually found in that SST.
+    pub(crate) rocksdb_bloom_filter_full_true_positive: Gauge,
+    /// Current memory used by the RocksDB block cache, in bytes
+    /// (from `Cache::get_usage`). Compare against
+    /// `RETHBSC_ROCKSDB_BLOCK_CACHE_GB` to see fullness.
+    pub(crate) rocksdb_block_cache_usage_bytes: Gauge,
+    /// Block cache memory that is currently pinned (cannot be evicted).
+    pub(crate) rocksdb_block_cache_pinned_usage_bytes: Gauge,
 }
 
 /// PathDB implementation using RocksDB.
@@ -127,6 +178,15 @@ pub struct PathDB {
     pub storage_root_cache: Arc<MokaCache<Vec<u8>, Option<Vec<u8>>>>,
     /// Metrics for the PathDB.
     metrics: PathDBMetrics,
+    /// RocksDB options kept alive so we can read its ticker counters
+    /// (`get_ticker_count`) and surface them via `PathDBMetrics`.
+    /// Required because tickers live inside the Options' embedded
+    /// Statistics object; dropping Options destroys our handle on it.
+    db_opts: Arc<Options>,
+    /// The RocksDB block cache. `Cache` is internally `Arc<CacheWrapper>`,
+    /// so this is essentially a shared handle — we can query `get_usage()`
+    /// without affecting the DB. Kept around purely for metrics.
+    block_cache: RocksCache,
 }
 
 /// Build a consistent RocksDB BlockBasedTable configuration for trie workloads.
@@ -175,6 +235,8 @@ impl Clone for PathDB {
             trie_node_cache: self.trie_node_cache.clone(),
             storage_root_cache: self.storage_root_cache.clone(),
             metrics: self.metrics.clone(),
+            db_opts: self.db_opts.clone(),
+            block_cache: self.block_cache.clone(),
         }
     }
 }
@@ -192,9 +254,16 @@ impl PathDB {
 
         // Explicitly configure BlockBasedTable. This directly impacts random reads
         // of trie nodes. If unset, RocksDB defaults to a tiny internal cache (~8MB).
-        let (_rocks_block_cache, block_based) = build_block_based_options(&config);
+        // Keep `rocks_block_cache` alive on PathDB so we can query `get_usage()`
+        // for the block-cache-fullness gauge below.
+        let (rocks_block_cache, block_based) = build_block_based_options(&config);
         db_opts.set_block_based_table_factory(&block_based);
-        
+
+        // Enable RocksDB built-in statistics so we can read ticker counts
+        // (BlockCacheHit/Miss, BloomFilterUseful, ...) via Options::get_ticker_count.
+        // Default level (`ExceptDetailedTimers`) keeps overhead under ~1%.
+        db_opts.enable_statistics();
+
         // Disable auto compaction during startup to avoid slow initialization
         // Compaction will happen automatically in the background during runtime
         db_opts.set_disable_auto_compactions(true);
@@ -272,7 +341,50 @@ impl PathDB {
             trie_node_cache,
             storage_root_cache,
             metrics: PathDBMetrics::new_with_labels(&[("instance", "default")]),
+            db_opts: Arc::new(db_opts),
+            block_cache: rocks_block_cache,
         })
+    }
+
+    /// Refresh RocksDB-side metrics (block cache ticker counts + usage)
+    /// plus the global DiffLayer hit counter. Called from `commit_difflayer`
+    /// alongside the moka entry-count gauges so all read-only metrics get
+    /// the same update cadence (~1/block).
+    fn update_rocksdb_metrics(&self) {
+        // Top tier of the three-tier breakdown: how many lookups DiffLayers
+        // chain absorbed before they could reach PathDB / moka.
+        self.metrics
+            .trie_difflayer_hits
+            .set(TRIE_DIFFLAYER_HITS.load() as f64);
+
+        // Ticker counts are process-monotonic; we expose the absolute value
+        // as a Gauge and let PromQL `rate(...[1m])` derive per-second rates.
+        self.metrics
+            .rocksdb_block_cache_hits
+            .set(self.db_opts.get_ticker_count(Ticker::BlockCacheHit) as f64);
+        self.metrics
+            .rocksdb_block_cache_misses
+            .set(self.db_opts.get_ticker_count(Ticker::BlockCacheMiss) as f64);
+        self.metrics
+            .rocksdb_block_cache_adds
+            .set(self.db_opts.get_ticker_count(Ticker::BlockCacheAdd) as f64);
+        self.metrics
+            .rocksdb_bloom_filter_useful
+            .set(self.db_opts.get_ticker_count(Ticker::BloomFilterUseful) as f64);
+        self.metrics
+            .rocksdb_bloom_filter_full_positive
+            .set(self.db_opts.get_ticker_count(Ticker::BloomFilterFullPositive) as f64);
+        self.metrics
+            .rocksdb_bloom_filter_full_true_positive
+            .set(self.db_opts.get_ticker_count(Ticker::BloomFilterFullTruePositive) as f64);
+
+        // Cache usage is a true instantaneous gauge (bytes currently in cache).
+        self.metrics
+            .rocksdb_block_cache_usage_bytes
+            .set(self.block_cache.get_usage() as f64);
+        self.metrics
+            .rocksdb_block_cache_pinned_usage_bytes
+            .set(self.block_cache.get_pinned_usage() as f64);
     }
 
     /// Get the underlying RocksDB instance.
@@ -705,6 +817,11 @@ impl TrieDatabase for PathDB {
                 self.metrics
                     .storage_root_cache_entries
                     .set(self.storage_root_cache.entry_count() as f64);
+
+                // Refresh RocksDB block cache + bloom ticker gauges. Tickers are
+                // read via FFI into Options' statistics object; usage is read from
+                // the Cache handle. All non-blocking, no contention with read/write.
+                self.update_rocksdb_metrics();
 
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())
