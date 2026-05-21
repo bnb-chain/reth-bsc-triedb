@@ -19,7 +19,7 @@ use crate::traits::*;
 use rust_eth_triedb_common::{TrieDatabase, DiffLayer, TRIE_STATE_ROOT_KEY, TRIE_STATE_BLOCK_NUMBER_KEY};
 
 use reth_metrics::{
-    metrics::{Counter},
+    metrics::{Counter, Gauge},
     Metrics,
 };
 
@@ -98,6 +98,13 @@ pub(crate) struct PathDBMetrics {
     pub(crate) storage_root_cache_hits: Counter,
     /// Counter of storage root cache misses
     pub(crate) storage_root_cache_misses: Counter,
+    /// Current number of entries in the trie_node_cache (mini-moka entry_count).
+    /// Updated once per `commit_difflayer` call. Compare against the configured
+    /// `RETHBSC_ROCKSDB_TRIE_NODE_CACHE_ENTRIES` cap to see whether the cache
+    /// is saturated (admission/eviction kicks in) or still filling.
+    pub(crate) trie_node_cache_entries: Gauge,
+    /// Current number of entries in the storage_root_cache.
+    pub(crate) storage_root_cache_entries: Gauge,
 }
 
 /// PathDB implementation using RocksDB.
@@ -688,6 +695,16 @@ impl TrieDatabase for PathDB {
                         self.storage_root_cache.insert(key.as_slice().to_vec(), Some(value.as_slice().to_vec()));
                     }
                 }
+
+                // Refresh cache-fullness gauges once per commit. `entry_count()` is a
+                // single atomic load on mini-moka's internal counter — no scan, no
+                // contention with the get/insert paths.
+                self.metrics
+                    .trie_node_cache_entries
+                    .set(self.trie_node_cache.entry_count() as f64);
+                self.metrics
+                    .storage_root_cache_entries
+                    .set(self.storage_root_cache.entry_count() as f64);
 
                 trace!(target: "pathdb::batch", "Successfully committed batch to database, block_number: {}, state_root: {:?}, diff_nodes_len: {}, diff_storage_roots_len: {}", block_number, state_root, diff_nodes_len, diff_storage_roots_len);
                 Ok(())
