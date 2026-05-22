@@ -12,7 +12,10 @@ use crate::encoding;
 
 /// NodeSet contains a set of nodes collected during the commit operation.
 /// Each node is keyed by path. It's not thread-safe to use.
-#[derive(Clone)]
+///
+/// `Default` produces an owner-zero empty set; it exists so child Committers
+/// can be `std::mem::take`n during parallel merges (see `merge_set_owned`).
+#[derive(Clone, Default)]
 pub struct NodeSet {
     /// Owner hash (zero for account trie, account address hash for storage tries)
     pub owner: B256,
@@ -80,9 +83,14 @@ impl NodeSet {
         &self.nodes
     }
 
-    /// MergeSet merges this 'set' with 'other'. It assumes that the sets are disjoint,
-    /// and thus does not deduplicate data (count deletes, dedup leaves etc).
-    pub fn merge_set(&mut self, other: &NodeSet) -> Result<(), String> {
+    /// Merges this 'set' with `other`, **consuming** `other`. Assumes the
+    /// sets are disjoint (no key collisions); does not deduplicate.
+    ///
+    /// All entries are moved, not cloned — this is the hot path for parallel
+    /// commit where each child Committer's NodeSet is merged into the parent
+    /// exactly once and then dropped. `owner` is preserved from `self`; the
+    /// emptied `other` is dropped at the end of this call.
+    pub fn merge_set_owned(&mut self, other: NodeSet) -> Result<(), String> {
         if self.owner != other.owner {
             return Err(format!(
                 "nodesets belong to different owner are not mergeable {:?}-{:?}",
@@ -90,14 +98,13 @@ impl NodeSet {
             ));
         }
 
-        self.nodes.extend(other.nodes.clone());
-        self.leaves.extend(other.leaves.clone());
+        self.nodes.extend(other.nodes);
+        self.leaves.extend(other.leaves);
         self.updates += other.updates;
         self.deletes += other.deletes;
-        // Merge difflayer as well
-        for (key, node) in other.difflayer.iter() {
-            self.difflayer.insert(key.clone(), node.clone());
-        }
+        // Move entries out of the Box<HashMap> without cloning each pair.
+        let other_diff = *other.difflayer;
+        self.difflayer.extend(other_diff);
 
         Ok(())
     }

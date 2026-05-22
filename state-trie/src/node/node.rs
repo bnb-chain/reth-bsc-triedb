@@ -18,6 +18,10 @@ pub struct NodeFlag {
     pub hash: Option<HashNode>,
     /// Whether the node has been modified
     pub dirty: bool,
+    /// RLP-encoded bytes of this node, populated by Hasher when the node
+    /// is hashed (>= 32 bytes). Consumed by Committer::store to avoid a
+    /// second encode pass. None for embedded nodes (< 32 bytes).
+    pub encoded: Option<Vec<u8>>,
 }
 
 impl Default for NodeFlag {
@@ -25,6 +29,7 @@ impl Default for NodeFlag {
         Self {
             hash: None,
             dirty: true,
+            encoded: None,
         }
     }
 }

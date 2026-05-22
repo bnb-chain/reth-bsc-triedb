@@ -25,7 +25,12 @@ impl Hasher {
         }
     }
 
-    /// Hash a node and return both the hashed and cached versions
+    /// Hash a node and return both the hashed and cached versions.
+    ///
+    /// The cached return value carries the RLP-encoded bytes in
+    /// `flags.encoded` for every node that was actually hashed (>= 32 bytes
+    /// or `force`). The Committer reuses these bytes in `store()` to avoid a
+    /// second RLP encoding pass over every dirty subtree.
     pub fn hash(&self, node: Arc<Node>, force: bool) -> (Arc<Node>, Arc<Node>) {
         let (hash, _) = node.cache();
         if let Some(hash) = hash {
@@ -37,14 +42,15 @@ impl Hasher {
                 let (collapsed, cached) = self.hash_short_node_children(short.clone());
                 let mut cached = cached.to_mutable_copy_with_cow();
 
-                let hashed = self.short_node_to_hash(collapsed, force);
+                let (hashed, encoded) = self.short_node_to_hash(collapsed, force);
                 match &hashed {
                     Node::Hash(hash) => {
-                        // Note: This would need proper access to flags
                         cached.flags.hash = Some(*hash);
+                        cached.flags.encoded = encoded;
                     }
                     _ => {
                         cached.flags.hash = None;
+                        cached.flags.encoded = None;
                     }
                 }
                 (Arc::new(hashed), Arc::new(Node::Short(Arc::new(cached))))
@@ -53,14 +59,15 @@ impl Hasher {
                 let (collapsed, cached) = self.hash_full_node_children(full.clone());
                 let mut cached = cached.to_mutable_copy_with_cow();
 
-                let hashed = self.full_node_to_hash(collapsed, force);
+                let (hashed, encoded) = self.full_node_to_hash(collapsed, force);
                 match &hashed {
                     Node::Hash(hash) => {
-                        // Note: This would need proper access to flags
                         cached.flags.hash = Some(*hash);
+                        cached.flags.encoded = encoded;
                     }
                     _ => {
                         cached.flags.hash = None;
+                        cached.flags.encoded = None;
                     }
                 }
                 (Arc::new(hashed), Arc::new(Node::Full(Arc::new(cached))))
@@ -92,16 +99,18 @@ impl Hasher {
         (collapsed_node, cached_node)
     }
 
-    /// Convert a short node to its hash representation
-    pub fn short_node_to_hash(&self, short: Arc<ShortNode>, force: bool) -> Node {
-        // Note: This is a placeholder implementation
+    /// Convert a short node to its hash representation.
+    ///
+    /// Returns the hashed form plus the RLP-encoded bytes when the node was
+    /// actually hashed (>= 32 bytes or `force`). Callers attach the bytes to
+    /// the cached node's `flags.encoded` so the Committer can reuse them.
+    pub fn short_node_to_hash(&self, short: Arc<ShortNode>, force: bool) -> (Node, Option<Vec<u8>>) {
         let rpl_enc = short.to_rlp();
         if rpl_enc.len() < 32 && !force {
-            return Node::Short(short);
+            return (Node::Short(short), None);
         }
-        let hash = keccak256(rpl_enc);
-        // Placeholder hash
-        Node::Hash(hash)
+        let hash = keccak256(&rpl_enc);
+        (Node::Hash(hash), Some(rpl_enc))
     }
 
     /// Hash the children of a full node
@@ -150,15 +159,18 @@ impl Hasher {
         (Arc::new(collapsed), Arc::new(cached))
     }
 
-    /// Convert a full node to its hash representation
-    pub fn full_node_to_hash(&self, full: Arc<FullNode>, force: bool) -> Node {
-        // Note: This is a placeholder implementation
+    /// Convert a full node to its hash representation.
+    ///
+    /// Same contract as `short_node_to_hash`: returns the encoded bytes
+    /// alongside the hash so they can be attached to the cached node and
+    /// reused by the Committer.
+    pub fn full_node_to_hash(&self, full: Arc<FullNode>, force: bool) -> (Node, Option<Vec<u8>>) {
         let rpl_enc = full.to_rlp();
         if rpl_enc.len() < 32 && !force {
-            return Node::Full(full);
+            return (Node::Full(full), None);
         }
-        let hash = keccak256(rpl_enc);
-        Node::Hash(hash)
+        let hash = keccak256(&rpl_enc);
+        (Node::Hash(hash), Some(rpl_enc))
     }
 }
 
@@ -324,6 +336,52 @@ mod tests {
                    "Performance test: results should be identical");
 
         println!("✅ Performance comparison test completed!");
+    }
+
+    #[test]
+    fn hasher_caches_encoded_bytes_when_hashing() {
+        use crate::encoding::{hex_to_compact, key_to_nibbles};
+        use crate::node::ShortNode;
+
+        init_empty_root_node();
+
+        // Hex key + terminator (leaf form) — the trie's internal representation.
+        // The hasher converts this to compact when encoding.
+        let hex_key = key_to_nibbles(&[0xAB; 16]);
+        // Value is large enough that the encoded short exceeds 32 bytes,
+        // forcing the hasher to actually keccak256 it.
+        let value = vec![0xCDu8; 80];
+        let short = ShortNode::new(hex_key.clone(), &Node::Value(value));
+        let input: Arc<Node> = Arc::new(Node::Short(Arc::new(short)));
+
+        let hasher = Hasher::new(false);
+        let (hashed, cached) = hasher.hash(input, true);
+
+        // Hashed must be Node::Hash
+        let hash = match hashed.as_ref() {
+            Node::Hash(h) => *h,
+            other => panic!("expected Hash, got {:?}", other),
+        };
+
+        // Cached must be Node::Short with flags.encoded populated, and the
+        // bytes must keccak to the same hash the hasher returned.
+        let cached_short = match cached.as_ref() {
+            Node::Short(s) => s.clone(),
+            other => panic!("expected Short, got {:?}", other),
+        };
+        let encoded = cached_short.flags.encoded.as_ref()
+            .expect("flags.encoded should be populated after hashing");
+        assert_eq!(cached_short.flags.hash, Some(hash));
+        assert_eq!(keccak256(encoded), hash,
+                   "cached encoded bytes must hash to the same value as the hasher returned");
+
+        // And the bytes must equal what node_to_bytes (the Committer's
+        // fallback path) would produce on the same collapsed form.
+        let mut collapsed = cached_short.to_mutable_copy_with_cow();
+        collapsed.key = hex_to_compact(&cached_short.key);
+        let expected = Node::node_to_bytes(Arc::new(Node::Short(Arc::new(collapsed))));
+        assert_eq!(encoded, &expected,
+                   "cached encoded bytes must match node_to_bytes output");
     }
 
     #[test]
